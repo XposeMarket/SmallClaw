@@ -116,7 +116,7 @@ SmallClaw controls a real browser via Playwright — not just opening a URL for 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/smallclaw.git
+git clone https://github.com/xposemarket/smallclaw.git
 cd smallclaw
 
 # Install dependencies
