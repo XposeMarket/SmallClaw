@@ -38,9 +38,15 @@ const sessions: Map<string, BrowserSession> = new Map();
 let playwrightModule: any = null;
 let playwrightChecked = false;
 
+const os = require('os');
+const PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH
+  || require('path').join(os.homedir(), '.playwright-browsers');
+
 async function getPW(): Promise<any | null> {
   if (playwrightChecked) return playwrightModule;
   playwrightChecked = true;
+  // Set PLAYWRIGHT_BROWSERS_PATH before Playwright loads so it can find its bundled Chromium
+  process.env.PLAYWRIGHT_BROWSERS_PATH = PLAYWRIGHT_BROWSERS_PATH;
   try {
     playwrightModule = await (Function('return import("playwright")')() as Promise<any>);
     return playwrightModule;
@@ -82,6 +88,20 @@ async function getOrCreateSession(sessionId: string): Promise<BrowserSession> {
 
     const chromePaths = [
       process.env.CHROME_PATH,
+      // Playwright bundled Chromium (installed via `npx playwright install chromium`)
+      `${PLAYWRIGHT_BROWSERS_PATH}/chromium-1208/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`,
+      `${PLAYWRIGHT_BROWSERS_PATH}/chromium-1208/chrome-linux/chrome`,
+      `${PLAYWRIGHT_BROWSERS_PATH}/chromium-1208/chrome-win/chrome.exe`,
+      // macOS system Chrome
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      `${process.env.HOME}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
+      // Linux
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/chromium',
+      // Windows
       'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
       'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
       `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
@@ -89,41 +109,46 @@ async function getOrCreateSession(sessionId: string): Promise<BrowserSession> {
 
     const fs = await import('fs');
     const chromePath = chromePaths.find(p => fs.existsSync(p));
-    if (!chromePath) throw new Error('Chrome not found. Set CHROME_PATH env var.');
 
-    const path = await import('path');
-    const os = await import('os');
-    const profileDir = process.env.CHROME_PROFILE
-      || path.join(os.homedir(), '.localclaw', 'chrome-debug-profile');
+    if (chromePath) {
+      // System Chrome found — launch with CDP so we can connect
+      const path = await import('path');
+      const os = await import('os');
+      const profileDir = process.env.CHROME_PROFILE
+        || path.join(os.homedir(), '.localclaw', 'chrome-debug-profile');
 
-    // Ensure profile dir exists
-    if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true });
+      if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true });
 
-    const { spawn } = await import('child_process');
-    spawn(chromePath, [
-      `--remote-debugging-port=${debugPort}`,
-      `--user-data-dir=${profileDir}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-background-timer-throttling',
-    ], { detached: true, stdio: 'ignore' }).unref();
+      const { spawn } = await import('child_process');
+      spawn(chromePath, [
+        `--remote-debugging-port=${debugPort}`,
+        `--user-data-dir=${profileDir}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-background-timer-throttling',
+      ], { detached: true, stdio: 'ignore' }).unref();
 
-    console.log(`[Browser] Chrome profile: ${profileDir} (log in once, saved forever)`);
+      console.log(`[Browser] Chrome profile: ${profileDir} (log in once, saved forever)`);
 
-    // Wait for Chrome to start
-    let connected = false;
-    for (let i = 0; i < 30; i++) {
-      await new Promise(r => setTimeout(r, 500));
-      if (await isPortOpen(debugPort)) {
-        try {
-          browser = await pw.chromium.connectOverCDP(`http://localhost:${debugPort}`);
-          connected = true;
-          break;
-        } catch { /* retry */ }
+      let connected = false;
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        if (await isPortOpen(debugPort)) {
+          try {
+            browser = await pw.chromium.connectOverCDP(`http://localhost:${debugPort}`);
+            connected = true;
+            break;
+          } catch { /* retry */ }
+        }
       }
+      if (!connected) throw new Error(`Chrome launched but did not respond on port ${debugPort} after 15s.`);
+      console.log(`[Browser] Launched and connected to Chrome on port ${debugPort}`);
+    } else {
+      // No system Chrome — use Playwright's bundled Chromium directly
+      console.log('[Browser] No system Chrome found. Launching Playwright bundled Chromium...');
+      browser = await pw.chromium.launch({ headless: false, args: ['--no-first-run', '--no-default-browser-check'] });
+      console.log('[Browser] Playwright Chromium launched.');
     }
-    if (!connected) throw new Error(`Chrome launched but did not respond on port ${debugPort} after 15s. Close any existing Chrome windows and try again.`);
-    console.log(`[Browser] Launched and connected to Chrome on port ${debugPort}`);
   }
 
   // Get or create a context, then a page

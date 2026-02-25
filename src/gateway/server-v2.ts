@@ -35,8 +35,32 @@ const MAX_TOOL_ROUNDS = 12;
 // Active tasks (keyed by session)
 const activeTasks: Map<string, TaskState> = new Map();
 
-// Safe commands allowlist for run_command
-const SAFE_COMMANDS: Record<string, string> = {
+// Safe commands allowlist for run_command — platform-aware
+const isMac = process.platform === 'darwin';
+const isLinux = process.platform === 'linux';
+const SAFE_COMMANDS: Record<string, string> = isMac ? {
+  'chrome': 'open -a "Google Chrome"',
+  'browser': 'open -a "Google Chrome"',
+  'firefox': 'open -a Firefox',
+  'edge': 'open -a "Microsoft Edge"',
+  'notepad': 'open -a TextEdit',
+  'calc': 'open -a Calculator',
+  'calculator': 'open -a Calculator',
+  'explorer': 'open .',
+  'finder': 'open .',
+  'terminal': 'open -a Terminal',
+  'cmd': 'open -a Terminal',
+} : isLinux ? {
+  'chrome': 'google-chrome',
+  'browser': 'xdg-open https://google.com',
+  'firefox': 'firefox',
+  'notepad': 'gedit',
+  'calc': 'gnome-calculator',
+  'calculator': 'gnome-calculator',
+  'explorer': 'xdg-open .',
+  'terminal': 'x-terminal-emulator',
+  'cmd': 'x-terminal-emulator',
+} : {
   'chrome': 'start chrome',
   'browser': 'start chrome',
   'firefox': 'start firefox',
@@ -578,7 +602,7 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
         if (!fs.existsSync(filePath)) return { name, args, result: `"${filename}" not found`, error: true };
         const lines = fs.readFileSync(filePath, 'utf-8').split('\n');
         const insertAt = Math.min(afterLine, lines.length);
-        lines.splice(insertAt, 0, ...content.split('\\n'));
+        lines.splice(insertAt, 0, ...content.split('\n'));
         fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
         return { name, args, result: `${filename}: inserted after line ${afterLine} (now ${lines.length} lines)`, error: false };
       }
@@ -649,17 +673,17 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
           let url = parts.slice(1).join(' ');
           // Add https:// if missing
           if (url && !url.startsWith('http')) url = 'https://' + url;
-          const appCmd = SAFE_COMMANDS[app] || `start chrome`;
-          execCmd = `${appCmd} ${url}`;
+          const appCmd = SAFE_COMMANDS[app] || (isMac ? 'open' : 'start chrome');
+          execCmd = isMac ? `open "${url}"` : `${appCmd} ${url}`;
         }
         // 3. Plain URL → open in default browser
         else if (/^(https?:\/\/|www\.)/.test(cmd)) {
           const url = cmd.startsWith('www.') ? 'https://' + rawCmd : rawCmd;
-          execCmd = `start "" "${url}"`;
+          execCmd = isMac ? `open "${url}"` : isLinux ? `xdg-open "${url}"` : `start "" "${url}"`;
         }
         // 4. Bare domain like "youtube.com" → open in browser
         else if (/^[a-z0-9-]+\.[a-z]{2,}/.test(cmd) && !cmd.includes(' ')) {
-          execCmd = `start "" "https://${rawCmd}"`;
+          execCmd = isMac ? `open "https://${rawCmd}"` : isLinux ? `xdg-open "https://${rawCmd}"` : `start "" "https://${rawCmd}"`;
         }
         // 5. "code <path>" → VS Code
         else if (cmd.startsWith('code ')) {
