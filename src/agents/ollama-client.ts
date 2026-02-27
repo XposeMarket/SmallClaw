@@ -40,9 +40,10 @@ export class OllamaClient {
       num_predict?: number;
       think?: boolean | 'high' | 'medium' | 'low';
       tools?: any[];
+      model?: string;
     }
   ): Promise<ChatOutput> {
-    const model = getModelForRole(role);
+    const model = String(options?.model || '').trim() || getModelForRole(role);
     const result = await this.provider.chat(messages, model, {
       temperature: options?.temperature,
       max_tokens:  options?.num_predict,

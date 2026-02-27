@@ -36,6 +36,24 @@
     --shadow-md: 0 8px 24px rgba(16, 32, 64, 0.08);
   }
 
+  :root[data-theme="dark"] {
+    --bg: #1f242d;
+    --bg-soft: #242a34;
+    --panel: #2a313d;
+    --panel-2: #323a47;
+    --line: #3d4656;
+    --line-strong: #505b70;
+    --text: #e8edf6;
+    --muted: #aeb9cb;
+    --brand: #4c8dff;
+    --brand-2: #2f6fe0;
+    --ok: #31b884;
+    --warn: #d6a64f;
+    --err: #e06d6d;
+    --shadow-sm: 0 2px 8px rgba(4, 7, 12, 0.28);
+    --shadow-md: 0 10px 30px rgba(4, 7, 12, 0.36);
+  }
+
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
@@ -57,6 +75,12 @@
     padding: 12px;
     overflow: hidden;
   }
+  :root[data-theme="dark"] body {
+    background:
+      radial-gradient(900px 420px at 8% -15%, rgba(76, 141, 255, 0.12), transparent 65%),
+      radial-gradient(900px 420px at 100% -20%, rgba(89, 188, 255, 0.1), transparent 62%),
+      var(--bg);
+  }
 
   header {
     grid-area: header;
@@ -69,6 +93,8 @@
     align-items: center;
     padding: 10px 16px;
     gap: 14px;
+    position: relative;
+    z-index: 20;
   }
 
   .logo {
@@ -80,6 +106,7 @@
     align-items: center;
     gap: 8px;
   }
+  :root[data-theme="dark"] .logo { color: #e8edf6; }
 
   .mode-toggle {
     display: inline-flex;
@@ -116,6 +143,25 @@
     align-items: center;
     gap: 8px;
   }
+
+  .icon-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .icon-btn:hover { color: var(--text); border-color: var(--line-strong); }
+  .icon-btn svg { width: 16px; height: 16px; }
+  .icon-btn .theme-icon { display: none; }
+  .icon-btn[data-theme-state="light"] .theme-icon.sun { display: block; }
+  .icon-btn[data-theme-state="dark"] .theme-icon.moon { display: block; }
 
   .status-pill {
     border: 1px solid var(--line);
@@ -186,6 +232,7 @@
     transition: all 0.18s ease;
     font-family: 'Manrope', sans-serif;
   }
+  :root[data-theme="dark"] .sidebar-tab { background: var(--panel); }
 
   .sidebar-tab.active {
     background: #eaf2ff;
@@ -217,6 +264,169 @@
     color: var(--muted);
     cursor: pointer;
     font-family: 'Manrope', sans-serif;
+  }
+  :root[data-theme="dark"] .sidebar-action { background: var(--panel); color: var(--text); }
+
+  :root[data-theme="dark"] .hb-modal,
+  :root[data-theme="dark"] #settings-modal > div {
+    background: var(--panel) !important;
+    color: var(--text);
+    border-color: var(--line) !important;
+  }
+  :root[data-theme="dark"] header {
+    background: rgba(42, 49, 61, 0.88);
+  }
+  :root[data-theme="dark"] main,
+  :root[data-theme="dark"] .right-panel,
+  :root[data-theme="dark"] aside {
+    background: var(--panel);
+  }
+  :root[data-theme="dark"] .job-item,
+  :root[data-theme="dark"] .skill-item,
+  :root[data-theme="dark"] .skill-result,
+  :root[data-theme="dark"] .task-card,
+  :root[data-theme="dark"] .approval-card,
+  :root[data-theme="dark"] .agent-metric,
+  :root[data-theme="dark"] .task-list,
+  :root[data-theme="dark"] .task-row,
+  :root[data-theme="dark"] .artifact-card,
+  :root[data-theme="dark"] .artifact-preview {
+    background: var(--panel-2);
+    border-color: var(--line);
+  }
+  :root[data-theme="dark"] .msg {
+    border-bottom-color: var(--line);
+  }
+  :root[data-theme="dark"] .msg-role { color: #c1cde0; }
+  :root[data-theme="dark"] .msg-content { color: #e8edf6; }
+  :root[data-theme="dark"] .msg.user .msg-content { color: #9fc2ff; }
+  :root[data-theme="dark"] .chat-welcome h2 { color: #c8dbff; }
+  :root[data-theme="dark"] .agent-card {
+    background: linear-gradient(180deg, #303846 0%, #2a313d 100%);
+    border-color: var(--line);
+  }
+  :root[data-theme="dark"] .task-progress-wrap {
+    background: #242c39;
+    border-color: var(--line);
+  }
+  :root[data-theme="dark"] #process-log,
+  :root[data-theme="dark"] #log-panel {
+    background: #242c39;
+    border-color: var(--line);
+    color: #d4deee;
+  }
+  :root[data-theme="dark"] .log-line { color: #b8c4da; }
+  :root[data-theme="dark"] .log-line.info { color: #82adff; }
+  :root[data-theme="dark"] .chat-input-area,
+  :root[data-theme="dark"] .mission-bar {
+    background: linear-gradient(180deg, #313947, #2a313d);
+  }
+  :root[data-theme="dark"] .queued-prompts-panel {
+    background: linear-gradient(180deg, #2c3442, #272f3a);
+  }
+  :root[data-theme="dark"] .queued-item {
+    background: var(--panel);
+    border-color: var(--line);
+    color: var(--text);
+  }
+  :root[data-theme="dark"] .queued-item-btn,
+  :root[data-theme="dark"] .queued-clear-btn {
+    background: var(--panel-2);
+    border-color: var(--line);
+    color: var(--text);
+  }
+  :root[data-theme="dark"] .skill-card {
+    background: var(--panel-2);
+    border-color: var(--line);
+  }
+  :root[data-theme="dark"] .skill-card:hover {
+    border-color: #5c6980;
+    box-shadow: 0 6px 16px rgba(8, 12, 20, 0.35);
+  }
+  :root[data-theme="dark"] .skill-card.enabled {
+    border-color: #3f8f67;
+    background: linear-gradient(135deg, #273b33 0%, #23352e 100%);
+    box-shadow: 0 0 0 2px rgba(49, 184, 132, 0.18), 0 4px 12px rgba(10, 20, 14, 0.35);
+  }
+  :root[data-theme="dark"] .skill-card.enabled .skill-card-name { color: #9fe3c2; }
+  :root[data-theme="dark"] .skill-card-dot { background: #6c788f; }
+  :root[data-theme="dark"] .skill-card.enabled .skill-card-dot {
+    background: #31b884;
+    box-shadow: 0 0 0 3px rgba(49, 184, 132, 0.22);
+  }
+  :root[data-theme="dark"] .skill-mini-btn {
+    background: var(--panel);
+    border-color: var(--line);
+    color: #c8d4e8;
+  }
+  :root[data-theme="dark"] .skill-mini-btn:hover {
+    border-color: #64738e;
+    color: #e8edf6;
+  }
+  :root[data-theme="dark"] .skill-remove-btn { color: #aeb9cc; }
+  :root[data-theme="dark"] .skill-remove-btn:hover { color: #f09999; }
+  :root[data-theme="dark"] .toggle-track {
+    background: #3a4454;
+    border-color: #546177;
+  }
+  :root[data-theme="dark"] .toggle-track::after { background: #b6c2d8; }
+  :root[data-theme="dark"] .toggle-switch input:checked + .toggle-track {
+    background: #334c77;
+    border-color: #4b73b3;
+  }
+  :root[data-theme="dark"] #chat-input,
+  :root[data-theme="dark"] #mission-input,
+  :root[data-theme="dark"] #skill-search-input {
+    background: var(--panel-2);
+    border-color: var(--line);
+    color: var(--text);
+  }
+  :root[data-theme="dark"] #chat-input::placeholder,
+  :root[data-theme="dark"] #mission-input::placeholder,
+  :root[data-theme="dark"] #skill-search-input::placeholder {
+    color: #a9b5ca;
+  }
+  :root[data-theme="dark"] #settings-modal input,
+  :root[data-theme="dark"] #settings-modal select,
+  :root[data-theme="dark"] #settings-modal textarea,
+  :root[data-theme="dark"] .settings-input {
+    background: var(--panel-2) !important;
+    color: var(--text) !important;
+    border-color: var(--line) !important;
+  }
+  :root[data-theme="dark"] #settings-modal [style*="background:#fff"],
+  :root[data-theme="dark"] #settings-modal [style*="background: #fff"] {
+    background: var(--panel-2) !important;
+    color: var(--text) !important;
+  }
+  :root[data-theme="dark"] #settings-modal [style*="linear-gradient(180deg,#fff"],
+  :root[data-theme="dark"] #settings-modal [style*="linear-gradient(180deg, #fff"] {
+    background: linear-gradient(180deg, #323a47 0%, #2b3340 100%) !important;
+  }
+  :root[data-theme="dark"] #settings-modal #tg-status-bar {
+    background: #2a313d !important;
+    border: 1px solid var(--line);
+  }
+  :root[data-theme="dark"] #settings-modal .info-row {
+    border-bottom-color: var(--line);
+  }
+  :root[data-theme="dark"] #settings-modal button[style*="background:#fff"],
+  :root[data-theme="dark"] #settings-modal button[style*="background: #fff"] {
+    background: var(--panel) !important;
+    color: var(--text) !important;
+    border-color: var(--line) !important;
+  }
+  :root[data-theme="dark"] #settings-modal code {
+    background: #232a35 !important;
+    color: #d8e2f1;
+  }
+  :root[data-theme="dark"] .CodeMirror {
+    background: #1f242d;
+    color: #e8edf6;
+  }
+  :root[data-theme="dark"] .CodeMirror-gutters {
+    background: #232a35;
+    border-right: 1px solid var(--line);
   }
 
   #jobs-list,
@@ -1357,10 +1567,26 @@
 
   <div class="mode-toggle">
     <button class="mode-btn active" id="btn-chat" onclick="setMode('chat')">Chat</button>
-    <button class="mode-btn" id="btn-heartbeat" onclick="setMode('heartbeat')">Heartbeat</button>
+    <button class="mode-btn" id="btn-bgtasks" onclick="setMode('bgtasks')">🗂 Tasks</button>
   </div>
 
   <div class="status-bar">
+    <button
+      id="theme-toggle"
+      class="icon-btn"
+      data-theme-state="light"
+      onclick="toggleTheme()"
+      title="Switch to dark mode"
+      aria-label="Toggle dark mode"
+    >
+      <svg class="theme-icon sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <circle cx="12" cy="12" r="4"></circle>
+        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+      </svg>
+      <svg class="theme-icon moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3c-.04.25-.06.5-.06.76a8 8 0 0 0 9.85 7.84z"></path>
+      </svg>
+    </button>
     <button onclick="openSettings()" title="Settings" style="display:flex;align-items:center;gap:6px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius-sm);padding:6px 12px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;white-space:nowrap" onmouseover="this.style.color='var(--text)';this.style.borderColor='var(--line-strong)'" onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--line)'">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       Settings
@@ -1498,44 +1724,71 @@
   </div>
 </main>
 
-<!-- HEARTBEAT VIEW (full page overlay) -->
-<div id="heartbeat-view">
-  <div class="hb-topbar">
-    <div class="hb-status-dot" id="hb-dot"></div>
-    <span class="hb-topbar-label" id="hb-label">Heartbeat OFF</span>
-    <span class="hb-topbar-meta" id="hb-meta">Every 30m · 8:00 AM–10:00 PM</span>
-    <div class="hb-topbar-actions">
-      <button class="hb-btn" id="hb-toggle-btn" onclick="toggleHeartbeatEnabled()">Enable</button>
-      <button class="hb-btn primary" onclick="openTaskModal()">+ Add Task</button>
+<!-- Task Modal -->
+<div id="task-modal" style="display:none"></div>
+
+<!-- BACKGROUND TASKS KANBAN VIEW -->
+<div id="bgtasks-view" style="display:none;flex-direction:column;gap:0;position:absolute;top:90px;bottom:12px;left:12px;right:12px;background:var(--bg);padding:16px;overflow:hidden;border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);z-index:5;">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-shrink:0">
+    <div style="display:flex;align-items:center;gap:12px">
+      <span style="font-size:16px;font-weight:800;letter-spacing:-0.01em">Background Tasks</span>
+      <span id="bgt-count" style="font-size:11px;background:#eaf2ff;color:#0d4faf;border-radius:999px;padding:2px 10px;font-weight:700">0 tasks</span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button
+        id="bgt-heartbeat-label"
+        onclick="openBgtHeartbeatModal()"
+        style="border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:8px;padding:5px 10px;font-size:11px;font-weight:600;cursor:pointer"
+        title="Task heartbeat settings"
+      >⏳ heartbeat: 10min</button>
+      <button onclick="refreshBgTasks()" style="border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:8px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer">Refresh</button>
     </div>
   </div>
-  <div class="hb-content" id="hb-content">
-    <div class="hb-empty" id="hb-empty">
-      <div style="font-size:32px;margin-bottom:12px;opacity:0.3">🕓</div>
-      <div style="font-weight:700;margin-bottom:6px">No tasks yet</div>
-      <div>Add scheduled tasks, reminders, or heartbeat checks.<br>They'll run automatically and report back here.</div>
+
+  <!-- Kanban columns -->
+  <div id="bgt-board" style="display:flex;gap:12px;flex:1;min-height:0;overflow-x:auto;padding-bottom:8px">
+    <!-- Columns injected by renderBgTasks() -->
+  </div>
+
+  <!-- Task detail side panel -->
+  <div id="bgt-panel" style="display:none;position:absolute;top:0;right:0;width:480px;bottom:0;background:var(--panel);border-left:1px solid var(--line);flex-direction:column;overflow:hidden;z-index:10">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--line);flex-shrink:0">
+      <span id="bgt-panel-title" style="font-size:14px;font-weight:800">Task Details</span>
+      <div style="display:flex;gap:8px">
+        <button id="bgt-panel-pause" onclick="bgtPauseResume()" style="border:1px solid var(--line);background:var(--panel-2);border-radius:8px;padding:4px 12px;font-size:12px;font-weight:600;cursor:pointer;color:var(--muted)">Pause</button>
+        <button onclick="closeBgtPanel()" style="border:0;background:none;font-size:18px;cursor:pointer;color:var(--muted);line-height:1">&#x2715;</button>
+      </div>
     </div>
-    <div id="hb-section-running" class="hb-section" style="display:none">
-      <div class="hb-section-title"><div class="hb-section-dot red"></div>NOW — Running</div>
-      <div id="hb-running-cards"></div>
-    </div>
-    <div id="hb-section-queued" class="hb-section" style="display:none">
-      <div class="hb-section-title"><div class="hb-section-dot yellow"></div>UP NEXT</div>
-      <div id="hb-queued-cards"></div>
-    </div>
-    <div id="hb-section-scheduled" class="hb-section" style="display:none">
-      <div class="hb-section-title"><div class="hb-section-dot green"></div>SCHEDULED</div>
-      <div id="hb-scheduled-cards"></div>
-    </div>
-    <div id="hb-section-completed" class="hb-section" style="display:none">
-      <div class="hb-section-title" style="cursor:pointer" onclick="document.getElementById('hb-completed-cards').style.display=document.getElementById('hb-completed-cards').style.display==='none'?'block':'none'"><div class="hb-section-dot gray"></div>COMPLETED (click to expand)</div>
-      <div id="hb-completed-cards" style="display:none"></div>
+    <div id="bgt-panel-body" style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px">
+      <!-- Filled by openBgtPanel() -->
     </div>
   </div>
 </div>
 
-<!-- Task Modal -->
-<div id="task-modal" style="display:none"></div>
+<!-- Background Task Heartbeat Modal -->
+<div id="bgt-heartbeat-modal" style="display:none;position:fixed;inset:0;background:rgba(10,20,40,0.35);z-index:9999;align-items:center;justify-content:center;padding:18px">
+  <div style="width:min(420px,96vw);max-height:90vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-md)">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--line)">
+      <div style="font-weight:800">Task Heartbeat</div>
+      <button class="btn btn-sm" style="background:var(--panel-2);color:var(--muted);border:1px solid var(--line)" onclick="closeBgtHeartbeatModal()">Close</button>
+    </div>
+    <div style="padding:14px 16px;display:flex;flex-direction:column;gap:12px">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="bgt-hb-enabled" />
+        Enable task heartbeat
+      </label>
+      <div>
+        <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:6px">Interval (minutes)</label>
+        <input id="bgt-hb-interval" type="number" min="1" max="1440" step="1" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:8px;font-size:13px;font-family:'IBM Plex Mono',monospace" />
+        <div style="font-size:11px;color:var(--muted);margin-top:6px">Range: 1 to 1440 minutes</div>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--line)">
+      <button class="btn btn-sm" style="background:var(--panel-2);color:var(--muted);border:1px solid var(--line)" onclick="closeBgtHeartbeatModal()">Cancel</button>
+      <button class="btn btn-sm" onclick="saveBgtHeartbeatConfig()">Save</button>
+    </div>
+  </div>
+</div>
 
 <!-- RIGHT PANEL -->
   <div class="right-panel" id="right-panel" style="position:relative">
@@ -1837,6 +2090,8 @@
     <div id="settings-panel-security" style="display:none;padding:14px 16px">
       <div style="border:1px solid var(--line);border-radius:12px;padding:12px">
         <div class="right-section-title" style="margin-bottom:8px">File Access</div>
+        <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:6px">Workspace Path</label>
+        <input id="settings-workspace-path" type="text" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:8px;font-family:'IBM Plex Mono',monospace;font-size:12px;margin-bottom:10px" placeholder="e.g. D:\SmallClaw\workspace" />
         <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:6px">Allowed Paths (one per line)</label>
         <textarea id="settings-allowed-paths" style="width:100%;min-height:120px;border:1px solid var(--line);border-radius:10px;padding:8px;font-family:'IBM Plex Mono',monospace;font-size:12px"></textarea>
         <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 6px">Blocked Paths (one per line)</label>
@@ -2047,6 +2302,117 @@
               <input id="orch-max-assists-session" class="settings-input" type="number" min="1" max="100" value="18" />
             </div>
           </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px">
+            <div>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Browser advisor calls / turn</div>
+              <input id="orch-browser-calls-turn" class="settings-input" type="number" min="1" max="12" value="5" />
+            </div>
+            <div>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Browser max collected items</div>
+              <input id="orch-browser-max-items" class="settings-input" type="number" min="12" max="240" value="80" />
+            </div>
+            <div>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Browser forced retries</div>
+              <input id="orch-browser-forced-retries" class="settings-input" type="number" min="0" max="6" value="2" />
+            </div>
+          </div>
+          <div id="orch-preempt-panel" style="margin-bottom:12px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--panel-2)">
+            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
+              Ollama stall preempt: hard-restart Ollama if generation hangs too long (skill-gated).
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Preempt enabled</div>
+                <select id="orch-preempt-enabled" class="settings-input">
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select>
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Stall threshold (sec)</div>
+                <input id="orch-preempt-threshold" class="settings-input" type="number" min="10" max="300" value="45" />
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Max preempts / turn</div>
+                <input id="orch-preempt-max-turn" class="settings-input" type="number" min="1" max="3" value="1" />
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Max preempts / session</div>
+                <input id="orch-preempt-max-session" class="settings-input" type="number" min="1" max="10" value="3" />
+              </div>
+            </div>
+            <div id="orch-preempt-note" style="font-size:10px;color:var(--muted);margin-top:8px;display:none">
+              Preempt runs only when the active primary provider is Ollama.
+            </div>
+          </div>
+          <div id="orch-fileops-panel" style="margin-bottom:12px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--panel-2)">
+            <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
+              FILE_OP v2: size gating, verification triggers, watchdog, and checkpointing.
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">FILE_OP v2 enabled</div>
+                <select id="orch-fileops-enabled" class="settings-input">
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select>
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Verify create always</div>
+                <select id="orch-fileops-verify-create" class="settings-input">
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Primary create max lines</div>
+                <input id="orch-fileops-create-lines" class="settings-input" type="number" min="20" max="400" value="80" />
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Primary create max chars</div>
+                <input id="orch-fileops-create-chars" class="settings-input" type="number" min="800" max="40000" value="3500" />
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Primary edit max lines</div>
+                <input id="orch-fileops-edit-lines" class="settings-input" type="number" min="1" max="80" value="12" />
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Primary edit max chars</div>
+                <input id="orch-fileops-edit-chars" class="settings-input" type="number" min="100" max="8000" value="800" />
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Primary edit max files</div>
+                <input id="orch-fileops-edit-files" class="settings-input" type="number" min="1" max="8" value="1" />
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Verify large payload lines</div>
+                <input id="orch-fileops-verify-lines" class="settings-input" type="number" min="5" max="400" value="25" />
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Verify large payload chars</div>
+                <input id="orch-fileops-verify-chars" class="settings-input" type="number" min="200" max="50000" value="1200" />
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Watchdog no-progress cycles</div>
+                <input id="orch-fileops-watchdog-cycles" class="settings-input" type="number" min="2" max="8" value="3" />
+              </div>
+              <div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Checkpointing</div>
+                <select id="orch-fileops-checkpointing" class="settings-input">
+                  <option value="true">Enabled</option>
+                  <option value="false">Disabled</option>
+                </select>
+              </div>
+            </div>
+          </div>
           <div id="orch-eligibility-msg" style="font-size:11px;color:var(--muted);margin-bottom:8px;padding:8px 10px;background:var(--panel-2);border:1px solid var(--line);border-radius:10px;display:none"></div>
           <button onclick="saveOrchestrationConfig()" class="btn" style="width:100%;margin-bottom:8px">Save Orchestration Settings</button>
         </div>
@@ -2120,6 +2486,7 @@ let sidebarTab = 'jobs';
 let useAgentMode = false;
 const CHAT_SESSIONS_KEY = 'smallclaw_chat_sessions_v1';
 const AGENT_SESSION_KEY = 'smallclaw_agent_session_id';
+const THEME_KEY = 'smallclaw_theme';
 function generateSessionId() {
   return (crypto?.randomUUID?.() || ('sess_' + Math.random().toString(36).slice(2)));
 }
@@ -2138,6 +2505,7 @@ let chatSessions = [];
 let activeChatSessionId = null;
 let sessionsEditMode = false;
 let isThinking = false;
+let streamingSessionId = null; // which session owns the active stream
 let processLogEntries = [];
 let currentTurnStartIndex = -1;
 let lastAgentMode = '-';
@@ -2257,6 +2625,7 @@ function syncActiveChat() {
   const sess = chatSessions.find(s => s.id === activeChatSessionId);
   chatHistory = sess ? (sess.history || []) : [];
   processLogEntries = sess ? (sess.processLog || []) : [];
+  liveTaskSteps = [];  // clear live steps so a different session never inherits in-progress tool display
   renderChatMessages();
   renderProcessLog();
   renderLiveStepsPanel();
@@ -2320,20 +2689,23 @@ function openSession(id) {
 
 // ---- Mode switching ----
 function setMode(mode) {
+  if (mode !== 'chat' && mode !== 'bgtasks') mode = 'chat';
   currentMode = mode;
   // Toggle buttons
   document.getElementById('btn-chat').classList.toggle('active', mode === 'chat');
-  document.getElementById('btn-heartbeat').classList.toggle('active', mode === 'heartbeat');
+  const bgtBtn = document.getElementById('btn-bgtasks');
+  if (bgtBtn) bgtBtn.classList.toggle('active', mode === 'bgtasks');
   // Toggle views
   document.getElementById('chat-view').style.display = mode === 'chat' ? 'flex' : 'none';
-  document.getElementById('heartbeat-view').style.display = mode === 'heartbeat' ? 'flex' : 'none';
+  const bgtView = document.getElementById('bgtasks-view');
+  if (bgtView) bgtView.style.display = mode === 'bgtasks' ? 'flex' : 'none';
   // Toggle sidebar + right panel visibility
   const aside = document.querySelector('aside');
   const rightPanel = document.getElementById('right-panel');
   if (aside) aside.style.display = mode === 'chat' ? '' : 'none';
   if (rightPanel) rightPanel.style.display = mode === 'chat' ? '' : 'none';
-  // Load tasks when switching to heartbeat
-  if (mode === 'heartbeat') loadTasksFromServer();
+  // Load background tasks when switching to bgtasks
+  if (mode === 'bgtasks') refreshBgTasks();
 }
 
 // ─── Heartbeat / Tasks System ───────────────────────────────────────────────
@@ -2484,7 +2856,6 @@ function openTaskModal(taskId) {
       <select id="tm-type">
         <option value="recurring" ${!job || job.type==='recurring' ? 'selected' : ''}>Recurring (cron)</option>
         <option value="one-shot" ${job?.type==='one-shot' ? 'selected' : ''}>One-shot (run once)</option>
-        <option value="heartbeat" ${job?.type==='heartbeat' ? 'selected' : ''}>Heartbeat check</option>
       </select>
       <label>Schedule (cron expression)</label>
       <input id="tm-schedule" value="${job?.schedule || '*/30 * * * *'}" placeholder="*/30 * * * * (every 30 min)">
@@ -2773,7 +3144,7 @@ function renderChatMessages() {
     </div>`;
   }).join('');
 
-  if (isThinking) {
+  if (isThinking && streamingSessionId === activeChatSessionId) {
     const progressHtml = currentProgressLines.length
       ? `<div style="margin:6px 0 8px 0;font-size:11px;line-height:1.6;color:var(--muted)">
           ${currentProgressLines.map((l) => `<div>• ${escHtml(l)}</div>`).join('')}
@@ -2827,10 +3198,18 @@ function renderProcessPill(entries) {
 
 function formatProcessLines(entries) {
   if (!entries || entries.length === 0) return '<div style="color:var(--muted)">No process details.</div>';
+  const TYPE_COLORS = {
+    user: 'var(--text)', think: '#388bfd', tool: '#e3b341',
+    result: '#bc8cff', error: 'var(--red)', final: '#56d364',
+    warn: 'var(--yellow)', step: '#56d364', info: '#79c0ff',
+    split: 'var(--accent2)', synth: 'var(--accent2)',
+  };
   return entries.map(e => {
-    const type = escHtml(String(e.type || 'info')).toUpperCase();
+    const rawType = String(e.type || 'info');
+    const typeLabel = escHtml(rawType).toUpperCase();
+    const typeColor = TYPE_COLORS[rawType] || 'var(--muted)';
     const content = escHtml(String(e.content || ''));
-    return `<div style="margin-bottom:4px"><span style="color:var(--muted)">[${escHtml(String(e.ts || ''))}] ${type}</span> ${content}</div>`;
+    return `<div style="margin-bottom:4px"><span style="color:var(--muted)">[${escHtml(String(e.ts || ''))}]</span> <span style="color:${typeColor};font-weight:600">${typeLabel}</span> ${content}</div>`;
   }).join('');
 }
 
@@ -2933,20 +3312,20 @@ function renderProcessLog() {
   }
 
   el.innerHTML = processLogEntries.map((e,i) => {
-    let icon, color, label;
+    let icon, color, label, labelColor;
     switch(e.type) {
-      case 'user':    icon='▶'; color='var(--accent2)'; label='USER';   break;
-      case 'think':   icon='💭'; color='var(--muted)';   label='THINK';  break;
-      case 'tool':    icon='⚡'; color='var(--blue)';    label='TOOL';   break;
-      case 'result':  icon='✓'; color='var(--green)';   label='OK';     break;
-      case 'error':   icon='✗'; color='var(--red)';     label='FAIL';   break;
-      case 'final':   icon='★'; color='var(--green)';   label='FINAL';  break;
-      case 'warn':    icon='⚠'; color='var(--yellow)';  label='WARN';   break;
-      case 'step':    icon='↻'; color='var(--muted)';   label='STEP';   break;
-      case 'split':   icon='⋮'; color='var(--accent2)'; label='SPLIT';  break;
-      case 'synth':   icon='⊕'; color='var(--accent2)'; label='SYNTH';  break;
-      case 'info':    icon='·'; color='var(--muted)';   label='INFO';   break;
-      default:        icon='·'; color='var(--muted)';   label=e.type;   break;
+      case 'user':    icon='▶'; color='var(--accent2)'; labelColor='var(--text)';     label='USER';   break;
+      case 'think':   icon='💭'; color='#388bfd';        labelColor='#388bfd';         label='THINK';  break;
+      case 'tool':    icon='⚡'; color='#e3b341';        labelColor='#e3b341';         label='TOOL';   break;
+      case 'result':  icon='✓'; color='#bc8cff';        labelColor='#bc8cff';         label='OK';     break;
+      case 'error':   icon='✗'; color='var(--red)';     labelColor='var(--red)';      label='FAIL';   break;
+      case 'final':   icon='★'; color='#56d364';        labelColor='#56d364';         label='FINAL';  break;
+      case 'warn':    icon='⚠'; color='var(--yellow)';  labelColor='var(--yellow)';   label='WARN';   break;
+      case 'step':    icon='↻'; color='#56d364';        labelColor='#56d364';         label='STEP';   break;
+      case 'split':   icon='⋮'; color='var(--accent2)'; labelColor='var(--accent2)';  label='SPLIT';  break;
+      case 'synth':   icon='⊕'; color='var(--accent2)'; labelColor='var(--accent2)';  label='SYNTH';  break;
+      case 'info':    icon='·'; color='#79c0ff';        labelColor='#79c0ff';         label='INFO';   break;
+      default:        icon='·'; color='var(--muted)';   labelColor='var(--muted)';    label=e.type;   break;
     }
 
     // Think entries: show full content in a scrollable block
@@ -2956,7 +3335,7 @@ function renderProcessLog() {
       return `
         <div style="margin-bottom:4px">
           <span style="color:var(--muted);font-size:10px">${e.ts}</span>
-          <span style="color:${color};margin:0 6px">${icon} ${label}</span>
+          <span style="color:${color};margin:0 6px">${icon} <span style="color:${labelColor}">${label}</span></span>
           <span style="color:var(--muted);cursor:pointer;text-decoration:underline;font-size:10px" onclick="togglePL('${id}')">${escHtml(preview)}…</span>
         </div>
         <div id="${id}" style="display:none;background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;white-space:pre-wrap;color:var(--muted);font-size:10px;max-height:200px;overflow-y:auto;font-style:italic">${escHtml(e.content)}</div>
@@ -2970,7 +3349,7 @@ function renderProcessLog() {
       return `
         <div style="margin-bottom:4px">
           <span style="color:var(--muted);font-size:10px">${e.ts}</span>
-          <span style="color:${color};margin:0 6px">${icon} ${label}</span>
+          <span style="color:${color};margin:0 6px">${icon} <span style="color:${labelColor}">${label}</span></span>
           <span style="color:${color};cursor:pointer;font-size:10px" onclick="togglePL('${id}')">${escHtml(preview)}… <span style="opacity:0.5">[expand]</span></span>
         </div>
         <div id="${id}" style="display:none;background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;white-space:pre-wrap;color:var(--text);font-size:10px;max-height:300px;overflow-y:auto">${escHtml(e.content)}</div>
@@ -2984,7 +3363,7 @@ function renderProcessLog() {
       return `
         <div style="margin-bottom:6px">
           <span style="color:var(--muted);font-size:10px">${e.ts}</span>
-          <span style="color:${color};margin:0 6px">${icon} ${label}</span>
+          <span style="color:${color};margin:0 6px">${icon} <span style="color:${labelColor}">${label}</span></span>
           <span style="color:var(--text);">${escHtml(String(e.content || ''))}</span>
           <div style="margin-top:6px">
             <button class="btn btn-sm" onclick="confirmMemory(${i})">Approve</button>
@@ -3001,7 +3380,7 @@ function renderProcessLog() {
       return `
         <div style="margin-bottom:3px">
           <span style="color:var(--muted);font-size:10px">${e.ts}</span>
-          <span style="color:${color}">${icon} ${label}</span>
+          <span style="color:${color}">${icon} <span style="color:${labelColor}">${label}</span></span>
           <span style="color:var(--text);margin-left:8px">${escHtml(String(e.content || ''))}</span>
           <span style="color:var(--muted);cursor:pointer;margin-left:8px;font-size:10px" onclick="togglePL('${id}')">[details]</span>
         </div>
@@ -3009,7 +3388,7 @@ function renderProcessLog() {
       `;
     }
 
-    return `<div style="margin-bottom:3px"><span style="color:var(--muted);font-size:10px">${e.ts}</span> <span style="color:${color}">${icon} ${label}</span>  <span style="color:var(--text)">${escHtml(String(e.content || ''))}</span></div>`;
+    return `<div style="margin-bottom:3px"><span style="color:var(--muted);font-size:10px">${e.ts}</span> <span style="color:${color}">${icon} <span style="color:${labelColor}">${label}</span></span>  <span style="color:var(--text)">${escHtml(String(e.content || ''))}</span></div>`;
   }).join('');
 
   if (shouldFollow) el.scrollTop = el.scrollHeight;
@@ -3059,6 +3438,7 @@ async function sendChat(queuedMessage = null) {
     input.style.height = 'auto';
   }
   isThinking = true;
+  streamingSessionId = activeChatSessionId; // lock bubble to this session
   setButtonState(true);
   currentPreflightStatus = '';
   currentProgressLines = [];
@@ -3206,9 +3586,19 @@ async function sendChat(queuedMessage = null) {
           case 'tool_call': {
             const action = String(event.action || '').trim();
             const stepNum = Number(event.stepNum || 0);
+            const args = (event.args && typeof event.args === 'object') ? event.args : null;
+            const argsPreview = args ? JSON.stringify(args).slice(0, 260) : '';
+            const syntheticTag = event.synthetic ? ' [synthetic]' : '';
             sawToolActivityThisTurn = true;
             if (action) pushProgressLine(`${stepNum ? `Step ${stepNum}: ` : ''}Running ${action}...`);
             upsertLiveStep(action || 'tool', stepNum || (liveTaskSteps.length + 1), 'in_progress', 'running');
+            if (action) {
+              addProcessEntry(
+                'tool',
+                `${stepNum ? `Step ${stepNum}: ` : ''}${action}${syntheticTag}${argsPreview ? ` ${argsPreview}` : ''}`,
+                args || undefined,
+              );
+            }
             break;
           }
 
@@ -3217,9 +3607,14 @@ async function sendChat(queuedMessage = null) {
             const stepNum = Number(event.stepNum || 0);
             sawToolActivityThisTurn = true;
             const text = String(event.result || '');
-            const ok = !/^ERROR:/i.test(text);
+            const ok = event.error === true ? false : !/^ERROR:/i.test(text);
+            const syntheticTag = event.synthetic ? ' [synthetic]' : '';
             if (action) pushProgressLine(`${stepNum ? `Step ${stepNum}: ` : ''}${action} ${ok ? 'complete' : 'failed'}`);
             upsertLiveStep(action || 'tool', stepNum || (liveTaskSteps.length + 1), ok ? 'done' : 'failed', ok ? 'completed' : text.slice(0, 120));
+            addProcessEntry(
+              ok ? 'result' : 'error',
+              `${stepNum ? `Step ${stepNum}: ` : ''}${action || 'tool'}${syntheticTag} => ${text || '(no output)'}`,
+            );
             loadAgentSessionContext();
             break;
           }
@@ -3237,14 +3632,104 @@ async function sendChat(queuedMessage = null) {
             const cap = (Number.isFinite(Number(event.assist_count)) && Number.isFinite(Number(event.assist_cap)))
               ? ` | assists ${event.assist_count}/${event.assist_cap}`
               : '';
-            addProcessEntry('info', `Orchestrator: trigger=${trigger} mode=${mode}${route}${reason}${cap}`);
+            addProcessEntry('info', `Orchestrator: trigger=${trigger} mode=${mode}${route}${reason}${cap}`, event);
             if (event.preflight?.quick_plan?.length) {
               addProcessEntry('info', `Orchestrator plan: ${event.preflight.quick_plan[0]}`);
             } else if (event.advice?.next_actions?.length) {
               addProcessEntry('info', `Orchestrator next: ${event.advice.next_actions[0]}`);
             }
+            const preflightRaw = String(event.preflight?.raw_response || '').trim();
+            if (preflightRaw) {
+              addProcessEntry('think', `[Secondary AI preflight raw response]\n${preflightRaw}`);
+            }
+            const adviceRaw = String(event.advice?.raw_response || '').trim();
+            if (adviceRaw) {
+              addProcessEntry('think', `[Secondary AI advisor raw response]\n${adviceRaw}`);
+            }
             break;
           }
+
+          case 'browser_advisor_start': {
+            const pageType = event.page_type ? ` type=${event.page_type}` : '';
+            const count = Number.isFinite(Number(event.extracted_count)) ? ` | extracted=${event.extracted_count}` : '';
+            addProcessEntry('info', `Browser advisor start:${pageType}${count}`);
+            break;
+          }
+
+          case 'feed_collected': {
+            const b = Number(event.batch || 0);
+            const added = Number(event.added || 0);
+            const total = Number(event.total || 0);
+            const deduped = Number(event.deduped || 0);
+            addProcessEntry('info', `Feed collected: batch ${b} | +${added} | total ${total} | deduped ${deduped}`);
+            break;
+          }
+
+          case 'browser_advisor_route': {
+            const route = String(event.route || 'unknown');
+            const reason = event.reason ? ` | ${String(event.reason)}` : '';
+            const cap = (Number.isFinite(Number(event.assist_count)) && Number.isFinite(Number(event.assist_cap)))
+              ? ` | assists ${event.assist_count}/${event.assist_cap}`
+              : '';
+            const nextTool = event.next_tool?.tool ? ` | next=${event.next_tool.tool}` : '';
+            addProcessEntry('info', `Browser advisor route=${route}${nextTool}${reason}${cap}`, event);
+            const rawResponse = String(event.raw_response || '').trim();
+            if (rawResponse) {
+              addProcessEntry('think', `[Secondary AI browser advisor raw response]\n${rawResponse}`);
+            }
+            break;
+          }
+
+          case 'browser_advisor_nudge': {
+            const route = event.route ? `[${event.route}] ` : '';
+            const preview = String(event.preview || '').trim();
+            if (preview) addProcessEntry('info', `Advisor nudge ${route}${preview}`);
+            break;
+          }
+
+          case 'forced_retry': {
+            const reason = String(event.reason || 'advisor requested continuation');
+            const retry = Number(event.retry || 0);
+            const max = Number(event.max_retries || 0);
+            addProcessEntry('warn', `Forced retry ${retry}/${max}: ${reason}`);
+            break;
+          }
+
+          case 'preempt_start': {
+            const elapsedSec = Math.max(1, Math.round(Number(event.elapsed_ms || 0) / 1000));
+            const thresholdSec = Math.max(1, Math.round(Number(event.threshold_ms || 0) / 1000));
+            addProcessEntry('warn', `Preempt start: generation stalled ${elapsedSec}s (threshold ${thresholdSec}s).`);
+            break;
+          }
+
+          case 'preempt_killed': {
+            const restarted = event.restarted === true;
+            const cap = (Number.isFinite(Number(event.preempts_session)) && Number.isFinite(Number(event.preempts_session_cap)))
+              ? ` | preempts ${event.preempts_session}/${event.preempts_session_cap}`
+              : '';
+            addProcessEntry(restarted ? 'info' : 'warn', `Preempt kill/restart ${restarted ? 'completed' : 'failed'}${cap}`);
+            break;
+          }
+
+          case 'preempt_ready': {
+            const cap = (Number.isFinite(Number(event.preempts_session)) && Number.isFinite(Number(event.preempts_session_cap)))
+              ? ` | preempts ${event.preempts_session}/${event.preempts_session_cap}`
+              : '';
+            addProcessEntry('info', `Preempt ready: Ollama online, running rescue advisor${cap}`);
+            break;
+          }
+
+          case 'preempt_rescue': {
+            const cap = (Number.isFinite(Number(event.assist_count)) && Number.isFinite(Number(event.assist_cap)))
+              ? ` | assists ${event.assist_count}/${event.assist_cap}`
+              : '';
+            addProcessEntry('info', `Preempt rescue guidance injected${cap}`);
+            break;
+          }
+
+          case 'preempt_retry':
+            addProcessEntry('info', 'Preempt retry: re-running primary with rescue context.');
+            break;
 
           case 'synthesizing':
             pushProgressLine(`Synthesizing ${Number(event.count || 1)} answer(s)...`);
@@ -3404,6 +3889,7 @@ async function sendChat(queuedMessage = null) {
   }
 
   isThinking = false;
+  streamingSessionId = null; // release session lock
   currentAbortController = null;
   setButtonState(false);
   currentPreflightStatus = '';
@@ -3495,6 +3981,36 @@ function connectWS() {
       if (currentMode === 'heartbeat' && msg.event === 'tool_result') {
         const card = document.querySelector(`[data-job-id="${msg.jobId}"] .hb-card-meta`);
         if (card) card.innerHTML = `<span style="color:var(--brand)">Working: ${escHtml((msg.data?.action || '').slice(0,40))}...</span>`;
+      }
+    }
+    // ── Background Task (Kanban) events ──
+    if (msg.type === 'task_running' || msg.type === 'task_complete' || msg.type === 'task_paused' ||
+        msg.type === 'task_failed' || msg.type === 'task_needs_assistance' || msg.type === 'task_step_done' || msg.type === 'task_tool_call' ||
+        msg.type === 'task_heartbeat_tick' || msg.type === 'task_heartbeat_resumed') {
+      // Live-refresh the kanban board if visible
+      if (currentMode === 'bgtasks') refreshBgTasks();
+      // If panel is open for this task, refresh it
+      if (bgtOpenTaskId && (msg.taskId === bgtOpenTaskId)) {
+        bgtRefreshOpenPanel();
+      }
+      // Toast notification for completions and errors
+      if (msg.type === 'task_complete') {
+        bgtToast(`✅ Task complete`, msg.summary ? msg.summary.slice(0,120) : '');
+      } else if (msg.type === 'task_failed') {
+        bgtToast(`❌ Task failed`, msg.error ? msg.error.slice(0,120) : '');
+      } else if (msg.type === 'task_needs_assistance') {
+        bgtToast(`⚠️ Task paused`, msg.reason ? String(msg.reason).slice(0, 120) : 'Needs assistance');
+      }
+    }
+    // Notification from task runner (status push to channel)
+    if (msg.type === 'task_notification' && msg.sessionId) {
+      // Try to add a status message to the originating chat session
+      const sess = chatSessions.find(s => s.id === msg.sessionId);
+      if (sess) {
+        sess.history = sess.history || [];
+        sess.history.push({ role: 'assistant', content: msg.message || '' });
+        saveChatSessions();
+        if (currentSessionId === msg.sessionId) renderMessages();
       }
     }
   };
@@ -3619,11 +4135,10 @@ function onProviderChange() {
   });
   if (provider === 'openai') {
     refreshOpenAIModels(true).catch(() => {});
-    return;
-  }
-  if (['ollama', 'lm_studio', 'llama_cpp'].includes(provider)) {
+  } else if (['ollama', 'lm_studio', 'llama_cpp'].includes(provider)) {
     refreshProviderModels().catch(() => {});
   }
+  syncOrchPreemptControls();
 }
 
 async function loadModelSettings() {
@@ -4031,6 +4546,7 @@ async function openSettings() {
   } catch {}
   try {
     const paths = await api('/api/settings/paths');
+    document.getElementById('settings-workspace-path').value = paths.workspace_path || '';
     document.getElementById('settings-allowed-paths').value = (paths.allowed_paths || []).join('\n');
     document.getElementById('settings-blocked-paths').value = (paths.blocked_paths || []).join('\n');
   } catch {}
@@ -4147,6 +4663,7 @@ async function sendTelegramTestMessage() {
 }
 
 async function saveSettings() {
+  const workspace_path = document.getElementById('settings-workspace-path').value.trim();
   const allowed_paths = document.getElementById('settings-allowed-paths').value.split('\n').map(s => s.trim()).filter(Boolean);
   const blocked_paths = document.getElementById('settings-blocked-paths').value.split('\n').map(s => s.trim()).filter(Boolean);
   const payload = {
@@ -4176,7 +4693,7 @@ async function saveSettings() {
   };
   const providerPayload = buildProviderPayload();
   try {
-    await api('/api/settings/paths', { method: 'POST', body: JSON.stringify({ allowed_paths, blocked_paths }) });
+    await api('/api/settings/paths', { method: 'POST', body: JSON.stringify({ workspace_path, allowed_paths, blocked_paths }) });
     await api('/api/settings/search', { method: 'POST', body: JSON.stringify(payload) });
     await api('/api/settings/agent', { method: 'POST', body: JSON.stringify(policyPayload) });
     await api('/api/settings/model', { method: 'POST', body: JSON.stringify(modelPayload) });
@@ -4274,7 +4791,7 @@ function renderSessionsList() {
 // ---- Select job ----
 async function selectJob(jobId) {
   selectedJobId = jobId;
-  setMode('mission');
+  setMode('chat');
   renderJobsList(allJobs);
   await refreshJobDetail(jobId);
   clearInterval(pollInterval);
@@ -4640,6 +5157,24 @@ async function loadOrchestrationConfig() {
     const cooldownEl = document.getElementById('orch-cooldown-rounds');
     const maxAssistTurnEl = document.getElementById('orch-max-assists-turn');
     const maxAssistSessionEl = document.getElementById('orch-max-assists-session');
+    const browserCallsEl = document.getElementById('orch-browser-calls-turn');
+    const browserItemsEl = document.getElementById('orch-browser-max-items');
+    const browserRetriesEl = document.getElementById('orch-browser-forced-retries');
+    const preemptEnabledEl = document.getElementById('orch-preempt-enabled');
+    const preemptThresholdEl = document.getElementById('orch-preempt-threshold');
+    const preemptMaxTurnEl = document.getElementById('orch-preempt-max-turn');
+    const preemptMaxSessionEl = document.getElementById('orch-preempt-max-session');
+    const fileOpsEnabledEl = document.getElementById('orch-fileops-enabled');
+    const fileOpsVerifyCreateEl = document.getElementById('orch-fileops-verify-create');
+    const fileOpsCreateLinesEl = document.getElementById('orch-fileops-create-lines');
+    const fileOpsCreateCharsEl = document.getElementById('orch-fileops-create-chars');
+    const fileOpsEditLinesEl = document.getElementById('orch-fileops-edit-lines');
+    const fileOpsEditCharsEl = document.getElementById('orch-fileops-edit-chars');
+    const fileOpsEditFilesEl = document.getElementById('orch-fileops-edit-files');
+    const fileOpsVerifyLinesEl = document.getElementById('orch-fileops-verify-lines');
+    const fileOpsVerifyCharsEl = document.getElementById('orch-fileops-verify-chars');
+    const fileOpsWatchdogCyclesEl = document.getElementById('orch-fileops-watchdog-cycles');
+    const fileOpsCheckpointingEl = document.getElementById('orch-fileops-checkpointing');
     if (provEl)  provEl.value  = cfg.secondary?.provider || '';
     await updateOrchSecondaryModels(cfg.secondary?.model || '');
     if (failEl)  failEl.value  = String(cfg.triggers?.consecutive_failures ?? 2);
@@ -4653,6 +5188,25 @@ async function loadOrchestrationConfig() {
     if (cooldownEl) cooldownEl.value = String(cfg.limits?.assist_cooldown_rounds ?? 3);
     if (maxAssistTurnEl) maxAssistTurnEl.value = String(cfg.limits?.max_assists_per_turn ?? 3);
     if (maxAssistSessionEl) maxAssistSessionEl.value = String(cfg.limits?.max_assists_per_session ?? 18);
+    if (browserCallsEl) browserCallsEl.value = String(cfg.browser?.max_advisor_calls_per_turn ?? 5);
+    if (browserItemsEl) browserItemsEl.value = String(cfg.browser?.max_collected_items ?? 80);
+    if (browserRetriesEl) browserRetriesEl.value = String(cfg.browser?.max_forced_retries ?? 2);
+    if (preemptEnabledEl) preemptEnabledEl.value = String(cfg.preempt?.enabled === true);
+    if (preemptThresholdEl) preemptThresholdEl.value = String(cfg.preempt?.stall_threshold_seconds ?? 45);
+    if (preemptMaxTurnEl) preemptMaxTurnEl.value = String(cfg.preempt?.max_preempts_per_turn ?? 1);
+    if (preemptMaxSessionEl) preemptMaxSessionEl.value = String(cfg.preempt?.max_preempts_per_session ?? 3);
+    if (fileOpsEnabledEl) fileOpsEnabledEl.value = String(cfg.file_ops?.enabled !== false);
+    if (fileOpsVerifyCreateEl) fileOpsVerifyCreateEl.value = String(cfg.file_ops?.verify_create_always !== false);
+    if (fileOpsCreateLinesEl) fileOpsCreateLinesEl.value = String(cfg.file_ops?.primary_create_max_lines ?? 80);
+    if (fileOpsCreateCharsEl) fileOpsCreateCharsEl.value = String(cfg.file_ops?.primary_create_max_chars ?? 3500);
+    if (fileOpsEditLinesEl) fileOpsEditLinesEl.value = String(cfg.file_ops?.primary_edit_max_lines ?? 12);
+    if (fileOpsEditCharsEl) fileOpsEditCharsEl.value = String(cfg.file_ops?.primary_edit_max_chars ?? 800);
+    if (fileOpsEditFilesEl) fileOpsEditFilesEl.value = String(cfg.file_ops?.primary_edit_max_files ?? 1);
+    if (fileOpsVerifyLinesEl) fileOpsVerifyLinesEl.value = String(cfg.file_ops?.verify_large_payload_lines ?? 25);
+    if (fileOpsVerifyCharsEl) fileOpsVerifyCharsEl.value = String(cfg.file_ops?.verify_large_payload_chars ?? 1200);
+    if (fileOpsWatchdogCyclesEl) fileOpsWatchdogCyclesEl.value = String(cfg.file_ops?.watchdog_no_progress_cycles ?? 3);
+    if (fileOpsCheckpointingEl) fileOpsCheckpointingEl.value = String(cfg.file_ops?.checkpointing_enabled !== false);
+    syncOrchPreemptControls();
     // Check eligibility
     const elig = await api('/api/orchestration/eligible');
     const msg  = document.getElementById('orch-eligibility-msg');
@@ -4683,6 +5237,24 @@ async function saveOrchestrationConfig() {
   const cooldownRounds = Number(document.getElementById('orch-cooldown-rounds')?.value || 3);
   const maxAssistsTurn = Number(document.getElementById('orch-max-assists-turn')?.value || 3);
   const maxAssistsSession = Number(document.getElementById('orch-max-assists-session')?.value || 18);
+  const browserCallsPerTurn = Number(document.getElementById('orch-browser-calls-turn')?.value || 5);
+  const browserMaxItems = Number(document.getElementById('orch-browser-max-items')?.value || 80);
+  const browserForcedRetries = Number(document.getElementById('orch-browser-forced-retries')?.value || 2);
+  const preemptEnabled = document.getElementById('orch-preempt-enabled')?.value === 'true';
+  const preemptThresholdSec = Number(document.getElementById('orch-preempt-threshold')?.value || 45);
+  const preemptMaxTurn = Number(document.getElementById('orch-preempt-max-turn')?.value || 1);
+  const preemptMaxSession = Number(document.getElementById('orch-preempt-max-session')?.value || 3);
+  const fileOpsEnabled = document.getElementById('orch-fileops-enabled')?.value !== 'false';
+  const fileOpsVerifyCreate = document.getElementById('orch-fileops-verify-create')?.value !== 'false';
+  const fileOpsCreateLines = Number(document.getElementById('orch-fileops-create-lines')?.value || 80);
+  const fileOpsCreateChars = Number(document.getElementById('orch-fileops-create-chars')?.value || 3500);
+  const fileOpsEditLines = Number(document.getElementById('orch-fileops-edit-lines')?.value || 12);
+  const fileOpsEditChars = Number(document.getElementById('orch-fileops-edit-chars')?.value || 800);
+  const fileOpsEditFiles = Number(document.getElementById('orch-fileops-edit-files')?.value || 1);
+  const fileOpsVerifyLines = Number(document.getElementById('orch-fileops-verify-lines')?.value || 25);
+  const fileOpsVerifyChars = Number(document.getElementById('orch-fileops-verify-chars')?.value || 1200);
+  const fileOpsWatchdogCycles = Number(document.getElementById('orch-fileops-watchdog-cycles')?.value || 3);
+  const fileOpsCheckpointing = document.getElementById('orch-fileops-checkpointing')?.value !== 'false';
   try {
     await api('/api/orchestration/config', {
       method: 'POST',
@@ -4702,6 +5274,30 @@ async function saveOrchestrationConfig() {
           max_assists_per_turn: maxAssistsTurn,
           max_assists_per_session: maxAssistsSession,
         },
+        browser: {
+          max_advisor_calls_per_turn: browserCallsPerTurn,
+          max_collected_items: browserMaxItems,
+          max_forced_retries: browserForcedRetries,
+        },
+        preempt: {
+          enabled: preemptEnabled,
+          stall_threshold_seconds: preemptThresholdSec,
+          max_preempts_per_turn: preemptMaxTurn,
+          max_preempts_per_session: preemptMaxSession,
+        },
+        file_ops: {
+          enabled: fileOpsEnabled,
+          primary_create_max_lines: fileOpsCreateLines,
+          primary_create_max_chars: fileOpsCreateChars,
+          primary_edit_max_lines: fileOpsEditLines,
+          primary_edit_max_chars: fileOpsEditChars,
+          primary_edit_max_files: fileOpsEditFiles,
+          verify_create_always: fileOpsVerifyCreate,
+          verify_large_payload_lines: fileOpsVerifyLines,
+          verify_large_payload_chars: fileOpsVerifyChars,
+          watchdog_no_progress_cycles: fileOpsWatchdogCycles,
+          checkpointing_enabled: fileOpsCheckpointing,
+        },
       }),
     });
     const msg = document.getElementById('orch-eligibility-msg');
@@ -4715,6 +5311,20 @@ async function saveOrchestrationConfig() {
   } catch (err) {
     alert('Failed to save: ' + (err.message || err));
   }
+}
+
+function syncOrchPreemptControls() {
+  const provider = document.getElementById('settings-llm-provider')?.value || 'ollama';
+  const note = document.getElementById('orch-preempt-note');
+  const fields = [
+    document.getElementById('orch-preempt-enabled'),
+    document.getElementById('orch-preempt-threshold'),
+    document.getElementById('orch-preempt-max-turn'),
+    document.getElementById('orch-preempt-max-session'),
+  ].filter(Boolean);
+  const ollamaPrimary = provider === 'ollama';
+  fields.forEach(el => { el.disabled = !ollamaPrimary; });
+  if (note) note.style.display = ollamaPrimary ? 'none' : 'block';
 }
 
 // ─── Skill card eligibility rendering ───────────────────────────────────────
@@ -4746,7 +5356,11 @@ function renderSkillEligibility(skills) {
 // ─── Handle orchestration SSE events ────────────────────────────────────────
 
 function handleOrchestrationEvent(data) {
-  const panel = document.getElementById('tool-calls-panel') || document.getElementById('steps-panel');
+  const panel =
+    document.getElementById('tool-calls-panel')
+    || document.getElementById('steps-panel')
+    || document.getElementById('current-turn-process')
+    || document.getElementById('process-log');
   if (!panel) return;
   const el = document.createElement('div');
   el.style = 'padding:6px 10px;margin:4px 0;background:linear-gradient(135deg,#1a1a2e,#16213e);border-left:3px solid #7c3aed;border-radius:4px;font-size:12px;color:#a78bfa;';
@@ -4779,6 +5393,7 @@ async function refreshAll() {
   loadApprovals();
   checkStatus();
   loadSystemStats();
+  loadInstalledSkills();
   loadSearchSettingsSummary();
   loadAgentSessionContext();
 }
@@ -5341,6 +5956,32 @@ function updatePinBadge() {
   }
 }
 
+function getInitialTheme() {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === 'light' || saved === 'dark') return saved;
+  } catch {}
+  return 'light';
+}
+
+function applyTheme(theme) {
+  const resolved = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', resolved);
+  const toggle = document.getElementById('theme-toggle');
+  if (toggle) {
+    toggle.setAttribute('data-theme-state', resolved);
+    const title = resolved === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+    toggle.title = title;
+    toggle.setAttribute('aria-label', title);
+  }
+  try { localStorage.setItem(THEME_KEY, resolved); } catch {}
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  applyTheme(current === 'dark' ? 'light' : 'dark');
+}
+
 // ---- Boot ----
 document.addEventListener('click', (e) => {
   const pop = document.getElementById('quick-mode-popover');
@@ -5357,6 +5998,7 @@ document.addEventListener('click', (e) => {
 });
 
 loadChatSessions();
+applyTheme(getInitialTheme());
 setupProcessAndRightScrollTracking();
 updateHeartbeatUI();
 connectWS();
@@ -5368,6 +6010,372 @@ setInterval(loadSystemStats, 3000);
 setInterval(loadApprovals, 5000);
 setMode('chat'); // Start in chat mode
 canvasInitDrop();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BACKGROUND TASKS KANBAN SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+let bgtTasks = [];           // all task records from server
+let bgtOpenTaskId = null;    // currently open panel task id
+let bgtHeartbeatConfig = { enabled: true, interval_minutes: 10 };
+
+function openBgtHeartbeatModal() {
+  const modal = document.getElementById('bgt-heartbeat-modal');
+  const enabledEl = document.getElementById('bgt-hb-enabled');
+  const intervalEl = document.getElementById('bgt-hb-interval');
+  if (!modal || !enabledEl || !intervalEl) return;
+  enabledEl.checked = !!bgtHeartbeatConfig.enabled;
+  intervalEl.value = String(Math.max(1, Number(bgtHeartbeatConfig.interval_minutes) || 10));
+  modal.style.display = 'flex';
+}
+
+function closeBgtHeartbeatModal() {
+  const modal = document.getElementById('bgt-heartbeat-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function saveBgtHeartbeatConfig() {
+  const enabledEl = document.getElementById('bgt-hb-enabled');
+  const intervalEl = document.getElementById('bgt-hb-interval');
+  if (!enabledEl || !intervalEl) return;
+
+  const enabled = !!enabledEl.checked;
+  const interval = Math.max(1, Math.min(1440, Number(intervalEl.value) || 10));
+  try {
+    const data = await api('/api/bg-tasks/heartbeat/config', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled, interval_minutes: interval }),
+    });
+    if (data?.success && data.config) {
+      bgtHeartbeatConfig = data.config;
+      renderBgTasks();
+      closeBgtHeartbeatModal();
+      bgtToast('Heartbeat updated', enabled ? `Every ${interval} minute(s)` : 'Task heartbeat disabled');
+      return;
+    }
+    bgtToast('Heartbeat update failed', String(data?.error || 'Unknown error'));
+  } catch (err) {
+    bgtToast('Heartbeat update failed', String(err?.message || err));
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const modal = document.getElementById('bgt-heartbeat-modal');
+  if (modal && modal.style.display === 'flex') closeBgtHeartbeatModal();
+});
+
+document.addEventListener('click', (e) => {
+  const modal = document.getElementById('bgt-heartbeat-modal');
+  if (!modal || modal.style.display !== 'flex') return;
+  if (e.target === modal) closeBgtHeartbeatModal();
+});
+
+// ─── Columns config ─────────────────────────────────────────────────────────
+const BGT_COLUMNS = [
+  { key: 'running',          label: '▶ In Progress', color: '#0d4faf', bg: '#eaf2ff' },
+  { key: 'queued',           label: '⏳ Queued',      color: '#7c4d00', bg: '#fff8e1' },
+  { key: 'paused',           label: '⏸ Paused',      color: '#555',    bg: '#f5f5f5' },
+  { key: 'stalled',          label: '⚠ Stalled',     color: '#9c1a1a', bg: '#fff0f0' },
+  { key: 'needs_assistance', label: '🙋 Needs You',  color: '#6d2d9e', bg: '#f5eeff' },
+  { key: 'complete',         label: '✅ Complete',    color: '#1a6e35', bg: '#efffea' },
+  { key: 'failed',           label: '❌ Failed',     color: '#9c1a1a', bg: '#fff0f0' },
+];
+
+const STATUS_ICON = {
+  running: '▶',
+  queued: '⏳',
+  paused: '⏸',
+  stalled: '⚠',
+  needs_assistance: '🙋',
+  complete: '✅',
+  failed: '❌',
+};
+
+// ─── Fetch & Render ──────────────────────────────────────────────────────────
+async function refreshBgTasks() {
+  try {
+    const data = await api('/api/bg-tasks');
+    if (data.success) {
+      bgtTasks = data.tasks || [];
+      bgtHeartbeatConfig = data.heartbeatConfig || bgtHeartbeatConfig;
+    }
+  } catch (err) {
+    console.error('[BGT] refreshBgTasks error:', err);
+  }
+  renderBgTasks();
+}
+
+function renderBgTasks() {
+  const board = document.getElementById('bgt-board');
+  if (!board) return;
+
+  // Update count badge
+  const countEl = document.getElementById('bgt-count');
+  if (countEl) {
+    const active = bgtTasks.filter(t => t.status !== 'complete' && t.status !== 'failed').length;
+    countEl.textContent = `${active} active`;
+  }
+
+  // Update heartbeat label
+  const hbLabel = document.getElementById('bgt-heartbeat-label');
+  if (hbLabel) {
+    const mins = bgtHeartbeatConfig.interval_minutes || 10;
+    const on = bgtHeartbeatConfig.enabled;
+    hbLabel.textContent = on ? `⏳ heartbeat: ${mins}min` : '⏸ heartbeat: off';
+    hbLabel.style.color = on ? 'var(--brand)' : 'var(--muted)';
+  }
+
+  // Only render non-empty columns
+  const byStatus = {};
+  for (const col of BGT_COLUMNS) byStatus[col.key] = [];
+  for (const t of bgtTasks) {
+    if (byStatus[t.status]) byStatus[t.status].push(t);
+    else if (byStatus['stalled']) byStatus['stalled'].push(t);
+  }
+
+  board.innerHTML = '';
+  for (const col of BGT_COLUMNS) {
+    const tasks = byStatus[col.key];
+    if (tasks.length === 0 && (col.key === 'complete' || col.key === 'failed' || col.key === 'stalled' || col.key === 'needs_assistance')) continue;
+    const colEl = document.createElement('div');
+    colEl.style.cssText = 'min-width:240px;max-width:280px;flex:0 0 auto;display:flex;flex-direction:column;gap:0;';
+    colEl.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <span style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.06em;color:${col.color}">${col.label}</span>
+        <span style="font-size:10px;background:${col.bg};color:${col.color};border-radius:999px;padding:1px 8px;font-weight:700">${tasks.length}</span>
+      </div>
+      <div class="bgt-col-cards" style="display:flex;flex-direction:column;gap:8px;min-height:60px">${tasks.map(t => bgtCardHTML(t, col)).join('')}</div>
+    `;
+    board.appendChild(colEl);
+    if (tasks.length === 0) {
+      // Empty placeholder
+      colEl.querySelector('.bgt-col-cards').innerHTML = `<div style="text-align:center;padding:20px 8px;color:var(--muted);font-size:11px;border:1.5px dashed var(--line);border-radius:10px">No ${col.label.split(' ').slice(1).join(' ').toLowerCase()} tasks</div>`;
+    }
+  }
+
+  // If no tasks at all
+  if (bgtTasks.length === 0) {
+    board.innerHTML = `<div style="text-align:center;padding:60px 24px;color:var(--muted);font-size:13px;flex:1">
+      <div style="font-size:36px;margin-bottom:12px">🗂</div>
+      <div style="font-weight:700;margin-bottom:4px">No background tasks yet</div>
+      <div style="font-size:12px">Ask SmallClaw to do something in the background and it'll appear here.</div>
+    </div>`;
+  }
+}
+
+function bgtCardHTML(t, col) {
+  const mins = Math.round((Date.now() - (t.lastProgressAt || t.startedAt)) / 60000);
+  const timeAgo = mins < 1 ? 'just now' : mins < 60 ? `${mins}m ago` : `${Math.round(mins/60)}h ago`;
+  const stepsDone = (t.plan || []).filter(s => s.status === 'done' || s.status === 'skipped').length;
+  const totalSteps = (t.plan || []).length;
+  const pct = totalSteps > 0 ? Math.round(stepsDone / totalSteps * 100) : 0;
+  const currentStep = (t.plan || [])[t.currentStepIndex || 0];
+  const channel = t.channel === 'telegram' ? '📱' : '🌐';
+
+  return `
+  <div onclick="openBgtPanel('${escHtml(t.id)}')" data-bgt-id="${escHtml(t.id)}" style="
+    background:var(--panel);border:1.5px solid var(--line);border-radius:12px;padding:12px 14px;
+    cursor:pointer;transition:border-color 0.15s,box-shadow 0.15s;
+    ${bgtOpenTaskId === t.id ? 'border-color:var(--brand);box-shadow:0 0 0 2px rgba(90,145,255,0.15);' : ''}
+  " onmouseover="this.style.borderColor='var(--brand)'" onmouseout="this.style.borderColor='${bgtOpenTaskId===t.id?'var(--brand)':'var(--line)'}'">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:6px">
+      <span style="font-size:13px;font-weight:700;line-height:1.3;flex:1;min-width:0">${escHtml(t.title || 'Untitled Task')}</span>
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+        <button
+          onclick="event.stopPropagation(); bgtDeleteTask('${escHtml(t.id)}', '${escHtml(t.status)}')"
+          title="Remove task"
+          style="border:1px solid #fca5a5;background:#fff0f0;color:#9c1a1a;border-radius:7px;padding:1px 6px;font-size:11px;font-weight:700;cursor:pointer"
+        >🗑</button>
+        <span style="font-size:14px;flex-shrink:0">${STATUS_ICON[t.status] || '?'}</span>
+      </div>
+    </div>
+    ${currentStep ? `<div style="font-size:11px;color:var(--muted);margin-bottom:8px;line-height:1.4">Step ${(t.currentStepIndex||0)+1}/${totalSteps}: ${escHtml(currentStep.description.slice(0,60))}${currentStep.description.length>60?'…':''}</div>` : ''}
+    ${totalSteps > 0 ? `
+    <div style="background:var(--line);border-radius:999px;height:3px;margin-bottom:8px;overflow:hidden">
+      <div style="background:${col.color};width:${pct}%;height:100%;border-radius:999px;transition:width 0.4s"></div>
+    </div>` : ''}
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:10px;color:var(--muted)">${channel} ${timeAgo}</span>
+      ${t.status === 'needs_assistance' ? `<span style="font-size:10px;background:#f5eeff;color:#6d2d9e;border-radius:999px;padding:1px 8px;font-weight:700">Needs you</span>` : ''}
+      ${t.status === 'paused' ? `<span style="font-size:10px;background:#f5f5f5;color:#555;border-radius:999px;padding:1px 8px;font-weight:700">${t.pauseReason || 'paused'}</span>` : ''}
+    </div>
+  </div>`;
+}
+
+// ─── Side Panel ──────────────────────────────────────────────────────────────
+async function openBgtPanel(taskId) {
+  bgtOpenTaskId = taskId;
+  const panel = document.getElementById('bgt-panel');
+  if (panel) panel.style.display = 'flex';
+  await bgtRefreshOpenPanel();
+  // Highlight the card
+  renderBgTasks();
+}
+
+function closeBgtPanel() {
+  bgtOpenTaskId = null;
+  const panel = document.getElementById('bgt-panel');
+  if (panel) panel.style.display = 'none';
+  renderBgTasks();
+}
+
+async function bgtRefreshOpenPanel() {
+  if (!bgtOpenTaskId) return;
+  let task;
+  try {
+    const data = await api(`/api/bg-tasks/${bgtOpenTaskId}`);
+    if (data.success) task = data.task;
+  } catch {}
+  if (!task) { task = bgtTasks.find(t => t.id === bgtOpenTaskId); }
+  if (!task) return;
+
+  const titleEl = document.getElementById('bgt-panel-title');
+  if (titleEl) titleEl.textContent = task.title || 'Task Details';
+
+  const pauseBtn = document.getElementById('bgt-panel-pause');
+  if (pauseBtn) {
+    if (task.status === 'running') {
+      pauseBtn.textContent = 'Pause';
+      pauseBtn.style.display = '';
+    } else if (task.status === 'paused' || task.status === 'queued') {
+      pauseBtn.textContent = 'Resume';
+      pauseBtn.style.display = '';
+    } else {
+      pauseBtn.style.display = 'none';
+    }
+  }
+
+  const body = document.getElementById('bgt-panel-body');
+  if (!body) return;
+
+  const plan = task.plan || [];
+  const journal = task.journal || [];
+  const stepsDone = plan.filter(s => s.status === 'done' || s.status === 'skipped').length;
+  const lastTool = task.lastToolCall || '—';
+  const lastToolAt = task.lastToolCallAt ? new Date(task.lastToolCallAt).toLocaleTimeString() : '—';
+  const channel = task.channel === 'telegram' ? '📱 Telegram' : '🌐 Web UI';
+  const startedAt = task.startedAt ? new Date(task.startedAt).toLocaleString() : '—';
+  const statusColor = { running:'#0d4faf', queued:'#7c4d00', paused:'#555', stalled:'#9c1a1a', needs_assistance:'#6d2d9e', complete:'#1a6e35', failed:'#9c1a1a' };
+  const sc = statusColor[task.status] || '#555';
+
+  // Build plan steps HTML
+  const stepsHTML = plan.map((step, i) => {
+    const icon = step.status === 'done' ? '✅' : step.status === 'failed' ? '❌' : step.status === 'skipped' ? '⏭' : i === (task.currentStepIndex || 0) && task.status === 'running' ? '⏳' : '○';
+    const isCurrent = i === (task.currentStepIndex || 0) && task.status !== 'complete';
+    return `<div style="display:flex;gap:10px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--line);${isCurrent?'background:#f0f5ff;margin:0 -8px;padding:7px 8px;border-radius:6px;':''}"
+      title="${step.notes ? escHtml(step.notes) : ''}">
+      <span style="font-size:14px;flex-shrink:0;line-height:1.4">${icon}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:12px;font-weight:${isCurrent?'700':'500'};color:${isCurrent?'var(--text)':'var(--muted)'}">${escHtml(step.description)}</div>
+        ${step.notes ? `<div style="font-size:11px;color:var(--muted);margin-top:2px">${escHtml(step.notes.slice(0,120))}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  // Build journal HTML (last 30 entries)
+  const recentJournal = journal.slice(-30).reverse();
+  const journalHTML = recentJournal.map(entry => {
+    const time = new Date(entry.t).toLocaleTimeString();
+    const typeColor = { tool_call:'#0d4faf', tool_result:'#1a6e35', error:'#9c1a1a', plan_mutation:'#6d2d9e', status_push:'#555', pause:'#7c4d00', resume:'#7c4d00', advisor_decision:'#555', heartbeat:'var(--brand)' };
+    const tc = typeColor[entry.type] || '#888';
+    return `<div style="display:flex;gap:8px;padding:5px 0;border-bottom:1px solid var(--line);font-size:11px">
+      <span style="color:var(--muted);flex-shrink:0;min-width:52px">${time}</span>
+      <span style="color:${tc};flex-shrink:0;font-weight:700;min-width:60px">${entry.type}</span>
+      <span style="color:var(--text);flex:1;min-width:0;word-break:break-word">${escHtml(entry.content)}</span>
+    </div>`;
+  }).join('');
+
+  body.innerHTML = `
+    <!-- Status row -->
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <span style="font-size:11px;background:var(--line);border-radius:999px;padding:2px 10px;font-weight:700;color:${sc}">${STATUS_ICON[task.status]} ${task.status.replace(/_/g,' ')}</span>
+      <span style="font-size:11px;color:var(--muted)">${channel}</span>
+      <span style="font-size:11px;color:var(--muted)">Started ${startedAt}</span>
+    </div>
+
+    <!-- Summary if complete -->
+    ${task.finalSummary ? `<div style="background:#efffea;border:1px solid #b2dfb2;border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.6;color:#1a6e35">
+      <div style="font-weight:800;margin-bottom:4px">✅ Summary</div>
+      ${escHtml(task.finalSummary)}
+    </div>` : ''}
+
+    <!-- Needs assistance -->
+    ${task.status === 'needs_assistance' ? `<div style="background:#f5eeff;border:1px solid #cba8f5;border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.6;color:#6d2d9e">
+      <div style="font-weight:800;margin-bottom:4px">🙋 Task needs your input</div>
+      <div>The task has paused and is waiting for guidance. Check the latest journal entries below for context, then use the chat to provide direction.</div>
+    </div>` : ''}
+
+    <!-- Stats row -->
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <div style="flex:1;min-width:100px;background:var(--panel-2);border-radius:10px;padding:10px 12px">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:2px">Progress</div>
+        <div style="font-size:18px;font-weight:800">${stepsDone}<span style="font-size:12px;color:var(--muted)">/${plan.length}</span></div>
+        <div style="font-size:10px;color:var(--muted)">steps done</div>
+      </div>
+      <div style="flex:1;min-width:100px;background:var(--panel-2);border-radius:10px;padding:10px 12px">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:2px">Last Tool</div>
+        <div style="font-size:12px;font-weight:700;word-break:break-all">${escHtml(lastTool.slice(0,30))}</div>
+        <div style="font-size:10px;color:var(--muted)">${lastToolAt}</div>
+      </div>
+    </div>
+
+    <!-- Plan steps -->
+    ${plan.length > 0 ? `
+    <div>
+      <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:8px">Execution Plan</div>
+      <div style="border:1px solid var(--line);border-radius:10px;padding:6px 8px">${stepsHTML}</div>
+    </div>` : ''}
+
+    <!-- Process journal -->
+    <div>
+      <div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);margin-bottom:6px">Process Log <span style="font-weight:400;opacity:0.6">(latest first)</span></div>
+      <div style="font-family:monospace;font-size:11px;border:1px solid var(--line);border-radius:10px;padding:6px 8px;max-height:300px;overflow-y:auto">
+        ${journalHTML || '<div style="color:var(--muted);padding:8px">No entries yet.</div>'}
+      </div>
+    </div>
+
+    <!-- Delete button -->
+    ${(task.status === 'complete' || task.status === 'failed') ? `
+    <button onclick="bgtDeleteTask('${escHtml(task.id)}')" style="border:1px solid #fca5a5;background:#fff0f0;color:#9c1a1a;border-radius:8px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;align-self:flex-start">🗑 Remove</button>` : ''}
+  `;
+}
+
+// ─── Actions ─────────────────────────────────────────────────────────────────
+async function bgtPauseResume() {
+  if (!bgtOpenTaskId) return;
+  const task = bgtTasks.find(t => t.id === bgtOpenTaskId);
+  if (!task) return;
+  if (task.status === 'running') {
+    // Pause
+    try { await api(`/api/bg-tasks/${bgtOpenTaskId}/pause`, { method: 'POST' }); } catch {}
+  } else if (task.status === 'paused' || task.status === 'queued') {
+    // Resume
+    try { await api(`/api/bg-tasks/${bgtOpenTaskId}/resume`, { method: 'POST' }); } catch {}
+  }
+  await refreshBgTasks();
+  await bgtRefreshOpenPanel();
+}
+
+async function bgtDeleteTask(taskId, status) {
+  const isActive = status && status !== 'complete' && status !== 'failed';
+  const prompt = isActive
+    ? 'This task is still active. Remove it from the board anyway?'
+    : 'Remove this task from the board?';
+  if (!confirm(prompt)) return;
+  try { await api(`/api/bg-tasks/${taskId}`, { method: 'DELETE' }); } catch {}
+  if (bgtOpenTaskId === taskId) closeBgtPanel();
+  await refreshBgTasks();
+}
+
+// ─── Toast notification ───────────────────────────────────────────────────────
+function bgtToast(title, body) {
+  const toast = document.createElement('div');
+  toast.style.cssText = `position:fixed;bottom:24px;right:24px;z-index:9999;background:var(--panel);border:1.5px solid var(--line);border-radius:12px;padding:12px 16px;min-width:240px;max-width:360px;box-shadow:0 4px 24px rgba(0,0,0,0.12);font-family:var(--font)`;
+  toast.innerHTML = `<div style="font-size:13px;font-weight:800;margin-bottom:4px">${escHtml(title)}</div>${body ? `<div style="font-size:12px;color:var(--muted);line-height:1.4">${escHtml(body)}</div>` : ''}`;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 6000);
+}
 </script>
 </body>
 </html>

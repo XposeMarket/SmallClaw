@@ -28,9 +28,15 @@ interface TelegramDeps {
     sendSSE: (event: string, data: any) => void,
     pinnedMessages?: Array<{ role: string; content: string }>,
     abortSignal?: { aborted: boolean },
-    callerContext?: string
+    callerContext?: string,
+    modelOverride?: string,
+    executionMode?: 'interactive' | 'background_task' | 'heartbeat' | 'cron',
   ) => Promise<{ type: string; text: string; thinking?: string }>;
-  addMessage: (sessionId: string, msg: { role: 'user' | 'assistant'; content: string; timestamp: number }) => void;
+  addMessage: (
+    sessionId: string,
+    msg: { role: 'user' | 'assistant'; content: string; timestamp: number },
+    options?: { deferOnMemoryFlush?: boolean; disableMemoryFlushCheck?: boolean }
+  ) => void;
   getIsModelBusy: () => boolean;
   broadcast: (data: object) => void;
 }
@@ -129,12 +135,16 @@ export class TelegramChannel {
   /** Send a message to all allowed users (for cron/heartbeat delivery) */
   async sendToAllowed(text: string): Promise<void> {
     if (!this.config.enabled || !this.config.botToken) return;
-    for (const userId of this.config.allowedUserIds) {
-      try {
-        await this.sendMessage(userId, text);
-      } catch (err: any) {
-        console.error(`[Telegram] Failed to send to ${userId}: ${err.message}`);
+    try {
+      for (const userId of this.config.allowedUserIds) {
+        try {
+          await this.sendMessage(userId, text);
+        } catch (err: any) {
+          console.error(`[Telegram] Failed to send to ${userId}: ${err.message}`);
+        }
       }
+    } catch (err: any) {
+      console.error(`[Telegram] sendToAllowed no-op guard: ${String(err?.message || err)}`);
     }
   }
 
@@ -245,14 +255,21 @@ export class TelegramChannel {
     const sendSSE = (type: string, data: any) => { events.push({ type, data }); };
 
     try {
-      const telegramContext = 'CONTEXT: You are responding via Telegram. You are running on the user\'s local Windows PC. All computer tools (run_command, browser_open, browser_snapshot, browser_click, browser_fill, browser_press_key, browser_wait, browser_close) are fully available and operational. Use them confidently when the user asks you to open, browse, or interact with anything on their computer.';
-      const result = await this.deps.handleChat(text, sessionId, sendSSE, undefined, undefined, telegramContext);
+      const telegramContext = 'CONTEXT: You are responding via Telegram. You are running on the user\'s local Windows PC. All computer tools (run_command, browser_open, browser_snapshot, browser_click, browser_fill, browser_press_key, browser_wait, browser_close, desktop_screenshot, desktop_find_window, desktop_focus_window, desktop_click, desktop_drag, desktop_wait, desktop_type, desktop_press_key, desktop_get_clipboard, desktop_set_clipboard) are fully available and operational. Use them confidently when the user asks you to open, browse, or interact with anything on their computer.';
+      const isDesktopStatusCheck =
+        /\b(vs code|vscode|codex)\b/i.test(text)
+        && /\b(done|finished|complete|completed|responded)\b/i.test(text);
+      const statusContext = isDesktopStatusCheck
+        ? 'CONTEXT: This Telegram request is a desktop status check. First action should be desktop_screenshot (then desktop advisor flow), not browser tools.'
+        : '';
+      const callerContext = statusContext ? `${telegramContext}\n${statusContext}` : telegramContext;
+      const result = await this.deps.handleChat(text, sessionId, sendSSE, undefined, undefined, callerContext);
       const responseText = result.text || 'No response generated.';
 
       // Persist both messages to session history AFTER handleChat completes
       // (handleChat reads history internally, so we save after to avoid duplication)
-      this.deps.addMessage(sessionId, { role: 'user', content: text, timestamp: Date.now() });
-      this.deps.addMessage(sessionId, { role: 'assistant', content: responseText, timestamp: Date.now() });
+      this.deps.addMessage(sessionId, { role: 'user', content: text, timestamp: Date.now() }, { disableMemoryFlushCheck: true });
+      this.deps.addMessage(sessionId, { role: 'assistant', content: responseText, timestamp: Date.now() }, { disableMemoryFlushCheck: true });
 
       await this.sendMessage(chatId, responseText);
 

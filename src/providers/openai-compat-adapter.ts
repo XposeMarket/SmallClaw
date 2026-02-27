@@ -9,6 +9,7 @@
  */
 
 import type { LLMProvider, ChatMessage, ChatOptions, ChatResult, GenerateOptions, GenerateResult, ModelInfo, ProviderID } from './LLMProvider';
+import { contentToString } from './content-utils';
 
 export interface OpenAICompatConfig {
   endpoint: string;
@@ -80,10 +81,12 @@ export class OpenAICompatAdapter implements LLMProvider {
     if (this.id === 'openai_codex') {
       const CODEX_SYSTEM = 'You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user\'s local machine.';
       const hasSystem = messages.length > 0 && messages[0].role === 'system';
+      const systemContent = hasSystem ? contentToString(messages[0].content) : '';
       if (!hasSystem) {
         finalMessages = [{ role: 'system', content: CODEX_SYSTEM }, ...messages];
-      } else if (!messages[0].content?.includes('Codex')) {
-        finalMessages = [{ role: 'system', content: CODEX_SYSTEM + '\n\n' + messages[0].content }, ...messages.slice(1)];
+      } else if (!systemContent.includes('Codex')) {
+        const mergedSystem = systemContent ? `${CODEX_SYSTEM}\n\n${systemContent}` : CODEX_SYSTEM;
+        finalMessages = [{ role: 'system', content: mergedSystem }, ...messages.slice(1)];
       }
     }
     const body: any = {
@@ -128,7 +131,7 @@ export class OpenAICompatAdapter implements LLMProvider {
 
     const data = await this.post('/v1/chat/completions', body);
     const content = data.choices?.[0]?.message?.content ?? '';
-    return { response: content };
+    return { response: contentToString(content) };
   }
 
   async listModels(): Promise<ModelInfo[]> {

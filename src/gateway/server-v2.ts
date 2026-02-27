@@ -15,22 +15,102 @@ import fs from 'fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import { getConfig } from '../config/config';
 import { getOllamaClient } from '../agents/ollama-client';
-import { getSession, addMessage, getHistory, getWorkspace, setWorkspace, clearHistory } from './session';
+import { getSession, addMessage, getHistory, getHistoryForApiCall, getWorkspace, setWorkspace, clearHistory, cleanupSessions } from './session';
+import { hookBus } from './hooks';
+import { loadWorkspaceHooks } from './hook-loader';
+import { runBootMd } from './boot';
 import { TaskRunner, runTask, TaskTool, TaskState } from './task-runner';
 import { SkillsManager } from './skills-manager';
-import { browserOpen, browserSnapshot, browserClick, browserFill, browserPressKey, browserWait, browserClose, getBrowserToolDefinitions, getBrowserSessionInfo } from './browser-tools';
+import {
+  browserOpen,
+  browserSnapshot,
+  browserClick,
+  browserFill,
+  browserPressKey,
+  browserWait,
+  browserScroll,
+  browserClose,
+  getBrowserToolDefinitions,
+  getBrowserSessionInfo,
+  getBrowserAdvisorPacket,
+} from './browser-tools';
+import {
+  desktopScreenshot,
+  desktopFindWindow,
+  desktopFocusWindow,
+  desktopClick,
+  desktopDrag,
+  desktopWait,
+  desktopType,
+  desktopPressKey,
+  desktopGetClipboard,
+  desktopSetClipboard,
+  getDesktopToolDefinitions,
+  getDesktopAdvisorPacket,
+} from './desktop-tools';
 import { CronScheduler } from './cron-scheduler';
+import { HeartbeatRunner } from './heartbeat-runner';
 import { TelegramChannel } from './telegram-channel';
 import {
   OrchestrationTriggerState,
   callSecondaryPreflight,
   callSecondaryAdvisor,
+  callSecondaryFileOpClassifier,
+  callSecondaryFileAnalyzer,
+  callSecondaryFileVerifier,
+  callSecondaryFilePatchPlanner,
+  callSecondaryBrowserAdvisor,
+  callSecondaryDesktopAdvisor,
+  callSecondaryHeartbeatAdvisor,
+  formatPreflightExecutionObjective,
   formatPreflightHint,
   formatAdvisoryHint,
+  formatBrowserAdvisorHint,
+  formatDesktopAdvisorHint,
   getOrchestrationConfig,
+  clampOrchestrationConfig,
+  clampPreemptConfig,
   checkOrchestrationEligibility,
   shouldRunPreflight,
+  type TaskSnapshot as HeartbeatTaskSnapshot,
 } from '../orchestration/multi-agent';
+import {
+  createTask,
+  loadTask,
+  saveTask,
+  updateTaskStatus,
+  appendJournal,
+  updateResumeContext,
+  listTasks,
+  deleteTask,
+  mutatePlan,
+  buildTaskSnapshot,
+  type TaskRecord,
+  type TaskStatus,
+} from './task-store';
+import { BackgroundTaskRunner } from './background-task-runner';
+import {
+  FileOpProgressWatchdog,
+  FileOpType,
+  classifyFileOpType,
+  resolveFileOpSettings,
+  isFileMutationTool,
+  isFileCreateTool,
+  isFileEditTool,
+  extractFileToolTarget,
+  estimateFileToolChange,
+  canPrimaryApplyFileTool,
+  shouldVerifyFileTurn,
+  isSmallSuggestedFix,
+  buildFailureSignature,
+  buildPatchSignature,
+  loadFileOpCheckpoint,
+  saveFileOpCheckpoint,
+  clearFileOpCheckpoint,
+} from '../orchestration/file-op-v2';
+import { OllamaProcessManager } from './ollama-process-manager';
+import { raceWithWatchdog, PreemptState } from './preempt-watchdog';
+import { detectGpu, logGpuStatus } from './gpu-detector';
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +118,14 @@ const config = getConfig().getConfig();
 const PORT = config.gateway.port || 18789;
 const HOST = config.gateway.host || '127.0.0.1';
 const MAX_TOOL_ROUNDS = 12;
+type ExecutionMode = 'interactive' | 'background_task' | 'heartbeat' | 'cron';
+
+{
+  const cleaned = cleanupSessions();
+  if (cleaned.deleted > 0) {
+    console.log(`[session] Cleaned up ${cleaned.deleted} stale automated session file(s).`);
+  }
+}
 
 // Search config is now read dynamically from config on each request
 // so changing keys via settings takes effect immediately without restart
@@ -59,6 +147,7 @@ type OrchestrationSessionStats = {
 };
 
 const orchestrationSessionStats: Map<string, OrchestrationSessionStats> = new Map();
+const preemptSessionCounts: Map<string, number> = new Map();
 
 function getOrchestrationSessionStats(sessionId: string): OrchestrationSessionStats {
   const id = String(sessionId || 'default');
@@ -84,20 +173,80 @@ function recordOrchestrationEvent(
   return stats;
 }
 
+function getPreemptSessionCount(sessionId: string): number {
+  return preemptSessionCounts.get(String(sessionId || 'default')) || 0;
+}
+
+function incrementPreemptSessionCount(sessionId: string): number {
+  const id = String(sessionId || 'default');
+  const next = getPreemptSessionCount(id) + 1;
+  preemptSessionCounts.set(id, next);
+  return next;
+}
+
 // Safe commands allowlist for run_command
-const SAFE_COMMANDS: Record<string, string> = {
-  'chrome': 'start chrome',
-  'browser': 'start chrome',
-  'firefox': 'start firefox',
-  'edge': 'start msedge',
-  'notepad': 'start notepad',
-  'calc': 'start calc',
-  'calculator': 'start calc',
-  'explorer': 'start explorer',
-  'terminal': 'start cmd',
-  'cmd': 'start cmd',
-  'powershell': 'start powershell',
-};
+const isWindows = process.platform === 'win32';
+const isMac = process.platform === 'darwin';
+const isLinux = process.platform === 'linux';
+
+const SAFE_COMMANDS: Record<string, string> = isWindows
+  ? {
+      'chrome': 'start chrome',
+      'browser': 'start chrome',
+      'firefox': 'start firefox',
+      'edge': 'start msedge',
+      'notepad': 'start notepad',
+      'calc': 'start calc',
+      'calculator': 'start calc',
+      'explorer': 'start explorer',
+      'terminal': 'start cmd',
+      'cmd': 'start cmd',
+      'powershell': 'start powershell',
+    }
+  : isMac
+    ? {
+        'chrome': 'open -a "Google Chrome"',
+        'browser': 'open',
+        'firefox': 'open -a "Firefox"',
+        'edge': 'open -a "Microsoft Edge"',
+        'notepad': 'open -a "TextEdit"',
+        'calc': 'open -a "Calculator"',
+        'calculator': 'open -a "Calculator"',
+        'explorer': 'open .',
+        'terminal': 'open -a "Terminal"',
+        'cmd': 'open -a "Terminal"',
+        'powershell': 'open -a "Terminal"',
+      }
+    : {
+        'chrome': 'google-chrome',
+        'browser': 'xdg-open',
+        'firefox': 'firefox',
+        'edge': 'microsoft-edge',
+        'notepad': 'gedit',
+        'calc': 'gnome-calculator',
+        'calculator': 'gnome-calculator',
+        'explorer': 'xdg-open .',
+        'terminal': 'x-terminal-emulator',
+        'cmd': 'x-terminal-emulator',
+        'powershell': 'pwsh',
+      };
+
+function quoteShellArg(value: string): string {
+  return `"${String(value || '').replace(/"/g, '\\"')}"`;
+}
+
+function buildUrlOpenCommand(url: string): string {
+  if (isWindows) return `start "" ${quoteShellArg(url)}`;
+  if (isMac) return `open ${quoteShellArg(url)}`;
+  return `xdg-open ${quoteShellArg(url)}`;
+}
+
+function buildBrowserLaunchCommand(app: string, url: string): string {
+  const appCmd = SAFE_COMMANDS[app] || SAFE_COMMANDS.browser;
+  if (isWindows) return `${appCmd} ${quoteShellArg(url)}`;
+  if (app === 'browser') return buildUrlOpenCommand(url);
+  return `${appCmd} ${quoteShellArg(url)}`;
+}
 
 const BLOCKED_PATTERNS = ['del ', 'rm ', 'format', 'shutdown', 'restart', 'rmdir', 'rd ', 'taskkill', 'reg '];
 
@@ -201,53 +350,24 @@ function recoverSkillsIfEmpty(): void {
   }
 }
 
+// Ensure skills are available for prompt injection from the first turn.
+recoverSkillsIfEmpty();
+
 function setOrchestrationEnabled(enabled: boolean): void {
   const raw = getConfig().getConfig() as any;
   const current = raw.orchestration || {};
+  // Use the single-source-of-truth clamp utility from multi-agent.ts so bounds
+  // can never silently diverge from getOrchestrationConfig() or getOrchestrationConfigForApi().
+  const clamped = clampOrchestrationConfig(current);
+  const preempt = clampPreemptConfig(current.preempt || {});
   const merged = {
     enabled,
     secondary: {
       provider: String(current.secondary?.provider || '').trim(),
       model: String(current.secondary?.model || '').trim(),
     },
-    triggers: {
-      consecutive_failures: Number.isFinite(Number(current.triggers?.consecutive_failures))
-        ? Math.max(1, Math.floor(Number(current.triggers.consecutive_failures)))
-        : 2,
-      stagnation_rounds: Number.isFinite(Number(current.triggers?.stagnation_rounds))
-        ? Math.max(1, Math.floor(Number(current.triggers.stagnation_rounds)))
-        : 3,
-      loop_detection: current.triggers?.loop_detection !== false,
-      risky_files_threshold: Number.isFinite(Number(current.triggers?.risky_files_threshold))
-        ? Math.max(1, Math.floor(Number(current.triggers.risky_files_threshold)))
-        : 6,
-      risky_tool_ops_threshold: Number.isFinite(Number(current.triggers?.risky_tool_ops_threshold))
-        ? Math.max(10, Math.floor(Number(current.triggers.risky_tool_ops_threshold)))
-        : 220,
-      no_progress_seconds: Number.isFinite(Number(current.triggers?.no_progress_seconds))
-        ? Math.max(15, Math.floor(Number(current.triggers.no_progress_seconds)))
-        : 90,
-    },
-    preflight: {
-      mode: ['off', 'complex_only', 'always'].includes(String(current.preflight?.mode || ''))
-        ? String(current.preflight.mode)
-        : 'complex_only',
-      allow_secondary_chat: current.preflight?.allow_secondary_chat === true,
-    },
-    limits: {
-      assist_cooldown_rounds: Number.isFinite(Number(current.limits?.assist_cooldown_rounds))
-        ? Math.max(1, Math.floor(Number(current.limits.assist_cooldown_rounds)))
-        : 3,
-      max_assists_per_turn: Number.isFinite(Number(current.limits?.max_assists_per_turn))
-        ? Math.max(1, Math.floor(Number(current.limits.max_assists_per_turn)))
-        : 3,
-      max_assists_per_session: Number.isFinite(Number(current.limits?.max_assists_per_session))
-        ? Math.max(1, Math.floor(Number(current.limits.max_assists_per_session)))
-        : 18,
-      telemetry_history_limit: Number.isFinite(Number(current.limits?.telemetry_history_limit))
-        ? Math.max(10, Math.floor(Number(current.limits.telemetry_history_limit)))
-        : 100,
-    },
+    ...clamped,
+    preempt,
   };
   getConfig().updateConfig({ orchestration: merged } as any);
 }
@@ -267,12 +387,13 @@ function setOrchestrationEnabled(enabled: boolean): void {
 // Critical for 4B models — can't handle parallel inference.
 
 let isModelBusy = false;
+let lastMainSessionId = 'default';
 
 // ─── WebSocket Broadcast ───────────────────────────────────────────────────────
 // wss is assigned after server creation below; broadcastWS is only ever called
 // after startup (by cron ticks), so the late assignment is safe.
 
-let wss: WebSocketServer;
+let wss: WebSocketServer | undefined;
 
 function broadcastWS(data: object): void {
   if (!wss) return;
@@ -289,11 +410,27 @@ function broadcastWS(data: object): void {
 const cronStorePath = path.join(process.cwd(), '.localclaw', 'cron', 'jobs.json');
 const cronScheduler = new CronScheduler({
   storePath: cronStorePath,
-  handleChat: (message, sessionId, sendSSE, pinnedMessages, abortSignal) =>
-    handleChat(message, sessionId, sendSSE, pinnedMessages, abortSignal),
+  handleChat: (message, sessionId, sendSSE, pinnedMessages, abortSignal, callerContext, modelOverride, executionMode) =>
+    handleChat(message, sessionId, sendSSE, pinnedMessages, abortSignal, callerContext, modelOverride, executionMode),
   broadcast: broadcastWS,
   getIsModelBusy: () => isModelBusy,
   deliverTelegram: (text: string) => telegramChannel.sendToAllowed(text),
+  getMainSessionId: () => lastMainSessionId || 'default',
+  injectSystemEvent: (sessionId, text, job) => {
+    addMessage(sessionId, {
+      role: 'assistant',
+      content: `[System Event: ${job.name}]\n${text}`,
+      timestamp: Date.now(),
+    });
+    broadcastWS({
+      type: 'system_event',
+      sessionId,
+      source: 'cron',
+      jobId: job.id,
+      jobName: job.name,
+      text,
+    });
+  },
 });
 
 // ─── Telegram Channel Init ─────────────────────────────────────────────────────────
@@ -306,13 +443,121 @@ const telegramChannel = new TelegramChannel(
     streamMode: config.telegram?.streamMode || 'full',
   },
   {
-    handleChat: (message, sessionId, sendSSE, pinnedMessages, abortSignal, callerContext) =>
-      handleChat(message, sessionId, sendSSE, pinnedMessages, abortSignal, callerContext),
+    handleChat: (message, sessionId, sendSSE, pinnedMessages, abortSignal, callerContext, modelOverride, executionMode) =>
+      handleChat(message, sessionId, sendSSE, pinnedMessages, abortSignal, callerContext, modelOverride, executionMode),
     addMessage,
     getIsModelBusy: () => isModelBusy,
     broadcast: broadcastWS,
   }
 );
+
+const heartbeatRunner = new HeartbeatRunner({
+  workspacePath: getConfig().getWorkspacePath(),
+  configPath: path.join(process.cwd(), '.localclaw', 'heartbeat', 'config.json'),
+  handleChat: (message, sessionId, sendSSE, pinnedMessages, abortSignal, callerContext, modelOverride, executionMode) =>
+    handleChat(message, sessionId, sendSSE, pinnedMessages, abortSignal, callerContext, modelOverride, executionMode),
+  getMainSessionId: () => lastMainSessionId || 'default',
+  getIsModelBusy: () => isModelBusy,
+  broadcast: broadcastWS,
+  deliverTelegram: (text: string) => telegramChannel.sendToAllowed(text),
+});
+
+// --- Hook: gateway:startup -> run BOOT.md ------------------------------------
+function buildBootStartupSnapshot(workspacePath: string): string {
+  const lines: string[] = [];
+  lines.push(`workspace_path: ${workspacePath}`);
+
+  try {
+    const blocked = listTasks({ status: ['paused', 'stalled', 'needs_assistance'] }).slice(0, 12);
+    if (blocked.length === 0) {
+      lines.push('blocked_tasks: none');
+    } else {
+      lines.push('blocked_tasks:');
+      for (const t of blocked) {
+        const total = Math.max(1, Number(t.plan?.length || 0));
+        const step = Math.min(total, Math.max(1, Number(t.currentStepIndex || 0) + 1));
+        lines.push(`- [${t.status}] ${t.title} (step ${step}/${total})`);
+      }
+    }
+  } catch (err: any) {
+    lines.push(`blocked_tasks: unavailable (${String(err?.message || err || 'unknown')})`);
+  }
+
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  const yesterdayDate = new Date(now.getTime() - (24 * 60 * 60 * 1000));
+  const yesterday = yesterdayDate.toISOString().slice(0, 10);
+  const memDir = path.join(workspacePath, 'memory');
+  const todayMem = path.join(memDir, `${today}.md`);
+  const yesterdayMem = path.join(memDir, `${yesterday}.md`);
+  lines.push(`today_memory_file: ${fs.existsSync(todayMem) ? `${today}.md` : 'missing'}`);
+  lines.push(`yesterday_memory_file: ${fs.existsSync(yesterdayMem) ? `${yesterday}.md` : 'missing'}`);
+
+  try {
+    const dirents = fs.readdirSync(workspacePath, { withFileTypes: true });
+    const topFiles = dirents.filter(d => d.isFile()).map(d => d.name);
+    const tmpFiles = topFiles.filter((f) => /_tmp(\.|$)/i.test(f)).slice(0, 20);
+    lines.push(`tmp_files: ${tmpFiles.length ? tmpFiles.join(', ') : 'none'}`);
+
+    const todoHead: string[] = [];
+    for (const file of topFiles.slice(0, 200)) {
+      try {
+        const head = fs.readFileSync(path.join(workspacePath, file), 'utf-8')
+          .split('\n')
+          .slice(0, 5)
+          .join('\n');
+        if (/\bTODO\b/i.test(head)) {
+          todoHead.push(file);
+          if (todoHead.length >= 20) break;
+        }
+      } catch {
+        // skip unreadable files
+      }
+    }
+    lines.push(`todo_in_first_5_lines: ${todoHead.length ? todoHead.join(', ') : 'none'}`);
+  } catch (err: any) {
+    lines.push(`workspace_scan: unavailable (${String(err?.message || err || 'unknown')})`);
+  }
+
+  return lines.join('\n');
+}
+
+hookBus.register('gateway:startup', async ({ workspacePath }) => {
+  const bootSessionId = 'boot-startup';
+  setWorkspace(bootSessionId, workspacePath);
+  clearHistory(bootSessionId);
+  const startupSnapshot = buildBootStartupSnapshot(workspacePath);
+  await runBootMd(workspacePath, async (message, sessionId, sendSSE) => {
+    const bootContext = [
+      'CONTEXT: Internal startup BOOT.md turn. Execute tools to inspect workspace before summarizing.',
+      'BOOT TOOL RESTRICTION: use only list_files and read_file. Do not use run_command/start_task/browser_*/desktop_*.',
+      '[BOOT STARTUP SNAPSHOT - trusted runtime data]',
+      startupSnapshot,
+      'Use this snapshot as source of truth for task status. Use tools for file inspection.',
+      '[/BOOT STARTUP SNAPSHOT]',
+    ].join('\n\n');
+    const effectiveSessionId = sessionId || bootSessionId;
+    setWorkspace(effectiveSessionId, workspacePath);
+    const result = await handleChat(message, effectiveSessionId, sendSSE, undefined, undefined, bootContext);
+    return { text: result.text };
+  });
+});
+
+// --- Hook: command:new -> snapshot session before reset -----------------------
+hookBus.register('command:new', async ({ sessionId, workspacePath }) => {
+  const history = getHistory(sessionId, 10);
+  if (history.length === 0) return;
+
+  const memDir = path.join(workspacePath, 'memory');
+  fs.mkdirSync(memDir, { recursive: true });
+
+  const stamp = new Date().toISOString().replace('T', '_').slice(0, 16).replace(':', '-');
+  const slug = String(sessionId || '').slice(0, 8) || 'default';
+  const outPath = path.join(memDir, `${stamp}-${slug}.md`);
+  const lines = history.map((m) => `**${m.role}**: ${String(m.content || '').slice(0, 300)}`);
+  fs.writeFileSync(outPath, `# Session snapshot - ${stamp}\n\n${lines.join('\n\n')}\n`, 'utf-8');
+  console.log(`[hooks:command:new] Saved session snapshot -> ${path.basename(outPath)}`);
+});
 
 // ─── Workspace Memory Loader ───────────────────────────────────────────────────
 
@@ -326,21 +571,64 @@ function loadWorkspaceFile(workspacePath: string, filename: string, maxChars: nu
   } catch { return ''; }
 }
 
-function buildPersonalityContext(workspacePath: string): string {
+function readDailyMemoryContext(workspacePath: string, maxTokens: number = 800): string {
+  try {
+    const memDir = path.join(workspacePath, 'memory');
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const sections: string[] = [];
+
+    for (const day of [yesterday, today]) {
+      const p = path.join(memDir, `${day}.md`);
+      if (!fs.existsSync(p)) continue;
+      const raw = fs.readFileSync(p, 'utf-8').trim();
+      if (!raw) continue;
+      sections.push(`### Memory: ${day}\n${raw}`);
+    }
+
+    if (!sections.length) return '';
+
+    let combined = sections.join('\n\n');
+    const charLimit = Math.floor(maxTokens * 3.5);
+    if (combined.length > charLimit) {
+      combined = combined.slice(-charLimit);
+    }
+    return `\n\n## Recent Memory Notes\n${combined}`;
+  } catch {
+    return '';
+  }
+}
+
+async function buildPersonalityContext(sessionId: string, workspacePath: string): Promise<string> {
   const identity = loadWorkspaceFile(workspacePath, 'IDENTITY.md', 200);
+  const dailyMemory = readDailyMemoryContext(workspacePath, 800);
   const soul = loadWorkspaceFile(workspacePath, 'SOUL.md', 500);
   const user = loadWorkspaceFile(workspacePath, 'USER.md', 300);
   const memory = loadWorkspaceFile(workspacePath, 'MEMORY.md', 600);
 
-  // NOTE: Daily log (memory/YYYY-MM-DD.md) is intentionally NOT injected here.
-  // It is written by logToDaily() and will be consumed by the heartbeat/cron system.
-  // Injecting it live causes stale/cleared conversations to bleed into new chats.
+  const bootstrapFiles = [
+    { path: path.join(workspacePath, 'IDENTITY.md'), content: identity, label: 'IDENTITY' },
+    { path: path.join(workspacePath, 'memory', '_recent.md'), content: dailyMemory.trim(), label: 'RECENT_MEMORY' },
+    { path: path.join(workspacePath, 'SOUL.md'), content: soul, label: 'SOUL' },
+    { path: path.join(workspacePath, 'USER.md'), content: user, label: 'USER' },
+    { path: path.join(workspacePath, 'MEMORY.md'), content: memory, label: 'MEMORY' },
+  ];
+
+  await hookBus.fire({
+    type: 'agent:bootstrap',
+    sessionId,
+    workspacePath,
+    bootstrapFiles,
+    timestamp: Date.now(),
+  });
 
   const parts: string[] = [];
-  if (identity) parts.push(`[IDENTITY]\n${identity}`);
-  if (soul) parts.push(`[SOUL]\n${soul}`);
-  if (user) parts.push(`[USER]\n${user}`);
-  if (memory) parts.push(`[MEMORY]\n${memory}`);
+  for (const file of bootstrapFiles) {
+    const content = String(file?.content || '').trim();
+    if (!content) continue;
+    const label = String(file?.label || '').trim().toUpperCase() || 'BOOTSTRAP';
+    parts.push(`[${label}]\n${content}`);
+  }
 
   return parts.length > 0 ? '\n\n' + parts.join('\n\n') : '';
 }
@@ -496,7 +784,7 @@ function buildTools() {
       type: 'function',
       function: {
         name: 'run_command',
-        description: 'Open apps for the USER to see — you CANNOT interact with what it opens. Use "chrome" to open browser, "chrome youtube.com" to open a URL, "notepad" for notepad, "code D:\\path" for VS Code. If you need to interact with a webpage (click, read, fill forms), use browser_open instead.',
+        description: 'Open apps for the USER to see. Use browser_* tools for webpage interaction and desktop_* tools for desktop app interaction.',
         parameters: {
           type: 'object', required: ['command'],
           properties: {
@@ -521,6 +809,7 @@ function buildTools() {
     },
     // Browser automation tools
     ...getBrowserToolDefinitions(),
+    ...getDesktopToolDefinitions(),
     // Orchestration tool — only exposed when orchestration is enabled
     ...(() => {
       const oc = getOrchestrationConfig();
@@ -737,10 +1026,31 @@ interface ToolResult {
   error: boolean;
 }
 
+function normalizeToolArgs(rawArgs: any): any {
+  if (rawArgs == null) return {};
+  if (typeof rawArgs === 'string') {
+    const trimmed = rawArgs.trim();
+    if (!trimmed) return {};
+    try {
+      const parsed = JSON.parse(trimmed);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  if (typeof rawArgs === 'object') return rawArgs;
+  return {};
+}
+
 async function executeTool(name: string, args: any, workspacePath: string, sessionId: string = 'default'): Promise<ToolResult> {
   // Filename inference: if the model forgot to pass filename, use the last one
   const needsFilename = ['read_file', 'create_file', 'replace_lines', 'insert_after', 'delete_lines', 'find_replace', 'delete_file'];
   if (needsFilename.includes(name)) {
+    // Normalize: secondary AI sometimes returns "path" or "file" instead of "filename"
+    if (!args.filename && !args.name) {
+      if (args.path) { args.filename = args.path; }
+      else if (args.file) { args.filename = args.file; }
+    }
     const fn = args.filename || args.name;
     if (fn) {
       lastFilenameUsed.set(sessionId, fn);
@@ -794,12 +1104,12 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
       case 'insert_after': {
         const filename = args.filename || args.name;
         const afterLine = Math.max(0, Math.floor(Number(args.after_line) || 0));
-        const content = args.content || '';
+        const content = String(args.content || '').replace(/\\n/g, '\n');
         const filePath = path.join(workspacePath, filename);
         if (!fs.existsSync(filePath)) return { name, args, result: `"${filename}" not found`, error: true };
         const lines = fs.readFileSync(filePath, 'utf-8').split('\n');
         const insertAt = Math.min(afterLine, lines.length);
-        lines.splice(insertAt, 0, ...content.split('\\n'));
+        lines.splice(insertAt, 0, ...content.split('\n'));
         fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
         return { name, args, result: `${filename}: inserted after line ${afterLine} (now ${lines.length} lines)`, error: false };
       }
@@ -870,33 +1180,37 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
           let url = parts.slice(1).join(' ');
           // Add https:// if missing
           if (url && !url.startsWith('http')) url = 'https://' + url;
-          const appCmd = SAFE_COMMANDS[app] || `start chrome`;
-          execCmd = `${appCmd} ${url}`;
+          execCmd = buildBrowserLaunchCommand(app, url);
         }
         // 3. Plain URL → open in default browser
         else if (/^(https?:\/\/|www\.)/.test(cmd)) {
           const url = cmd.startsWith('www.') ? 'https://' + rawCmd : rawCmd;
-          execCmd = `start "" "${url}"`;
+          execCmd = buildUrlOpenCommand(url);
         }
         // 4. Bare domain like "youtube.com" → open in browser
         else if (/^[a-z0-9-]+\.[a-z]{2,}/.test(cmd) && !cmd.includes(' ')) {
-          execCmd = `start "" "https://${rawCmd}"`;
+          execCmd = buildUrlOpenCommand(`https://${rawCmd}`);
         }
         // 5. "code <path>" → VS Code
         else if (cmd.startsWith('code ')) {
           execCmd = rawCmd;
         }
-        // 6. "start <url>" → pass through
-        else if (cmd.startsWith('start http') || cmd.startsWith('start https')) {
+        // 6. Windows-only: "start <url>" → pass through
+        else if (isWindows && (cmd.startsWith('start http') || cmd.startsWith('start https'))) {
           execCmd = rawCmd;
         }
-        // 7. "explorer <path>"
-        else if (cmd.startsWith('explorer ')) {
+        // 7. Windows-only: "explorer <path>"
+        else if (isWindows && cmd.startsWith('explorer ')) {
           execCmd = rawCmd;
         }
 
         if (!execCmd) {
-          return { name, args, result: `Command "${rawCmd}" not recognized. Try: chrome, chrome youtube.com, notepad, code <path>, or a URL`, error: true };
+          return {
+            name,
+            args,
+            result: `Command "${rawCmd}" not recognized. Try: chrome, chrome youtube.com, notepad, code <path>, or a URL`,
+            error: true,
+          };
         }
         try {
           const { exec } = await import('child_process');
@@ -937,9 +1251,67 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
         const result = await browserWait(sessionId, Number(args.ms || 2000));
         return { name, args, result, error: result.startsWith('ERROR') };
       }
+      case 'browser_scroll': {
+        const dir = String(args.direction || 'down').toLowerCase() === 'up' ? 'up' : 'down';
+        const result = await browserScroll(sessionId, dir, Number(args.multiplier || 1));
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
       case 'browser_close': {
         const result = await browserClose(sessionId);
         return { name, args, result, error: false };
+      }
+
+      // Desktop automation tools
+      case 'desktop_screenshot': {
+        const result = await desktopScreenshot(sessionId);
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_find_window': {
+        const result = await desktopFindWindow(String(args.name || ''));
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_focus_window': {
+        const result = await desktopFocusWindow(String(args.name || ''));
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_click': {
+        const result = await desktopClick(
+          Number(args.x),
+          Number(args.y),
+          String(args.button || 'left').toLowerCase() === 'right' ? 'right' : 'left',
+          args.double_click === true,
+        );
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_drag': {
+        const result = await desktopDrag(
+          Number(args.from_x),
+          Number(args.from_y),
+          Number(args.to_x),
+          Number(args.to_y),
+          Number(args.steps || 20),
+        );
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_wait': {
+        const result = await desktopWait(Number(args.ms || 500));
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_type': {
+        const result = await desktopType(String(args.text || ''));
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_press_key': {
+        const result = await desktopPressKey(String(args.key || 'Enter'));
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_get_clipboard': {
+        const result = await desktopGetClipboard();
+        return { name, args, result, error: result.startsWith('ERROR') };
+      }
+      case 'desktop_set_clipboard': {
+        const result = await desktopSetClipboard(String(args.text || ''));
+        return { name, args, result, error: result.startsWith('ERROR') };
       }
 
       default:
@@ -1028,11 +1400,129 @@ function separateThinkingFromContent(text: string): { reply: string; thinking: s
   };
 }
 
+function normalizeForDedup(text: string): string {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
+    .trim();
+}
+
+function isGreetingLikeMessage(text: string): boolean {
+  const raw = String(text || '').trim();
+  if (!raw || raw.length > 120) return false;
+  if (/\b(search|open|read|write|file|code|task|build|fix|debug|run|install|http|www\.|\.com|please|could you|can you)\b/i.test(raw)) {
+    return false;
+  }
+  return /^(hi|hello|hey|yo|sup|howdy|good (morning|afternoon|evening)|hey claw|hello claw|hi claw|hey smallclaw|hello smallclaw|hi smallclaw|how are you)[!.?\s]*$/i.test(raw);
+}
+
+function sanitizeFinalReply(
+  text: string,
+  opts: { preflightReason?: string } = {},
+): string {
+  const raw = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!raw) return '';
+
+  const metaPatterns: RegExp[] = [
+    /^\s*No tools (are|were) needed for (this|the) greeting\.?\s*$/i,
+    /^\s*Greeting only,\s*no tools needed\.?\s*$/i,
+    /^\s*Advisor route selected .*$/i,
+    /^\s*\[ADVISOR[^\]]*\]\s*$/i,
+    /^\s*\[\/ADVISOR[^\]]*\]\s*$/i,
+    /^\s*Understood\.?\s*I will execute this objective.*$/i,
+  ];
+
+  const reasonNorm = normalizeForDedup(opts.preflightReason || '');
+  const parts = raw
+    .split(/\n{2,}/)
+    .map(p => p.trim())
+    .filter(Boolean)
+    .filter((p) => {
+      if (metaPatterns.some(re => re.test(p))) return false;
+      if (reasonNorm && normalizeForDedup(p) === reasonNorm) return false;
+      return true;
+    });
+
+  const deduped: string[] = [];
+  let prevNorm = '';
+  for (const p of parts) {
+    const norm = normalizeForDedup(p);
+    if (!norm) continue;
+    if (norm === prevNorm) continue;
+    deduped.push(p);
+    prevNorm = norm;
+  }
+
+  return deduped.join('\n\n').trim();
+}
+
+function stripExplicitThinkTags(text: string): { cleaned: string; thinking: string } {
+  const raw = String(text || '');
+  if (!raw) return { cleaned: '', thinking: '' };
+
+  const blocks: string[] = [];
+  let cleaned = raw.replace(/<think>([\s\S]*?)<\/think>/gi, (_m, inner) => {
+    const t = String(inner || '').trim();
+    if (t) blocks.push(t);
+    return '';
+  });
+
+  // Handle dangling open <think> blocks from partial model outputs.
+  const openIdx = cleaned.toLowerCase().lastIndexOf('<think>');
+  if (openIdx !== -1) {
+    const trailing = cleaned
+      .slice(openIdx + '<think>'.length)
+      .replace(/<\/think>/gi, '')
+      .trim();
+    if (trailing) blocks.push(trailing);
+    cleaned = cleaned.slice(0, openIdx);
+  }
+
+  cleaned = cleaned.replace(/<\/think>/gi, '').trim();
+  return { cleaned, thinking: blocks.join('\n\n').trim() };
+}
+
 // ─── Main Chat Handler ─────────────────────────────────────────────────────────
 
 function isExecutionLikeRequest(message: string): boolean {
   const m = String(message || '');
-  return /\b(create|build|implement|develop|scaffold|generate|fix|debug|edit|update|refactor|rewrite|patch|setup|configure|calendar|app|component|project|file|folder|directory|workspace|code)\b/i.test(m);
+  return /\b(create|build|implement|develop|scaffold|generate|fix|debug|edit|update|refactor|rewrite|patch|setup|configure|calendar|app|component|project|file|folder|directory|workspace|code|desktop|window|screen|mouse|keyboard|clipboard|vs code|vscode)\b/i.test(m);
+}
+
+function isBrowserAutomationRequest(message: string): boolean {
+  const m = String(message || '');
+  const hasBrowserVerb = /\b(open|go to|navigate|visit|browse|click|type|fill|press|submit|log ?in|login|use my computer)\b/i.test(m);
+  const hasTarget = /(?:https?:\/\/)?(?:www\.)?[a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?:\/\S*)?/i.test(m)
+    || /\b(chatgpt|google|reddit|x\.com|twitter|github|youtube)\b/i.test(m);
+  return hasBrowserVerb && hasTarget;
+}
+
+function isDesktopAutomationRequest(message: string): boolean {
+  const m = String(message || '');
+  const hasDesktopVerb = /\b(check|look|see|open|focus|click|type|press|read|copy|paste|use my computer|screenshot)\b/i.test(m);
+  const hasDesktopTarget = /\b(desktop|screen|window|app|application|vs code|vscode|terminal|notepad|clipboard|codex)\b/i.test(m);
+  const statusAsk = /\b(is|did|has).*\b(done|finished|complete|completed)\b/i.test(m);
+  return (hasDesktopVerb && hasDesktopTarget) || (statusAsk && /\b(vs code|vscode|codex)\b/i.test(m));
+}
+
+function extractLikelyUrl(message: string): string | null {
+  const raw = String(message || '');
+  const directUrlMatch = raw.match(/\bhttps?:\/\/[^\s)]+/i);
+  const domainMatch = raw.match(/\b(?:www\.)?[a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s)]*)?/i);
+  const url = (directUrlMatch?.[0] || domainMatch?.[0] || '').trim();
+  if (!url) return null;
+  const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  return normalized.replace(/["'<>]/g, '');
+}
+
+function looksLikeSafetyRefusal(text: string): boolean {
+  const s = String(text || '').trim().toLowerCase();
+  if (!s) return false;
+  return (
+    /disallowed|can't (help|assist|do that|use your computer)|cannot (help|assist|do that|use your computer)|unable to (help|assist|do that)/i.test(s)
+    || /i (can't|cannot) (control|operate|use) (your|the) computer/i.test(s)
+    || /against (policy|safety)/i.test(s)
+  );
 }
 
 function looksLikeIntentOnlyReply(text: string): boolean {
@@ -1053,6 +1543,258 @@ function hasConcreteCompletion(text: string): boolean {
   return /\b(done|completed|created|updated|fixed|implemented|finished|saved|wrote|executed|here(?:'s| is) (?:the|your)|success(?:fully)?)\b/i.test(s);
 }
 
+function isBrowserToolName(name: string): boolean {
+  return /^browser_(open|snapshot|click|fill|press_key|wait|scroll|close)$/i.test(String(name || ''));
+}
+
+function isDesktopToolName(name: string): boolean {
+  return /^desktop_(screenshot|find_window|focus_window|click|drag|wait|type|press_key|get_clipboard|set_clipboard)$/i.test(String(name || ''));
+}
+
+function isHighStakesFile(filename: string): boolean {
+  const f = String(filename || '').toLowerCase();
+  return /(auth|billing|payment|security|secret|token|config|credential|oauth|permission|acl)/.test(f);
+}
+
+function requestedFullTemplate(message: string): boolean {
+  return /\b(full page|full template|full config|full layout|complete page|entire file|whole file)\b/i
+    .test(String(message || ''));
+}
+
+function resolveWorkspaceFilePath(workspacePath: string, filename: string): string {
+  if (!filename) return '';
+  if (path.isAbsolute(filename)) return filename;
+  return path.join(workspacePath, filename);
+}
+
+function collectFileSnapshots(
+  workspacePath: string,
+  files: string[],
+  maxCharsPerFile: number = 3600,
+): Array<{
+  filename: string;
+  exists: boolean;
+  content_preview: string;
+  line_count: number;
+  char_count: number;
+}> {
+  const out: Array<{
+    filename: string;
+    exists: boolean;
+    content_preview: string;
+    line_count: number;
+    char_count: number;
+  }> = [];
+  const seen = new Set<string>();
+  for (const raw of files || []) {
+    const fn = String(raw || '').trim();
+    if (!fn) continue;
+    if (seen.has(fn.toLowerCase())) continue;
+    seen.add(fn.toLowerCase());
+
+    const fp = resolveWorkspaceFilePath(workspacePath, fn);
+    if (!fp) continue;
+    if (!fs.existsSync(fp)) {
+      out.push({
+        filename: fn,
+        exists: false,
+        content_preview: '',
+        line_count: 0,
+        char_count: 0,
+      });
+      continue;
+    }
+    try {
+      const content = fs.readFileSync(fp, 'utf-8');
+      const lines = content.split('\n');
+      const numbered = lines.map((line, i) => `${i + 1}: ${line}`).join('\n');
+      out.push({
+        filename: fn,
+        exists: true,
+        content_preview: numbered.slice(0, maxCharsPerFile),
+        line_count: lines.length,
+        char_count: content.length,
+      });
+    } catch {
+      out.push({
+        filename: fn,
+        exists: true,
+        content_preview: '',
+        line_count: 0,
+        char_count: 0,
+      });
+    }
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+// ─── Browser Tool Result Interceptor (Multi-Agent) ──────────────────────────
+// When multi-agent orchestrator is active, the LLM should NEVER see raw browser
+// snapshot data — only the secondary AI (via getBrowserAdvisorPacket) gets that.
+// The LLM receives a short acknowledgment so it knows the tool ran, then waits
+// for the advisor's directive telling it what to do next.
+function buildBrowserAck(toolName: string, result: ToolResult): string {
+  if (result.error) {
+    // On error the LLM does need to know what failed so it can decide next step
+    return `${toolName} failed: ${result.result.slice(0, 200)}`;
+  }
+  switch (toolName) {
+    case 'browser_open':
+      return 'Browser opened. Secondary AI is analyzing the page — wait for directive.';
+    case 'browser_snapshot':
+      return 'Snapshot captured. Secondary AI is analyzing — wait for directive.';
+    case 'browser_press_key':
+      return 'Key pressed. Page updating — secondary AI will instruct next step.';
+    case 'browser_wait':
+      return 'Wait complete.';
+    case 'browser_click':
+      return 'Clicked. Secondary AI is analyzing the result — wait for directive.';
+    case 'browser_fill':
+      return 'Input filled.';
+    default:
+      return `${toolName} complete.`;
+  }
+}
+
+function buildDesktopAck(toolName: string, result: ToolResult): string {
+  if (result.error) {
+    return `${toolName} failed: ${result.result.slice(0, 200)}`;
+  }
+  switch (toolName) {
+    case 'desktop_screenshot':
+      return 'Desktop screenshot captured. Secondary AI is analyzing window context and will direct next step.';
+    case 'desktop_find_window':
+      return 'Window search complete.';
+    case 'desktop_focus_window':
+      return 'Window focused.';
+    case 'desktop_click':
+      return 'Desktop click executed.';
+    case 'desktop_drag':
+      return 'Desktop drag executed.';
+    case 'desktop_wait':
+      return 'Desktop wait complete.';
+    case 'desktop_type':
+      return 'Text input sent to focused window.';
+    case 'desktop_press_key':
+      return 'Key press sent.';
+    case 'desktop_get_clipboard':
+      return 'Clipboard read complete.';
+    case 'desktop_set_clipboard':
+      return 'Clipboard updated.';
+    default:
+      return `${toolName} complete.`;
+  }
+}
+
+function isBrowserHeavyResearchPage(input: {
+  url?: string;
+  pageType?: string;
+  snapshotElements?: number;
+  feedCount?: number;
+}): boolean {
+  const url = String(input.url || '').toLowerCase();
+  const pageType = String(input.pageType || '').toLowerCase();
+  const elements = Number(input.snapshotElements || 0);
+  const feedCount = Number(input.feedCount || 0);
+
+  if (pageType === 'x_feed' || pageType === 'search_results' || pageType === 'article') return true;
+  if (feedCount >= 6) return true;
+  if (elements >= 10) return true;
+  return /(x\.com|twitter\.com|reddit\.com|google\.[a-z.]+\/search|bing\.com\/search|duckduckgo\.com|news|search\?q=)/.test(url);
+}
+
+type SnapshotDiagnostics = {
+  scanned: number;
+  included: number;
+  hidden: number;
+  unlabeledNonInput: number;
+  unnamedInputIncluded: number;
+};
+
+type BrowserSnapshotQuality = {
+  low: boolean;
+  reasons: string[];
+  elementCount: number;
+  inputCandidates: number;
+  dominantRoles: string[];
+  diagnostics: SnapshotDiagnostics | null;
+};
+
+function goalLikelyNeedsTextInput(goal: string): boolean {
+  const text = String(goal || '');
+  return /\b(type|fill|enter|input|message|say|send|search|write|reply|post|submit|login|log ?in|chat|comment)\b/i.test(text);
+}
+
+function parseSnapshotDiagnostics(snapshot: string): SnapshotDiagnostics | null {
+  const m = String(snapshot || '').match(
+    /Snapshot diagnostics:\s*scanned=(\d+)\s+included=(\d+)\s+hidden=(\d+)\s+unlabeled_non_input=(\d+)\s+unnamed_input_included=(\d+)/i,
+  );
+  if (!m) return null;
+  const toInt = (x: string) => {
+    const n = Number(x);
+    return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+  };
+  return {
+    scanned: toInt(m[1]),
+    included: toInt(m[2]),
+    hidden: toInt(m[3]),
+    unlabeledNonInput: toInt(m[4]),
+    unnamedInputIncluded: toInt(m[5]),
+  };
+}
+
+function evaluateBrowserSnapshotQuality(snapshot: string, snapshotElements: number, goal: string): BrowserSnapshotQuality {
+  const elementCount = Number.isFinite(Number(snapshotElements)) ? Math.max(0, Math.floor(Number(snapshotElements))) : 0;
+  const roleCounts = new Map<string, number>();
+  let inputCandidates = 0;
+
+  for (const raw of String(snapshot || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    const m = line.match(/^\[@\d+\]\s+([a-z0-9_-]+)/i);
+    if (!m) continue;
+    const role = String(m[1] || '').toLowerCase();
+    roleCounts.set(role, (roleCounts.get(role) || 0) + 1);
+    if (
+      /\[INPUT\]/i.test(line)
+      || role === 'textbox'
+      || role === 'searchbox'
+      || role === 'combobox'
+      || role === 'textarea'
+    ) {
+      inputCandidates++;
+    }
+  }
+
+  const dominantRoles = Array.from(roleCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([role, count]) => `${role}:${count}`);
+  const diagnostics = parseSnapshotDiagnostics(snapshot);
+  const reasons: string[] = [];
+  const needsInput = goalLikelyNeedsTextInput(goal);
+  if (elementCount < 10) reasons.push(`low_elements=${elementCount}`);
+  if (needsInput && inputCandidates === 0) reasons.push('expected_input_but_none_detected');
+  if (needsInput && inputCandidates === 0 && dominantRoles.length) {
+    reasons.push(`top_roles=${dominantRoles.join(',')}`);
+  }
+  if (diagnostics && diagnostics.hidden > diagnostics.included) {
+    reasons.push('many_hidden_candidates');
+  }
+  if (diagnostics && diagnostics.unlabeledNonInput > diagnostics.included) {
+    reasons.push('many_unlabeled_non_input_candidates');
+  }
+
+  return {
+    low: reasons.length > 0,
+    reasons,
+    elementCount,
+    inputCandidates,
+    dominantRoles,
+    diagnostics,
+  };
+}
+
 interface HandleChatResult {
   type: 'chat' | 'execute';
   text: string;
@@ -1066,9 +1808,13 @@ async function handleChat(
   sendSSE: (event: string, data: any) => void,
   pinnedMessages?: Array<{ role: string; content: string }>,
   abortSignal?: { aborted: boolean },
-  callerContext?: string
+  callerContext?: string,
+  modelOverride?: string,
+  executionMode: ExecutionMode = 'interactive'
 ): Promise<HandleChatResult> {
   const ollama = getOllamaClient();
+  const isBootStartupTurn = /\bBOOT\.md\b/i.test(String(callerContext || ''));
+  const bootAllowedTools = new Set(['list_files', 'read_file']);
   const configuredWorkspace = getConfig().getWorkspacePath();
   const sessionWorkspace = getWorkspace(sessionId);
   const workspacePath = configuredWorkspace || sessionWorkspace;
@@ -1076,21 +1822,318 @@ async function handleChat(
     setWorkspace(sessionId, workspacePath);
   }
   console.log(`[v2] SESSION: ${sessionId} | Workspace: ${workspacePath}`);
-  sendSSE('info', { message: `Workspace: ${workspacePath}` });
-  const history = getHistory(sessionId, 5);
-  const tools = buildTools();
+  const history = getHistoryForApiCall(sessionId, 5);
+  const tools = isBootStartupTurn
+    ? buildTools().filter((t: any) => bootAllowedTools.has(String(t?.function?.name || '')))
+    : buildTools();
   const allToolResults: ToolResult[] = [];
   let allThinking = '';
-  let preflightRoute: 'primary_direct' | 'primary_with_plan' | 'secondary_chat' | null = null;
+  let preflightRoute: 'primary_direct' | 'primary_with_plan' | 'secondary_chat' | 'background_task' | null = null;
+  let preflightReasonForTurn = '';
   let continuationNudges = 0;
   const MAX_CONTINUATION_NUDGES = 2;
+  const orchestrationSkillEnabled = isOrchestrationSkillEnabled();
+  const greetingLikeTurn = isGreetingLikeMessage(message);
+
+  // ── Preempt watchdog setup ─────────────────────────────────────────────────
+  const rawCfgForPreempt = (getConfig().getConfig() as any);
+  const primaryProvider = rawCfgForPreempt.llm?.provider || 'ollama';
+  const preemptCfg: {
+    enabled: boolean;
+    stallThresholdMs: number;
+    maxPerTurn: number;
+    maxPerSession: number;
+    restartMode: 'inherit_console' | 'detached_hidden';
+  } = (() => {
+    const oc = rawCfgForPreempt.orchestration;
+    const preemptRaw = {
+      ...(oc?.preempt || {}),
+      restart_mode: oc?.preempt?.restart_mode
+        || process.env.SMALLCLAW_OLLAMA_RESTART_MODE
+        || (process.platform === 'win32' ? 'inherit_console' : 'detached_hidden'),
+    };
+    const normalizedPreempt = clampPreemptConfig(preemptRaw);
+    return {
+      enabled: orchestrationSkillEnabled
+        && primaryProvider === 'ollama'
+        && normalizedPreempt.enabled,
+      stallThresholdMs: normalizedPreempt.stall_threshold_seconds * 1000,
+      maxPerTurn: normalizedPreempt.max_preempts_per_turn,
+      maxPerSession: normalizedPreempt.max_preempts_per_session,
+      restartMode: normalizedPreempt.restart_mode === 'detached_hidden'
+        ? 'detached_hidden'
+        : 'inherit_console',
+    };
+  })();
+  const preemptState = new PreemptState();
+  preemptState.preemptsThisSession = getPreemptSessionCount(sessionId);
+  const ollamaEndpoint = rawCfgForPreempt.llm?.providers?.ollama?.endpoint
+    || rawCfgForPreempt.ollama?.endpoint
+    || 'http://localhost:11434';
+  const ollamaProcMgr = preemptCfg.enabled
+    ? new OllamaProcessManager({ endpoint: ollamaEndpoint, restartMode: preemptCfg.restartMode })
+    : null;
+  let browserContinuationPending = false;
+  let browserAdvisorRoute: 'answer_now' | 'continue_browser' | 'collect_more' | 'handoff_primary' | null = null;
+  let browserAdvisorHintPreview = '';
+  let browserForcedRetries = 0;
+  let browserAdvisorCallsThisTurn = 0;
+  let desktopContinuationPending = false;
+  let desktopAdvisorRoute: 'answer_now' | 'continue_desktop' | 'handoff_primary' | null = null;
+  let desktopAdvisorHintPreview = '';
+  let desktopAdvisorCallsThisTurn = 0;
+  let browserAdvisorLastHash = '';
+  let browserAdvisorUrlKey = '';
+  let browserAdvisorBatch = 0;
+  let browserAdvisorDedupeCount = 0;
+  let browserNoFeedProgressStreak = 0;
+  let browserStabilizeUrlKey = '';
+  let browserStabilizeWaitRetries = 0;
+  let browserStabilizeTabProbes = 0;
+  let browserStabilizeExhausted = false;
+  const browserAdvisorCollectedFeed: Array<Record<string, any>> = [];
+  const browserAdvisorSeenFeedKeys = new Set<string>();
+  const orchRuntimeCfg = getOrchestrationConfig();
+  const fileOpSettings = resolveFileOpSettings(orchRuntimeCfg as any);
+  const fileOpRouterEnabled =
+    orchestrationSkillEnabled
+    && (orchRuntimeCfg?.enabled ?? false)
+    && fileOpSettings.enabled
+    && !isBootStartupTurn;
+  const localFileOpClassification = fileOpRouterEnabled
+    ? classifyFileOpType(message)
+    : { type: 'CHAT' as FileOpType, reason: 'file-op v2 disabled' };
+  let fileOpClassification = localFileOpClassification;
+  if (fileOpRouterEnabled) {
+    const secondaryClass = await callSecondaryFileOpClassifier({
+      userMessage: message,
+      recentHistory: history.slice(-4).map(h => ({ role: h.role, content: h.content })),
+    });
+    if (secondaryClass) {
+      fileOpClassification = {
+        type: secondaryClass.operation as FileOpType,
+        reason: `secondary classifier: ${secondaryClass.reason || 'runtime classification'} (confidence ${secondaryClass.confidence.toFixed(2)})`,
+      };
+      sendSSE('orchestration', {
+        trigger: 'file_op_classifier',
+        mode: 'router',
+        route: secondaryClass.operation === 'BROWSER_OP'
+          ? 'browser_ops'
+          : secondaryClass.operation === 'DESKTOP_OP'
+            ? 'desktop_ops'
+            : (secondaryClass.operation === 'CHAT' ? 'chat' : 'file_ops'),
+        reason: secondaryClass.reason || 'secondary runtime classification',
+        operation: secondaryClass.operation,
+        confidence: secondaryClass.confidence,
+      });
+    } else {
+      // Secondary classifier unavailable — degrade to local classifier rather than
+      // collapsing to CHAT. Falling back to CHAT silently strips all file-op gating
+      // and verification, letting unchecked primary writes bypass all thresholds.
+      // Local classification is conservative (FILE_EDIT/FILE_CREATE) and safer.
+      sendSSE('info', {
+        message: `FILE_OP router: secondary classifier unavailable; degrading to local classification (${localFileOpClassification.type}).`,
+      });
+      fileOpClassification = {
+        type: localFileOpClassification.type,
+        reason: `secondary classifier unavailable — local fallback: ${localFileOpClassification.reason}`,
+      };
+    }
+  }
+  const browserMaxForcedRetries = orchRuntimeCfg?.browser?.max_forced_retries ?? 2;
+  const browserMaxAdvisorCallsPerTurn = orchRuntimeCfg?.browser?.max_advisor_calls_per_turn ?? 5;
+  const desktopMaxAdvisorCallsPerTurn = 4;
+  const browserMaxCollectedItems = orchRuntimeCfg?.browser?.max_collected_items ?? 80;
+  const browserMinFeedItemsBeforeAnswer = orchRuntimeCfg?.browser?.min_feed_items_before_answer ?? 12;
+  const browserStabilizeMaxWaitRetries = 2;
+  const browserStabilizeMaxTabProbes = 2;
+  const browserPacketMaxItems = Math.max(12, Math.min(60, Math.min(browserMaxCollectedItems, 40)));
   const seenToolCalls = new Set<string>();
+  const recentToolCalls: Array<{ name: string; argsHash: string }> = [];
+  const hashArgs = (args: any): string => {
+    try {
+      const normalize = (v: any): any => {
+        if (Array.isArray(v)) return v.map(normalize);
+        if (v && typeof v === 'object') {
+          const out: Record<string, any> = {};
+          for (const k of Object.keys(v).sort()) out[k] = normalize(v[k]);
+          return out;
+        }
+        return v;
+      };
+      return JSON.stringify(normalize(args || {})).slice(0, 200);
+    } catch {
+      return String(args || '').slice(0, 200);
+    }
+  };
+  const checkLoopDetection = (toolName: string, args: any): { state: 'ok' | 'warn' | 'block'; repeats: number } => {
+    const argsHash = hashArgs(args);
+    const repeats = recentToolCalls.filter((t) => t.name === toolName && t.argsHash === argsHash).length;
+    recentToolCalls.push({ name: toolName, argsHash });
+    if (recentToolCalls.length > 20) recentToolCalls.shift();
+    if (repeats >= 5) return { state: 'block', repeats };
+    if (repeats >= 3) return { state: 'warn', repeats };
+    return { state: 'ok', repeats };
+  };
   const orchestrationState = new OrchestrationTriggerState();
   const orchestrationLog: string[] = [];
   const orchestrationStats = getOrchestrationSessionStats(sessionId);
-  const orchestrationSkillEnabled = isOrchestrationSkillEnabled();
+  // Cached once per turn — used by browser interception, preempt nudge, and advisor calls
+  const multiAgentActive = orchestrationSkillEnabled && ((getOrchestrationConfig()?.enabled) ?? false);
+  const fileOpV2Active = multiAgentActive
+    && fileOpSettings.enabled
+    && (fileOpClassification.type === 'FILE_ANALYSIS' || fileOpClassification.type === 'FILE_CREATE' || fileOpClassification.type === 'FILE_EDIT');
+  const fileOpType = fileOpClassification.type;
+  let fileOpOwner: 'primary' | 'secondary' = fileOpType === 'FILE_ANALYSIS' ? 'secondary' : 'primary';
+  const fileOpTouchedFiles = new Set<string>();
+  const fileOpToolHistory: Array<{
+    tool: string;
+    args: any;
+    result: string;
+    error: boolean;
+    actor: 'primary' | 'secondary';
+    estimate_lines: number;
+    estimate_chars: number;
+  }> = [];
+  let fileOpPrimaryWriteLines = 0;
+  let fileOpPrimaryWriteChars = 0;
+  let fileOpHadCreate = false;
+  let fileOpHadToolFailure = false;
+  let fileOpPrimaryStallPromoted = false;
+  let fileOpLastFailureSignature = '';
+  const fileOpPatchSignatures: string[] = [];
+  const fileOpWatchdog = new FileOpProgressWatchdog(fileOpSettings.watchdog_no_progress_cycles);
+  const resumedFileOpCheckpoint = (fileOpV2Active && fileOpSettings.checkpointing_enabled)
+    ? loadFileOpCheckpoint(sessionId)
+    : null;
+  if (
+    resumedFileOpCheckpoint
+    && resumedFileOpCheckpoint.goal === message
+    && resumedFileOpCheckpoint.phase !== 'done'
+  ) {
+    fileOpOwner = resumedFileOpCheckpoint.owner || fileOpOwner;
+    for (const f of resumedFileOpCheckpoint.files_changed || []) {
+      if (f) fileOpTouchedFiles.add(String(f));
+    }
+    for (const sig of resumedFileOpCheckpoint.patch_history_signatures || []) {
+      if (sig) fileOpPatchSignatures.push(String(sig));
+    }
+    if (fileOpPatchSignatures.length > 20) {
+      fileOpPatchSignatures.splice(0, fileOpPatchSignatures.length - 20);
+    }
+  }
+  // Synthetic tool calls queued by the browser advisor for deterministic next steps.
+  // When set, the main loop skips LLM generation and executes these directly.
+  let pendingSyntheticToolCalls: Array<{ function: { name: string; arguments: any } }> = [];
 
-  const personalityCtx = buildPersonalityContext(workspacePath);
+  const trackFileOpMutation = (toolName: string, toolArgs: any, toolResult: ToolResult, actor: 'primary' | 'secondary') => {
+    if (!isFileMutationTool(toolName)) return;
+    const estimate = estimateFileToolChange(toolName, toolArgs);
+    const target = extractFileToolTarget(toolName, toolArgs);
+    if (target) fileOpTouchedFiles.add(target);
+    if (actor === 'primary') {
+      fileOpPrimaryWriteLines += estimate.lines_changed;
+      fileOpPrimaryWriteChars += estimate.chars_changed;
+    }
+    if (isFileCreateTool(toolName) && !toolResult.error) fileOpHadCreate = true;
+    if (toolResult.error) fileOpHadToolFailure = true;
+    fileOpToolHistory.push({
+      tool: toolName,
+      args: toolArgs,
+      result: toolResult.result,
+      error: toolResult.error,
+      actor,
+      estimate_lines: estimate.lines_changed,
+      estimate_chars: estimate.chars_changed,
+    });
+    if (fileOpToolHistory.length > 64) fileOpToolHistory.shift();
+    maybeSaveFileOpCheckpoint({
+      phase: 'execute',
+      next_action: `${actor} applied ${toolName}`,
+    });
+  };
+
+  const maybeSaveFileOpCheckpoint = (patch: {
+    phase: 'plan' | 'execute' | 'verify' | 'repair' | 'done';
+    next_action: string;
+    findings?: any[];
+  }) => {
+    if (!fileOpV2Active || !fileOpSettings.checkpointing_enabled) return;
+    saveFileOpCheckpoint(sessionId, {
+      goal: message,
+      phase: patch.phase,
+      owner: fileOpOwner,
+      operation: fileOpType,
+      files_changed: Array.from(fileOpTouchedFiles).slice(0, 24),
+      last_verifier_findings: Array.isArray(patch.findings) ? patch.findings : [],
+      patch_history_signatures: fileOpPatchSignatures.slice(-12),
+      next_action: patch.next_action,
+    });
+  };
+
+  const executeSecondaryPatchCalls = async (
+    calls: Array<{ tool: string; args: any }>,
+    reason: string,
+  ): Promise<{ ran: number; patchSignature: string }> => {
+    const planCalls = (calls || []).filter(c => c && c.tool && typeof c.args === 'object');
+    if (!planCalls.length) return { ran: 0, patchSignature: '' };
+    const patchSignature = buildPatchSignature(planCalls.map(c => ({ tool: c.tool, args: c.args })));
+    fileOpPatchSignatures.push(patchSignature);
+    if (fileOpPatchSignatures.length > 20) fileOpPatchSignatures.shift();
+    sendSSE('info', { message: `FILE_OP v2: applying ${planCalls.length} secondary patch call(s) (${reason}).` });
+    let ran = 0;
+    for (const call of planCalls) {
+      const toolName = String(call.tool || '').trim();
+      const toolArgs = call.args || {};
+      sendSSE('tool_call', { action: toolName, args: toolArgs, stepNum: allToolResults.length + 1, synthetic: true, actor: 'secondary' });
+      const toolResult = await executeTool(toolName, toolArgs, workspacePath, sessionId);
+      allToolResults.push(toolResult);
+      logToolCall(workspacePath, toolName, toolArgs, toolResult.result, toolResult.error);
+      trackFileOpMutation(toolName, toolArgs, toolResult, 'secondary');
+      if (toolResult.error) fileOpHadToolFailure = true;
+      sendSSE('tool_result', { action: toolName, result: toolResult.result.slice(0, 500), error: toolResult.error, stepNum: allToolResults.length, synthetic: true, actor: 'secondary' });
+      const goalReminder = `\n\n[GOAL REMINDER: Your task is still: "${message.slice(0, 120)}". Stay focused on this goal only.]`;
+      const isBrowserTool = isBrowserToolName(toolName);
+      const isDesktopTool = isDesktopToolName(toolName);
+      const toolMessageContent = (multiAgentActive && (isBrowserTool || isDesktopTool))
+        ? (isBrowserTool ? buildBrowserAck(toolName, toolResult) : buildDesktopAck(toolName, toolResult))
+        : toolResult.result;
+      messages.push({ role: 'tool', tool_name: toolName, content: toolMessageContent + goalReminder });
+      orchestrationLog.push(
+        toolResult.error
+          ? `✗ [secondary_patch] ${toolName}: ${toolResult.result.slice(0, 100)}`
+          : `✓ [secondary_patch] ${toolName}: ${toolResult.result.slice(0, 80)}`,
+      );
+      ran++;
+    }
+    return { ran, patchSignature };
+  };
+
+  if (fileOpV2Active) {
+    sendSSE('info', {
+      message: `FILE_OP v2 active: ${fileOpType} (${fileOpClassification.reason}).`,
+    });
+    sendSSE('orchestration', {
+      trigger: 'file_op_router',
+      mode: 'router',
+      route: 'file_ops',
+      reason: `${fileOpType} (${fileOpClassification.reason})`,
+      file_op_type: fileOpType,
+      owner: fileOpOwner,
+    });
+    if (resumedFileOpCheckpoint && resumedFileOpCheckpoint.goal === message && resumedFileOpCheckpoint.phase !== 'done') {
+      sendSSE('info', {
+        message: `FILE_OP v2: resuming checkpoint at phase="${resumedFileOpCheckpoint.phase}" next="${resumedFileOpCheckpoint.next_action || 'n/a'}".`,
+      });
+    } else {
+      maybeSaveFileOpCheckpoint({
+        phase: 'plan',
+        next_action: fileOpType === 'FILE_ANALYSIS' ? 'secondary analysis' : 'primary execution',
+      });
+    }
+  }
+
+  const personalityCtx = await buildPersonalityContext(sessionId, workspacePath);
 
   // Inject active browser session state so LLM knows to reuse it instead of re-opening
   const browserInfo = getBrowserSessionInfo(sessionId);
@@ -1105,11 +2148,34 @@ async function handleChat(
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  const executionModeSystemBlock = (() => {
+    if (executionMode === 'background_task') {
+      return [
+        'EXECUTION MODE: Autonomous background task.',
+        'You are running without user oversight. Do not ask clarifying questions.',
+        'Make decisions based on available context. Use tools precisely.',
+        'If truly blocked: return a concise blocked reason and the best next action.',
+      ].join('\n');
+    }
+    if (executionMode === 'heartbeat') {
+      return [
+        'EXECUTION MODE: Heartbeat check.',
+        'Run concise, decisive checks and report only actionable issues.',
+      ].join('\n');
+    }
+    if (executionMode === 'cron') {
+      return [
+        'EXECUTION MODE: Scheduled cron task.',
+        'Act autonomously and complete the prompt without asking follow-up questions.',
+      ].join('\n');
+    }
+    return '';
+  })();
 
   const messages: any[] = [
     {
       role: 'system',
-      content: `You are SmallClaw 🦞, a friendly AI assistant that runs locally.
+      content: `${executionModeSystemBlock ? `${executionModeSystemBlock}\n\n` : ''}You are SmallClaw 🦞, a friendly AI assistant that runs locally.
 Current date: ${dateStr}, ${timeStr}.
 
 TOOLS:
@@ -1123,7 +2189,7 @@ TOOLS:
 - delete_file: Delete a file
 - web_search: Search the web. Returns headlines + short snippets.
 - web_fetch: Fetch full text content from a URL. Use after web_search to read the actual page.
-- run_command: Open apps for the USER to see (chrome, notepad, vscode). You CANNOT interact with what it opens.
+- run_command: Open apps for the USER to see (chrome, notepad, vscode). Use desktop_* tools to interact with desktop apps afterward.
 - start_task: Launch a multi-step task (for complex operations needing many steps)
 - browser_open: Navigate to a URL in a browser YOU control (can click, fill, snapshot after)
 - browser_snapshot: Refresh visible elements. If element count looks low, call browser_wait first
@@ -1132,16 +2198,42 @@ TOOLS:
 - browser_press_key: Press Enter/Tab/Escape. Use Enter after filling a search box
 - browser_wait: Wait N ms then snapshot — use when page has few elements or content is still loading
 - browser_close: Close browser tab
+- desktop_screenshot: Capture full desktop screenshot and window context (Windows)
+- desktop_find_window: Find desktop windows by title/process
+- desktop_focus_window: Bring a desktop window to foreground
+- desktop_click: Click at screen coordinates
+- desktop_drag: Drag mouse from one coordinate to another
+- desktop_wait: Wait for UI to settle (ms)
+- desktop_type: Type text into focused desktop window
+- desktop_press_key: Press key/combo in focused desktop window
+- desktop_get_clipboard: Read clipboard text
+- desktop_set_clipboard: Set clipboard text
 
 IDENTITY RULE:
 Your name is SmallClaw. When a user asks you to search for, open, or find any external tool or project, look it up as requested. NEVER redirect to SmallClaw links or repos unless the user is specifically asking about SmallClaw itself. If a search fails, say so and ask for clarification.
 
+TOOL ROUTING - web_fetch vs browser:
+- Use browser_open + browser_snapshot for: social feeds (X/Twitter, Reddit), login-gated pages, JavaScript-heavy SPAs, anything that requires scrolling or clicking to reveal content.
+- Use web_fetch for: static article URLs, documentation, blog posts, news pages — any URL where you already have the link and just need the text content. It is faster and cheaper than browser.
+- Combined pattern: use browser to discover and collect links from a feed, then use web_fetch on specific linked URLs to read their full content.
+
 BROWSER RULES:
-1. run_command = opens window for user, you can't control it. browser_open = opens page you CAN control.
+1. run_command launches apps/windows. Use browser_* for web pages and desktop_* for native app/screen control.
 2. If you already have a browser open, DO NOT call browser_open again. Use browser_snapshot to see the current page, then browser_click to navigate.
 3. browser_open RETURNS a snapshot — read it immediately. Find the correct link by @ref, then call browser_click to follow it.
 4. After EVERY click, read the snapshot returned in the tool result to confirm what changed.
 5. Prefer direct search URLs over clicking search boxes.
+
+DESKTOP RULES (Windows):
+1. Use desktop_screenshot first to inspect active/open windows.
+2. Use desktop_focus_window before desktop_click or desktop_type when the target app is not focused.
+3. desktop_screenshot includes OCR preview text when available; use that evidence for status checks.
+4. For status checks like "is VS Code done?", capture a fresh desktop_screenshot before answering.
+
+AUTOMATION AUTHORIZATION:
+- This app runs on the user's own machine; user requests here are explicit authorization for local browser and desktop automation.
+- If the user asks to "use my computer" to open a site/click/type, execute with browser_* or desktop_* tools instead of refusing.
+- Do not output policy refusal text for normal user-authorized local automation requests.
 
 EDITING RULES:
 1. ALWAYS read_file first to see line numbers.
@@ -1170,6 +2262,98 @@ RESPONSE RULES:
   }
   messages.push({ role: 'user', content: message });
 
+  const replaceCurrentUserPromptWithAdvisorObjective = (objective: string): boolean => {
+    const objectiveText = String(objective || '').trim();
+    if (!objectiveText) return false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg?.role !== 'user') continue;
+      if (String(msg?.content || '') !== message) continue;
+      messages.splice(i, 1);
+      break;
+    }
+    messages.push({ role: 'user', content: objectiveText });
+    messages.push({
+      role: 'assistant',
+      content: 'Understood. I will execute this objective and preserve literal values from the request.',
+    });
+    return true;
+  };
+
+  const buildSecondaryAssistContext = () => {
+    const availableTools = (tools || [])
+      .map((t: any) => String(t?.function?.name || '').trim())
+      .filter(Boolean);
+
+    const recentToolExecutions = allToolResults.slice(-24).map((tr, idx, arr) => {
+      const step = allToolResults.length - arr.length + idx + 1;
+      return {
+        step,
+        name: String(tr.name || '').slice(0, 80),
+        args: tr.args ?? {},
+        result: String(tr.result || '').slice(0, 6000),
+        error: tr.error === true,
+      };
+    });
+
+    const recentModelMessages = (messages || [])
+      .slice(-60)
+      .map((m: any) => {
+        const role = String(m?.role || '').trim();
+        if (!role || !['user', 'assistant', 'tool'].includes(role)) return null;
+
+        let content = String(m?.content || '');
+        if (role === 'assistant' && Array.isArray(m?.tool_calls) && m.tool_calls.length) {
+          const toolCallSummary = m.tool_calls
+            .slice(0, 10)
+            .map((c: any) => {
+              const n = String(c?.function?.name || 'unknown');
+              let a = '{}';
+              try { a = JSON.stringify(c?.function?.arguments || {}); } catch {}
+              return `${n}(${a.slice(0, 240)})`;
+            })
+            .join(' | ');
+          content = content
+            ? `${content}\nTOOL_CALLS: ${toolCallSummary}`
+            : `TOOL_CALLS: ${toolCallSummary}`;
+        } else if (role === 'tool') {
+          const toolName = String(m?.tool_name || 'tool');
+          content = `${toolName}: ${content}`;
+        }
+
+        const trimmed = content.replace(/\r/g, '').trim();
+        if (!trimmed) return null;
+        return { role, content: trimmed.slice(0, 2200) };
+      })
+      .filter(Boolean)
+      .slice(-28) as Array<{ role: string; content: string }>;
+
+    let latestBrowserSnapshot = '';
+    let latestDesktopSnapshot = '';
+    for (let i = allToolResults.length - 1; i >= 0; i--) {
+      const tr = allToolResults[i];
+      if (!tr || typeof tr.name !== 'string') continue;
+      const txt = String(tr.result || '').trim();
+      if (!txt) continue;
+      if (!latestBrowserSnapshot && tr.name.startsWith('browser_')) {
+        latestBrowserSnapshot = txt.slice(0, 7000);
+      }
+      if (!latestDesktopSnapshot && tr.name.startsWith('desktop_')) {
+        latestDesktopSnapshot = txt.slice(0, 7000);
+      }
+      if (latestBrowserSnapshot && latestDesktopSnapshot) break;
+    }
+
+    return {
+      availableTools,
+      recentToolExecutions,
+      recentModelMessages,
+      recentProcessNotes: orchestrationLog.slice(-28),
+      latestBrowserSnapshot,
+      latestDesktopSnapshot,
+    };
+  };
+
   const rawOrchCfg = ((getConfig().getConfig() as any).orchestration || {}) as any;
 
   // Optional preflight advisor pass: secondary model can route and provide
@@ -1180,8 +2364,21 @@ RESPONSE RULES:
       message: 'Preflight advisor is set to Always, but Multi-Agent Orchestrator skill is disabled.',
     });
   }
+  const skipGenericPreflightForFileOp = fileOpV2Active;
+  if (skipGenericPreflightForFileOp) {
+    sendSSE('info', {
+      message: `FILE_OP v2 route selected (${fileOpType}); skipping generic advisor preflight.`,
+    });
+  }
+  // Task runner sessions (sessionId starts with 'task_') are already inside a background task
+  // execution — skip preflight entirely to prevent recursive task spawning loops.
+  const isTaskRunnerSession = sessionId.startsWith('task_');
+
   if (
     preflightCfg?.enabled &&
+    !isBootStartupTurn &&
+    !skipGenericPreflightForFileOp &&
+    !isTaskRunnerSession &&
     shouldRunPreflight(message, preflightCfg.preflight.mode) &&
     orchestrationStats.assistCount < preflightCfg.limits.max_assists_per_session
   ) {
@@ -1198,6 +2395,7 @@ RESPONSE RULES:
 
     if (preflight) {
       preflightRoute = preflight.route;
+      preflightReasonForTurn = String(preflight.reason || '').trim();
       orchestrationLog.push(`[preflight:${preflight.route}] ${preflight.reason || 'no reason'}`);
       console.log(
         `[Orchestrator] Preflight route=${preflight.route} reason=${(preflight.reason || 'n/a').slice(0, 120)}`,
@@ -1222,6 +2420,34 @@ RESPONSE RULES:
         assist_cap: preflightCfg.limits.max_assists_per_session,
       });
 
+      // ── Background task route ────────────────────────────────────────────
+      if (preflight.route === 'background_task' && multiAgentActive) {
+        const taskTitle = preflight.task_title || 'Background Task';
+        const taskPlan = (preflight.task_plan || []).map((desc, i) => ({
+          index: i,
+          description: desc,
+          status: 'pending' as const,
+        }));
+        const isTelegram = callerContext?.includes('[TELEGRAM]');
+        const task = createTask({
+          title: taskTitle,
+          prompt: message,
+          sessionId,
+          channel: isTelegram ? 'telegram' : 'web',
+          plan: taskPlan.length > 0 ? taskPlan : [{ index: 0, description: 'Execute task', status: 'pending' }],
+        });
+        appendJournal(task.id, { type: 'status_push', content: `Task queued: ${taskTitle}` });
+        // Fire background runner (detached — does not block HTTP response)
+        const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
+        runner.start().catch(err => console.error(`[BackgroundTaskRunner] Task ${task.id} error:`, err.message));
+        const queuedMessage = preflight.friendly_queued_message
+          || `On it! I've queued "${taskTitle}" as a background task. You can track progress in the Tasks panel.`;
+        sendSSE('task_queued', { taskId: task.id, title: taskTitle });
+        logToDaily(workspacePath, 'LocalClaw', queuedMessage);
+        addMessage(sessionId, { role: 'assistant', content: queuedMessage, timestamp: Date.now() });
+        return { type: 'chat', text: queuedMessage };
+      }
+
       if (
         preflight.route === 'secondary_chat' &&
         preflightCfg.preflight.allow_secondary_chat &&
@@ -1240,9 +2466,45 @@ RESPONSE RULES:
           message: 'Advisor suggested secondary_chat, but direct secondary chat is disabled. Continuing with primary.',
         });
       } else if (preflight.route === 'primary_direct') {
-        sendSSE('info', { message: 'Advisor route selected primary_direct. Continuing with primary.' });
+        sendSSE('info', { message: 'Advisor route selected primary_direct. Continuing with primary response.' });
       } else if (preflight.route === 'primary_with_plan') {
-        sendSSE('info', { message: 'Advisor route selected primary_with_plan. Injecting plan guidance.' });
+        // primary_with_plan is retired when multi-agent is active — upgrade to background_task
+        if (multiAgentActive) {
+          sendSSE('info', { message: 'Advisor returned primary_with_plan but multi-agent is active — upgrading to background_task.' });
+          const taskTitle = preflight.task_title || (preflight.reason ? preflight.reason.slice(0, 60) : 'Background Task');
+          const taskPlan = (preflight.task_plan || preflight.quick_plan || []).map((desc: string, i: number) => ({
+            index: i, description: desc, status: 'pending' as const,
+          }));
+          const isTelegram = callerContext?.includes('[TELEGRAM]');
+          const task = createTask({
+            title: taskTitle,
+            prompt: message,
+            sessionId,
+            channel: isTelegram ? 'telegram' : 'web',
+            plan: taskPlan.length > 0 ? taskPlan : [{ index: 0, description: 'Execute task', status: 'pending' }],
+          });
+          appendJournal(task.id, { type: 'status_push', content: `Task queued (upgraded from primary_with_plan): ${taskTitle}` });
+          const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
+          runner.start().catch((err: Error) => console.error(`[BackgroundTaskRunner] Task ${task.id} error:`, err.message));
+          const queuedMessage = preflight.friendly_queued_message
+            || `On it! I've queued "${taskTitle}" as a background task. You can track progress in the Tasks panel.`;
+          sendSSE('task_queued', { taskId: task.id, title: taskTitle });
+          logToDaily(workspacePath, 'LocalClaw', queuedMessage);
+          addMessage(sessionId, { role: 'assistant', content: queuedMessage, timestamp: Date.now() });
+          return { type: 'chat', text: queuedMessage };
+        }
+        sendSSE('info', { message: 'Advisor route selected primary_with_plan. Injecting execution objective and plan guidance.' });
+      }
+
+      const shouldInjectObjective = preflight.route === 'primary_with_plan';
+      if (shouldInjectObjective) {
+        const objectiveHint = formatPreflightExecutionObjective(preflight);
+        const injected = replaceCurrentUserPromptWithAdvisorObjective(objectiveHint);
+        if (!injected) {
+          sendSSE('warn', {
+            message: 'Advisor objective injection failed; falling back to raw user prompt.',
+          });
+        }
       }
 
       if (preflight.route === 'primary_with_plan') {
@@ -1253,18 +2515,647 @@ RESPONSE RULES:
     }
   } else if (
     preflightCfg?.enabled &&
+    !isBootStartupTurn &&
+    !isTaskRunnerSession &&
     shouldRunPreflight(message, preflightCfg.preflight.mode) &&
     orchestrationStats.assistCount >= preflightCfg.limits.max_assists_per_session
   ) {
     sendSSE('info', { message: 'Advisor preflight skipped: session assist cap reached.' });
   }
 
+  const resetBrowserAdvisorCollection = () => {
+    browserAdvisorCollectedFeed.length = 0;
+    browserAdvisorSeenFeedKeys.clear();
+    browserAdvisorDedupeCount = 0;
+    browserAdvisorBatch = 0;
+    browserAdvisorLastHash = '';
+    browserNoFeedProgressStreak = 0;
+    browserStabilizeUrlKey = '';
+    browserStabilizeWaitRetries = 0;
+    browserStabilizeTabProbes = 0;
+    browserStabilizeExhausted = false;
+  };
+
+  const toUrlKey = (rawUrl: string): string => {
+    try {
+      const u = new URL(String(rawUrl || ''));
+      return `${u.hostname}${u.pathname}`.toLowerCase();
+    } catch {
+      return String(rawUrl || '').toLowerCase().split('?')[0];
+    }
+  };
+
+  const feedItemKey = (item: Record<string, any>): string => {
+    if (item?.id) return `id:${String(item.id)}`;
+    if (item?.link) return `link:${String(item.link)}`;
+    const text = String(item?.text || item?.snippet || item?.title || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+    const handle = String(item?.handle || item?.author || '').toLowerCase();
+    const time = String(item?.time || '').slice(0, 40);
+    return `hash:${handle}|${time}|${text}`;
+  };
+
+  const mergeBrowserFeedBatch = (batch: Array<Record<string, any>>): { added: number; deduped: number; total: number } => {
+    let added = 0;
+    let deduped = 0;
+    for (const raw of batch || []) {
+      const item = raw && typeof raw === 'object' ? raw : {};
+      const key = feedItemKey(item);
+      if (!key || browserAdvisorSeenFeedKeys.has(key)) {
+        deduped++;
+        continue;
+      }
+      browserAdvisorSeenFeedKeys.add(key);
+      browserAdvisorCollectedFeed.push(item);
+      if (browserAdvisorCollectedFeed.length > browserMaxCollectedItems) {
+        browserAdvisorCollectedFeed.shift();
+      }
+      added++;
+    }
+    browserAdvisorDedupeCount += deduped;
+    return { added, deduped, total: browserAdvisorCollectedFeed.length };
+  };
+
+  const maybeRunBrowserAdvisorPass = async (triggerToolName: string, triggerResult: ToolResult): Promise<void> => {
+    if (!isBrowserToolName(triggerToolName) || triggerResult.error) return;
+    const orchCfg = getOrchestrationConfig();
+    if (!orchestrationSkillEnabled || !orchCfg?.enabled) return;
+    if (browserAdvisorCallsThisTurn >= browserMaxAdvisorCallsPerTurn) return;
+    if (orchestrationStats.assistCount >= orchCfg.limits.max_assists_per_session) return;
+
+    const packet = await getBrowserAdvisorPacket(sessionId, { maxItems: browserPacketMaxItems, snapshotElements: 180 });
+    if (!packet) return;
+    const packetUrlKey = toUrlKey(packet.page.url);
+    if (
+      triggerToolName === 'browser_open'
+      || (browserAdvisorUrlKey && packetUrlKey && packetUrlKey !== browserAdvisorUrlKey && !browserContinuationPending)
+    ) {
+      resetBrowserAdvisorCollection();
+    }
+    browserAdvisorUrlKey = packetUrlKey || browserAdvisorUrlKey;
+    if (!browserStabilizeUrlKey || (packetUrlKey && packetUrlKey !== browserStabilizeUrlKey)) {
+      browserStabilizeUrlKey = packetUrlKey || browserStabilizeUrlKey;
+      browserStabilizeWaitRetries = 0;
+      browserStabilizeTabProbes = 0;
+      browserStabilizeExhausted = false;
+    }
+
+    const isFeedOrSearchPage = packet.page.pageType === 'x_feed' || packet.page.pageType === 'search_results';
+    const quality = evaluateBrowserSnapshotQuality(packet.snapshot, packet.snapshotElements, message);
+    if (quality.low) {
+      const diag = quality.diagnostics;
+      const diagMsg = diag
+        ? ` hidden=${diag.hidden}, unlabeled_non_input=${diag.unlabeledNonInput}, unnamed_input_included=${diag.unnamedInputIncluded}`
+        : '';
+      sendSSE('info', {
+        message: `Snapshot quality low: elements=${quality.elementCount}, input_candidates=${quality.inputCandidates}, reasons=${quality.reasons.join(' | ')}.${diagMsg}`,
+      });
+      const logLine = `[snapshot_quality] low | elements=${quality.elementCount} | inputs=${quality.inputCandidates} | reasons=${quality.reasons.join('; ')}`;
+      orchestrationLog.push(logLine.slice(0, 260));
+    }
+
+    const stabilizationEligibleTool = (
+      triggerToolName === 'browser_open'
+      || triggerToolName === 'browser_snapshot'
+      || triggerToolName === 'browser_wait'
+      || triggerToolName === 'browser_press_key'
+    );
+    const stabilizationEligiblePage = packet.page.pageType === 'generic' || packet.page.pageType === 'article';
+    const shouldAutoStabilize =
+      quality.elementCount < 10
+      || (goalLikelyNeedsTextInput(message) && quality.inputCandidates === 0);
+    if (
+      stabilizationEligibleTool
+      && stabilizationEligiblePage
+      && quality.low
+      && shouldAutoStabilize
+      && !isFeedOrSearchPage
+      && !browserStabilizeExhausted
+    ) {
+      if (browserStabilizeWaitRetries < browserStabilizeMaxWaitRetries) {
+        browserStabilizeWaitRetries += 1;
+        browserContinuationPending = true;
+        browserAdvisorRoute = 'continue_browser';
+        browserAdvisorHintPreview = 'Snapshot stabilization in progress';
+        pendingSyntheticToolCalls = [
+          { function: { name: 'browser_wait', arguments: { ms: 1500 } } },
+          { function: { name: 'browser_snapshot', arguments: {} } },
+        ];
+        sendSSE('info', {
+          message: `Snapshot stabilization: wait+snapshot (${browserStabilizeWaitRetries}/${browserStabilizeMaxWaitRetries}) before advisor routing.`,
+        });
+        return;
+      }
+
+      const shouldProbeFocus = goalLikelyNeedsTextInput(message) && quality.inputCandidates === 0;
+      if (shouldProbeFocus && browserStabilizeTabProbes < browserStabilizeMaxTabProbes) {
+        browserStabilizeTabProbes += 1;
+        browserContinuationPending = true;
+        browserAdvisorRoute = 'continue_browser';
+        browserAdvisorHintPreview = 'Input focus probe in progress';
+        pendingSyntheticToolCalls = [
+          { function: { name: 'browser_press_key', arguments: { key: 'Tab' } } },
+          { function: { name: 'browser_wait', arguments: { ms: 500 } } },
+          { function: { name: 'browser_snapshot', arguments: {} } },
+        ];
+        sendSSE('info', {
+          message: `Snapshot stabilization: Tab focus probe (${browserStabilizeTabProbes}/${browserStabilizeMaxTabProbes}) to surface input controls.`,
+        });
+        return;
+      }
+
+      browserStabilizeExhausted = true;
+      sendSSE('info', {
+        message: 'Snapshot stabilization exhausted for this page; proceeding with current snapshot evidence.',
+      });
+    } else if (
+      !quality.low
+      && (browserStabilizeWaitRetries > 0 || browserStabilizeTabProbes > 0)
+    ) {
+      sendSSE('info', {
+        message: `Snapshot stabilization complete: elements=${quality.elementCount}, input_candidates=${quality.inputCandidates}.`,
+      });
+      browserStabilizeWaitRetries = 0;
+      browserStabilizeTabProbes = 0;
+      browserStabilizeExhausted = false;
+    }
+
+    if (
+      !isBrowserHeavyResearchPage({
+        url: packet.page.url,
+        pageType: packet.page.pageType,
+        snapshotElements: packet.snapshotElements,
+        feedCount: packet.extractedFeed.length,
+      })
+    ) {
+      return;
+    }
+    const hashUnchanged = packet.contentHash === browserAdvisorLastHash;
+    if (hashUnchanged && !browserContinuationPending) return;
+    browserAdvisorLastHash = packet.contentHash;
+    browserAdvisorCallsThisTurn += 1;
+    browserAdvisorBatch += 1;
+
+    const merged = mergeBrowserFeedBatch(packet.extractedFeed as Array<Record<string, any>>);
+    const isFeedCollectionPage = packet.page.pageType === 'x_feed' || packet.page.pageType === 'search_results';
+    if (isFeedCollectionPage) {
+      browserNoFeedProgressStreak = merged.added > 0 ? 0 : (browserNoFeedProgressStreak + 1);
+    } else {
+      browserNoFeedProgressStreak = 0;
+    }
+
+    sendSSE('browser_advisor_start', {
+      trigger_tool: triggerToolName,
+      page_type: packet.page.pageType,
+      url: packet.page.url,
+      snapshot_elements: packet.snapshotElements,
+      extracted_count: packet.extractedFeed.length,
+    });
+    sendSSE('feed_collected', {
+      batch: browserAdvisorBatch,
+      added: merged.added,
+      total: merged.total,
+      deduped: merged.deduped,
+      url: packet.page.url,
+    });
+
+    const recentFailures = allToolResults
+      .filter((r) => r.error)
+      .slice(-4)
+      .map((r) => `${r.name}: ${String(r.result || '').slice(0, 180)}`);
+
+    const advisorFeed = browserAdvisorCollectedFeed.length > 0
+      ? browserAdvisorCollectedFeed.slice(-browserMaxCollectedItems)
+      : (packet.extractedFeed as Array<Record<string, any>>);
+
+    // ── Change 5: chat_interface generation-wait — skip advisor, inject synthetic wait ──
+    if (packet.page.pageType === 'chat_interface' && packet.isGenerating) {
+      sendSSE('info', { message: 'Browser: chat interface still generating — waiting for response before advising.' });
+      pendingSyntheticToolCalls = [
+        { function: { name: 'browser_wait', arguments: { ms: 3000 } } },
+        { function: { name: 'browser_snapshot', arguments: {} } },
+      ];
+      return; // don't call advisor yet — next round will re-enter this function with fresh snapshot
+    }
+
+    let advisor = await callSecondaryBrowserAdvisor({
+      goal: message,
+      minFeedItemsBeforeAnswer: browserMinFeedItemsBeforeAnswer,
+      page: {
+        title: packet.page.title,
+        url: packet.page.url,
+        pageType: packet.page.pageType,
+        snapshotElements: packet.snapshotElements,
+      },
+      extractedFeed: advisorFeed,
+      textBlocks: packet.textBlocks,
+      snapshot: packet.snapshot,
+      scrollState: {
+        batch: browserAdvisorBatch,
+        total_collected: advisorFeed.length,
+        dedupe_count: browserAdvisorDedupeCount,
+      },
+      lastActions: orchestrationLog.slice(-8),
+      recentFailures,
+      pageText: packet.pageText,
+      isGenerating: packet.isGenerating,
+    });
+    if (!advisor) return;
+
+    // Guardrail: collect_more should only run on feed/search collection pages.
+    // For generic pages (e.g. chatgpt.com composer), force decisive routing.
+    if (advisor.route === 'collect_more' && !isFeedCollectionPage) {
+      sendSSE('info', {
+        message: 'Browser advisor override: collect_more disabled on non-feed page; switching to direct interaction mode.',
+      });
+      advisor = {
+        ...advisor,
+        route: 'handoff_primary',
+        reason: 'collect_more disabled for non-feed pages; choose a concrete interaction from current snapshot.',
+        next_tool: { tool: 'browser_snapshot', params: {} },
+        primary_hint: 'Do not scroll/PageDown here. Use the current snapshot refs to click/fill the correct control directly.',
+      };
+    }
+
+    // Guardrail: if feed collection is making no progress, stop scroll loops.
+    if (
+      advisor.route === 'collect_more'
+      && isFeedCollectionPage
+      && browserNoFeedProgressStreak >= 2
+      && advisorFeed.length === 0
+    ) {
+      sendSSE('info', {
+        message: 'Browser advisor override: collection stalled with zero extracted items; stopping scroll loop.',
+      });
+      advisor = {
+        ...advisor,
+        route: 'continue_browser',
+        reason: 'No feed items extracted after repeated collection attempts; stop scrolling and select a concrete next interaction.',
+        next_tool: { tool: 'browser_snapshot', params: {} },
+        primary_hint: 'Collection is stalled (0 extracted). Do not keep PageDown looping. Use snapshot evidence and pick a concrete click/fill step.',
+      };
+    }
+
+    if (advisor.route === 'collect_more') {
+      if (!advisor.next_tool?.tool) {
+        advisor = {
+          ...advisor,
+          next_tool: { tool: 'browser_press_key', params: { key: 'PageDown' } },
+        };
+      } else if (
+        advisor.next_tool.tool === 'browser_press_key'
+        && (!advisor.next_tool.params || !advisor.next_tool.params.key)
+      ) {
+        advisor = {
+          ...advisor,
+          next_tool: { tool: 'browser_press_key', params: { ...(advisor.next_tool.params || {}), key: 'PageDown' } },
+        };
+      }
+    }
+
+    const hint = formatBrowserAdvisorHint(advisor);
+    const stats = recordOrchestrationEvent(
+      sessionId,
+      {
+        trigger: 'auto',
+        mode: 'planner',
+        reason: `browser_advisor:${advisor.route}${advisor.reason ? ` (${advisor.reason})` : ''}`,
+        route: advisor.route,
+      },
+      orchCfg,
+    );
+
+    browserAdvisorRoute = advisor.route;
+    browserAdvisorHintPreview = String(advisor.primary_hint || advisor.reason || advisor.answer || '').slice(0, 220);
+    browserContinuationPending = advisor.route === 'continue_browser' || advisor.route === 'collect_more';
+    if (!browserContinuationPending) {
+      browserForcedRetries = 0;
+    }
+
+    sendSSE('browser_advisor_route', {
+      route: advisor.route,
+      reason: advisor.reason,
+      answer: advisor.answer || '',
+      primary_hint: advisor.primary_hint || '',
+      next_tool: advisor.next_tool || null,
+      collect_policy: advisor.collect_policy || null,
+      raw_response: advisor.raw_response || '',
+      assist_count: stats.assistCount,
+      assist_cap: orchCfg.limits.max_assists_per_session,
+    });
+    sendSSE('browser_advisor_nudge', {
+      route: advisor.route,
+      preview: browserAdvisorHintPreview,
+    });
+
+    orchestrationLog.push(`[browser:${advisor.route}] ${String(advisor.reason || 'n/a').slice(0, 200)}`);
+
+    // ── Synthetic tool call injection for deterministic collect_more scrolls ─────────
+    // When the advisor says scroll (PageDown), skip LLM generation entirely.
+    // Inject as a synthetic assistant message that the main loop executes directly.
+    // This eliminates the 75s stall window between advisor directive and actual scroll.
+    const isCollectMoreScroll = advisor.route === 'collect_more'
+      && multiAgentActive
+      && isFeedCollectionPage
+      && advisor.next_tool?.tool === 'browser_press_key';
+    const isCollectMoreWait = advisor.route === 'collect_more'
+      && multiAgentActive
+      && isFeedCollectionPage
+      && advisor.next_tool?.tool === 'browser_wait';
+
+    if (isCollectMoreScroll || isCollectMoreWait) {
+      // Queue synthetic tool calls: scroll + wait + snapshot (all deterministic)
+      const scrollParams = advisor.next_tool!.params || { key: 'PageDown' };
+      pendingSyntheticToolCalls = [
+        { function: { name: advisor.next_tool!.tool, arguments: scrollParams } },
+        { function: { name: 'browser_wait', arguments: { ms: 1500 } } },
+        { function: { name: 'browser_snapshot', arguments: {} } },
+      ];
+      sendSSE('info', { message: `Advisor: synthetic scroll queued (${advisor.route}) — skipping LLM generation.` });
+      // Push a compact hint so the LLM knows what happened after the synthetic round
+      messages.push({ role: 'user', content: hint });
+      messages.push({ role: 'assistant', content: `[ADVISOR] ${advisorFeed.length}/${browserMinFeedItemsBeforeAnswer} items. Scrolling for more.` });
+      return;
+    }
+
+    // For non-deterministic steps, use the normal message injection path
+    // ── Changes 2 & 3: context wipe + stripped executor system for browser ops ──────────
+    // Secondary holds full state via buildSecondaryAssistContext().
+    // Primary only needs: minimal system + original goal + last 4 tool acks + this directive.
+    // Wipe now, before pushing the hint pair, so the hint ends up at the bottom cleanly.
+    if (multiAgentActive) {
+      const systemMsg = messages[0]; // always keep system at [0]
+      // Stripped executor system — no editing rules, no identity prose, just tool list + 3 rules
+      const strippedSystem = {
+        role: 'system',
+        content: `You are SmallClaw. Execute browser tool calls exactly as instructed by the advisor directive below.
+
+BROWSER TOOLS: browser_open, browser_snapshot, browser_click, browser_fill, browser_press_key, browser_wait, browser_scroll, browser_close, web_fetch
+
+RULES:
+1. Call exactly the tool and params the advisor specifies.
+2. Do not think, plan, or explain. Just call the tool.
+3. If the directive says answer_now, respond in 1-2 sentences using the provided draft.`,
+      };
+      // Keep last 4 tool-result messages so the LLM has minimal recent action context
+      const recentToolMsgs = messages
+        .filter((m: any) => m.role === 'tool')
+        .slice(-4);
+      // Rebuild messages: stripped system + goal + last 4 tool acks
+      messages.length = 0;
+      messages.push(strippedSystem);
+      messages.push({ role: 'user', content: message });
+      messages.push({ role: 'assistant', content: 'Understood. Executing browser task.' });
+      for (const tm of recentToolMsgs) messages.push(tm);
+    }
+
+    messages.push({ role: 'user', content: hint });
+    messages.push({ role: 'assistant', content: 'Understood. Continuing with browser advisor guidance.' });
+    if (advisor.route === 'answer_now' && advisor.answer.trim()) {
+      messages.push({
+        role: 'user',
+        content: `Use the browser evidence and answer now in 1-2 concise sentences. Draft answer: ${advisor.answer.slice(0, 700)}`,
+      });
+    } else if (advisor.next_tool?.tool) {
+      const isWebFetchStep = advisor.next_tool.tool === 'web_fetch';
+      const collectTail = advisor.route === 'collect_more' && !isWebFetchStep
+        ? ' Then continue collection: if needed call browser_wait(1200) and browser_snapshot before deciding again.'
+        : '';
+      const webFetchNote = isWebFetchStep
+        ? ' Use web_fetch (not browser_open) since you already have the URL and only need the text content.'
+        : '';
+      messages.push({
+        role: 'user',
+        content: `Immediate next step: call ${advisor.next_tool.tool} with params ${JSON.stringify(advisor.next_tool.params || {})}. Do not stop with intent text.${collectTail}${webFetchNote}`,
+      });
+    }
+  };
+
+  const maybeRunDesktopAdvisorPass = async (triggerToolName: string, triggerResult: ToolResult): Promise<void> => {
+    if (!isDesktopToolName(triggerToolName) || triggerResult.error) return;
+    if (triggerToolName !== 'desktop_screenshot') return;
+    const orchCfg = getOrchestrationConfig();
+    if (!orchestrationSkillEnabled || !orchCfg?.enabled) return;
+    if (desktopAdvisorCallsThisTurn >= desktopMaxAdvisorCallsPerTurn) return;
+    if (orchestrationStats.assistCount >= orchCfg.limits.max_assists_per_session) return;
+
+    const packet = getDesktopAdvisorPacket(sessionId);
+    if (!packet) return;
+
+    desktopAdvisorCallsThisTurn += 1;
+    sendSSE('desktop_advisor_start', {
+      trigger_tool: triggerToolName,
+      active_window: packet.activeWindow?.title || '',
+      open_windows: packet.openWindows.length,
+      width: packet.width,
+      height: packet.height,
+      ocr_confidence: Number(packet.ocrConfidence || 0),
+      ocr_chars: String(packet.ocrText || '').length,
+    });
+
+    const recentFailures = allToolResults
+      .filter((r) => r.error)
+      .slice(-4)
+      .map((r) => `${r.name}: ${String(r.result || '').slice(0, 180)}`);
+    const clipboardPreview = (() => {
+      for (let i = allToolResults.length - 1; i >= 0; i--) {
+        const r = allToolResults[i];
+        if (!r || r.error) continue;
+        if (r.name !== 'desktop_get_clipboard') continue;
+        return String(r.result || '').slice(0, 1200);
+      }
+      return '';
+    })();
+
+    const advisor = await callSecondaryDesktopAdvisor({
+      goal: message,
+      screenshot: {
+        width: packet.width,
+        height: packet.height,
+        capturedAt: packet.capturedAt,
+        contentHash: packet.contentHash,
+      },
+      // Pass the raw screenshot to the advisor when available. The advisor function
+      // will only inject it as an image_url content part when the secondary provider
+      // supports vision (openai / openai_codex). For Ollama/llama.cpp it is ignored.
+      screenshotBase64: packet.screenshotBase64 || undefined,
+      activeWindow: packet.activeWindow
+        ? { processName: packet.activeWindow.processName, title: packet.activeWindow.title }
+        : undefined,
+      openWindows: packet.openWindows.slice(0, 40).map((w) => ({ processName: w.processName, title: w.title })),
+      lastActions: orchestrationLog.slice(-8),
+      recentFailures,
+      clipboardPreview,
+      ocrText: packet.ocrText || '',
+      ocrConfidence: Number(packet.ocrConfidence || 0),
+    });
+    if (!advisor) return;
+
+    const hint = formatDesktopAdvisorHint(advisor);
+    const stats = recordOrchestrationEvent(
+      sessionId,
+      {
+        trigger: 'auto',
+        mode: 'planner',
+        reason: `desktop_advisor:${advisor.route}${advisor.reason ? ` (${advisor.reason})` : ''}`,
+        route: advisor.route,
+      },
+      orchCfg,
+    );
+
+    desktopAdvisorRoute = advisor.route;
+    desktopAdvisorHintPreview = String(advisor.primary_hint || advisor.reason || advisor.answer || '').slice(0, 220);
+    desktopContinuationPending = advisor.route === 'continue_desktop';
+
+    sendSSE('desktop_advisor_route', {
+      route: advisor.route,
+      reason: advisor.reason,
+      answer: advisor.answer || '',
+      primary_hint: advisor.primary_hint || '',
+      next_tool: advisor.next_tool || null,
+      raw_response: advisor.raw_response || '',
+      assist_count: stats.assistCount,
+      assist_cap: orchCfg.limits.max_assists_per_session,
+    });
+    sendSSE('desktop_advisor_nudge', {
+      route: advisor.route,
+      preview: desktopAdvisorHintPreview,
+    });
+
+    orchestrationLog.push(`[desktop:${advisor.route}] ${String(advisor.reason || 'n/a').slice(0, 200)}`);
+
+    if (multiAgentActive) {
+      const strippedSystem = {
+        role: 'system',
+        content: `You are SmallClaw. Execute desktop tool calls exactly as instructed by the advisor directive below.
+
+DESKTOP TOOLS: desktop_screenshot, desktop_find_window, desktop_focus_window, desktop_click, desktop_drag, desktop_wait, desktop_type, desktop_press_key, desktop_get_clipboard, desktop_set_clipboard
+
+RULES:
+1. Call exactly the tool and params the advisor specifies.
+2. Do not think, plan, or explain. Just call the tool.
+3. If the directive says answer_now, respond in 1-2 sentences using the provided draft.`,
+      };
+      const recentToolMsgs = messages
+        .filter((m: any) => m.role === 'tool')
+        .slice(-4);
+      messages.length = 0;
+      messages.push(strippedSystem);
+      messages.push({ role: 'user', content: message });
+      messages.push({ role: 'assistant', content: 'Understood. Executing desktop task.' });
+      for (const tm of recentToolMsgs) messages.push(tm);
+    }
+
+    messages.push({ role: 'user', content: hint });
+    messages.push({ role: 'assistant', content: 'Understood. Continuing with desktop advisor guidance.' });
+    if (advisor.route === 'answer_now' && advisor.answer.trim()) {
+      messages.push({
+        role: 'user',
+        content: `Use desktop evidence and answer now in 1-2 concise sentences. Draft answer: ${advisor.answer.slice(0, 700)}`,
+      });
+    } else if (advisor.next_tool?.tool) {
+      messages.push({
+        role: 'user',
+        content: `Immediate next step: call ${advisor.next_tool.tool} with params ${JSON.stringify(advisor.next_tool.params || {})}. After acting, capture desktop_screenshot again if fresh state is needed.`,
+      });
+    }
+  };
+
+  if (fileOpV2Active && fileOpType === 'FILE_ANALYSIS') {
+    sendSSE('info', { message: 'FILE_OP v2: delegating analysis to secondary model.' });
+    const candidateFiles = (() => {
+      try {
+        return fs.readdirSync(workspacePath, { withFileTypes: true })
+          .filter(e => e.isFile())
+          .map(e => e.name)
+          .slice(0, 80);
+      } catch {
+        return [] as string[];
+      }
+    })();
+    const analysis = await callSecondaryFileAnalyzer({
+      userMessage: message,
+      recentHistory: history.slice(-6).map(h => ({ role: h.role, content: h.content })),
+      candidateFiles,
+    });
+    if (analysis) {
+      maybeSaveFileOpCheckpoint({
+        phase: 'done',
+        next_action: 'analysis complete',
+      });
+      clearFileOpCheckpoint(sessionId);
+      const lines: string[] = [];
+      if (analysis.summary) lines.push(analysis.summary);
+      if (analysis.diagnosis) lines.push(`Diagnosis: ${analysis.diagnosis}`);
+      if (analysis.exact_files.length) lines.push(`Files: ${analysis.exact_files.join(', ')}`);
+      if (analysis.edit_plan.length) lines.push(`Plan: ${analysis.edit_plan.join(' -> ')}`);
+      const text = lines.join('\n');
+      logToDaily(workspacePath, 'LocalClaw', text);
+      return { type: 'chat', text };
+    }
+    // Secondary unavailable — fail-closed. Spec: FILE_ANALYSIS is always Secondary, no primary fallback.
+    sendSSE('info', { message: 'FILE_OP v2: secondary analyzer unavailable; cannot complete FILE_ANALYSIS (fail-closed).' });
+    return { type: 'chat', text: 'Analysis could not be completed: the secondary model is unavailable. Please try again.' };
+  }
+
   logToDaily(workspacePath, 'User', message);
+
+  // ── FILE_CREATE upfront size routing ──
+  // If the request is clearly secondary territory (full page / large template),
+  // skip primary entirely — queue secondary patch plan now so round 0 executes
+  // it as synthetic calls without ever running the LLM for generation.
+  // This eliminates the stall→restart spiral for large creates.
+  if (
+    fileOpV2Active
+    && fileOpType === 'FILE_CREATE'
+    && fileOpOwner === 'primary'
+    && pendingSyntheticToolCalls.length === 0
+  ) {
+    const looksLarge = requestedFullTemplate(message)
+      || /\b(landing page|full html|multi.?section|multiple sections|panels?|sections?.+panels?|panels?.+sections?|full.?page|whole page|full.?site|complete.?page)\b/i.test(message);
+    if (looksLarge) {
+      fileOpOwner = 'secondary';
+      fileOpPrimaryStallPromoted = true;
+      sendSSE('info', {
+        message: 'FILE_OP v2: large FILE_CREATE detected upfront — routing directly to secondary (skipping primary generation).',
+      });
+      maybeSaveFileOpCheckpoint({ phase: 'plan', next_action: 'upfront secondary routing for large create' });
+      const patchPlan = await callSecondaryFilePatchPlanner({
+        userMessage: message,
+        operationType: 'FILE_CREATE',
+        owner: 'secondary',
+        reason: 'Upfront large-create detection: request exceeds primary create thresholds before generation',
+        fileSnapshots: collectFileSnapshots(workspacePath, Array.from(fileOpTouchedFiles)),
+        verifier: null,
+      });
+      if (patchPlan?.tool_calls?.length) {
+        pendingSyntheticToolCalls = patchPlan.tool_calls.map(tc => ({
+          function: { name: tc.tool, arguments: tc.args || {} },
+        }));
+        sendSSE('info', {
+          message: `FILE_OP v2: queued ${pendingSyntheticToolCalls.length} secondary call(s) for large create.`,
+        });
+        maybeSaveFileOpCheckpoint({ phase: 'execute', next_action: 'execute secondary upfront create batch' });
+      }
+    }
+  }
 
   sendSSE('info', { message: 'Thinking...' });
   console.log(`\n[v2] ── CHAT (native tools) ──`);
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+  for (let round = 0; ; round++) {
+    if (round >= MAX_TOOL_ROUNDS) {
+      const allowExtendedFileOpLoop =
+        fileOpV2Active
+        && (fileOpType === 'FILE_CREATE' || fileOpType === 'FILE_EDIT')
+        && (fileOpOwner === 'secondary' || !!fileOpLastFailureSignature);
+      if (!allowExtendedFileOpLoop) break;
+      if (round === MAX_TOOL_ROUNDS) {
+        sendSSE('info', {
+          message: 'FILE_OP v2: extending execution beyond default step cap for secondary-owned repair convergence.',
+        });
+      }
+    }
+
     if (abortSignal?.aborted) {
       console.log(`[v2] Aborted at round ${round} — client disconnected`);
       const partial = allToolResults.length > 0
@@ -1273,16 +3164,353 @@ RESPONSE RULES:
       return { type: 'execute', text: partial, toolResults: allToolResults.length > 0 ? allToolResults : undefined };
     }
 
+    // ── Synthetic tool calls from browser advisor ─────────────────────────────
+    // When the advisor queued deterministic tool calls (e.g. PageDown scroll),
+    // skip LLM generation entirely for this round and execute them directly.
+    if (pendingSyntheticToolCalls.length > 0) {
+      const syntheticCalls = pendingSyntheticToolCalls.map((call: any, idx: number) => ({
+        ...call,
+        id: String(call?.id || `synthetic_${Date.now()}_${round + 1}_${idx + 1}`),
+      }));
+      pendingSyntheticToolCalls = []; // consume immediately
+      console.log(`[v2] SYNTHETIC[${round + 1}]: executing ${syntheticCalls.length} advisor-injected tool calls`);
+      sendSSE('info', { message: `Executing ${syntheticCalls.length} synthetic browser step(s)...` });
+
+      // Inject a synthetic assistant message so the message history is coherent
+      const syntheticAssistant = {
+        role: 'assistant',
+        content: null,
+        tool_calls: syntheticCalls,
+      };
+      messages.push(syntheticAssistant);
+
+      let roundHadProgressSynthetic = false;
+      for (const call of syntheticCalls) {
+        const toolCallId = String((call as any)?.id || '').trim();
+        const toolName = call.function?.name || 'unknown';
+        const toolArgs = normalizeToolArgs(call.function?.arguments);
+        console.log(`[v2] SYNTHETIC TOOL: ${toolName}(${JSON.stringify(toolArgs).slice(0, 100)})`);
+        sendSSE('tool_call', { action: toolName, args: toolArgs, stepNum: allToolResults.length + 1, synthetic: true });
+
+        const toolResult = await executeTool(toolName, toolArgs, workspacePath, sessionId);
+        allToolResults.push(toolResult);
+        logToolCall(workspacePath, toolName, toolArgs, toolResult.result, toolResult.error);
+        trackFileOpMutation(toolName, toolArgs, toolResult, 'secondary');
+        if (!toolResult.error) roundHadProgressSynthetic = true;
+
+        orchestrationLog.push(
+          toolResult.error
+            ? `✗ [synthetic] ${toolName}: ${toolResult.result.slice(0, 80)}`
+            : `✓ [synthetic] ${toolName}: ${toolResult.result.slice(0, 60)}`
+        );
+        sendSSE('tool_result', { action: toolName, result: toolResult.result.slice(0, 300), error: toolResult.error, stepNum: allToolResults.length, synthetic: true });
+
+        const goalReminder = `\n\n[GOAL REMINDER: Your task is still: "${message.slice(0, 120)}". Stay focused on this goal only.]`;
+        const isBrowserTool = isBrowserToolName(toolName);
+        const isDesktopTool = isDesktopToolName(toolName);
+        // Browser/Desktop tools in multi-agent mode always get an ack (LLM never sees raw snapshots)
+        const toolMessageContent = (multiAgentActive && (isBrowserTool || isDesktopTool))
+          ? (isBrowserTool ? buildBrowserAck(toolName, toolResult) : buildDesktopAck(toolName, toolResult))
+          : toolResult.result;
+        messages.push({
+          role: 'tool',
+          tool_name: toolName,
+          tool_call_id: toolCallId || undefined,
+          content: toolMessageContent + goalReminder,
+        });
+
+        if (isBrowserTool && !toolResult.error) {
+          browserForcedRetries = 0;
+          if (toolName === 'browser_close') {
+            browserContinuationPending = false;
+            browserAdvisorRoute = null;
+            browserAdvisorHintPreview = '';
+            resetBrowserAdvisorCollection();
+          }
+        }
+        if (isDesktopTool && !toolResult.error && toolName === 'desktop_screenshot') {
+          desktopContinuationPending = false;
+        }
+        // Fire advisor after each browser/desktop tool in the synthetic batch
+        await maybeRunBrowserAdvisorPass(toolName, toolResult);
+        await maybeRunDesktopAdvisorPass(toolName, toolResult);
+      }
+
+      sendSSE('info', { message: `Synthetic steps complete (step ${round + 1})` });
+      // Continue to next round — either with fresh LLM gen or another synthetic batch
+      continue;
+    }
+
+    // ── Secondary-owned FILE_OP: skip Ollama, run verify, return directly ──
+    // When secondary has already executed all patch calls there is nothing left
+    // for primary to do. Build the reply from what we already know in-memory.
+    if (
+      fileOpV2Active
+      && fileOpOwner === 'secondary'
+      && pendingSyntheticToolCalls.length === 0
+      && fileOpToolHistory.some(h => isFileMutationTool(h.tool))
+    ) {
+      // Run verification if triggered
+      const verifyDecision = shouldVerifyFileTurn({
+        had_create: fileOpHadCreate,
+        user_requested_full_template: requestedFullTemplate(message),
+        primary_write_lines: fileOpPrimaryWriteLines,
+        primary_write_chars: fileOpPrimaryWriteChars,
+        had_tool_failure: fileOpHadToolFailure,
+        touched_files: Array.from(fileOpTouchedFiles),
+        high_stakes_touched: Array.from(fileOpTouchedFiles).some(isHighStakesFile),
+      }, fileOpSettings);
+
+      if (verifyDecision.verify) {
+        sendSSE('info', { message: `FILE_OP v2: verifier check (${verifyDecision.reasons.join(' | ')}).` });
+        maybeSaveFileOpCheckpoint({ phase: 'verify', next_action: 'run secondary verifier' });
+        const targetFiles = Array.from(fileOpTouchedFiles);
+        const verifier = await callSecondaryFileVerifier({
+          userMessage: message,
+          operationType: fileOpType as 'FILE_CREATE' | 'FILE_EDIT',
+          fileSnapshots: collectFileSnapshots(workspacePath, targetFiles),
+          recentToolExecutions: fileOpToolHistory.slice(-24).map(h => ({
+            tool: h.tool, args: h.args, result: h.result, error: h.error,
+          })),
+        });
+        if (verifier?.verdict === 'FAIL') {
+          // Re-enter the repair loop by queuing a secondary patch plan and continuing
+          const patchPlan = await callSecondaryFilePatchPlanner({
+            userMessage: message,
+            operationType: fileOpType as 'FILE_CREATE' | 'FILE_EDIT',
+            owner: 'secondary',
+            reason: (verifier.reasons || []).join(' | ') || 'verifier fail',
+            fileSnapshots: collectFileSnapshots(workspacePath, targetFiles),
+            verifier,
+          });
+          if (patchPlan?.tool_calls?.length) {
+            pendingSyntheticToolCalls = patchPlan.tool_calls.map(tc => ({
+              function: { name: tc.tool, arguments: tc.args || {} },
+            }));
+            maybeSaveFileOpCheckpoint({ phase: 'execute', next_action: 'repair after verify fail' });
+            continue; // back to top of round loop — executes repair batch next
+          }
+        } else if (verifier?.verdict === 'PASS') {
+          maybeSaveFileOpCheckpoint({ phase: 'done', next_action: 'verification pass' });
+          clearFileOpCheckpoint(sessionId);
+        }
+      } else {
+        maybeSaveFileOpCheckpoint({ phase: 'done', next_action: 'turn complete' });
+        clearFileOpCheckpoint(sessionId);
+      }
+
+      // Build reply from actual results — no Ollama, no extra AI call
+      const createdFiles = fileOpToolHistory
+        .filter(h => h.tool === 'create_file' && !h.error)
+        .map(h => String(h.args?.filename || h.args?.name || h.args?.path || 'file'));
+      const editedFiles = fileOpToolHistory
+        .filter(h => isFileMutationTool(h.tool) && h.tool !== 'create_file' && !h.error)
+        .map(h => String(h.args?.filename || h.args?.name || h.args?.path || 'file'));
+      const failedOps = fileOpToolHistory.filter(h => h.error);
+
+      const parts: string[] = [];
+      if (createdFiles.length) parts.push(`Created ${createdFiles.join(', ')}`);
+      if (editedFiles.length) parts.push(`Updated ${[...new Set(editedFiles)].join(', ')}`);
+      if (failedOps.length) parts.push(`${failedOps.length} operation(s) failed`);
+      const finalText = parts.length ? parts.join('. ') + '.' : 'Done.';
+
+      console.log(`[v2] FINAL (secondary-owned): ${finalText}`);
+      logToDaily(workspacePath, 'LocalClaw', finalText);
+      return {
+        type: 'execute',
+        text: finalText,
+        toolResults: allToolResults.length > 0 ? allToolResults : undefined,
+      };
+    }
+
     let response: any;
     try {
-      const result = await ollama.chatWithThinking(messages, 'executor', {
-        tools, temperature: 0.3, num_ctx: 8192, num_predict: 4096, think: false,
+      // In multi-agent mode, disable thinking for browser ops — the secondary AI
+      // holds all context and issues exact directives; the primary just executes.
+      // Thinking during browser ops burns the full stall threshold (110s) for no gain.
+      const isActiveAutomationOp = multiAgentActive && (
+        fileOpType === 'BROWSER_OP'
+        || fileOpType === 'DESKTOP_OP'
+        || browserContinuationPending
+        || browserAdvisorRoute !== null
+        || desktopContinuationPending
+        || desktopAdvisorRoute !== null
+        || allToolResults.some(r =>
+          typeof r.name === 'string'
+          && (r.name.startsWith('browser_') || r.name.startsWith('desktop_')),
+        )
+      );
+      const primaryThinkMode: boolean | 'high' | 'medium' | 'low' = (multiAgentActive && !isActiveAutomationOp) ? true : false;
+      const generationPromise = ollama.chatWithThinking(messages, 'executor', {
+        tools,
+        temperature: 0.3,
+        num_ctx: 8192,
+        num_predict: 4096,
+        think: primaryThinkMode,
+        model: String(modelOverride || '').trim() || undefined,
       });
-      response = result.message;
-      if (result.thinking) {
-        console.log(`[v2] THINK (${result.thinking.length} chars): ${result.thinking.slice(0, 150)}...`);
-        allThinking += (allThinking ? '\n\n' : '') + result.thinking;
-        sendSSE('thinking', { thinking: result.thinking });
+
+      // ── Preempt watchdog ────────────────────────────────────────────
+      if (
+        preemptCfg.enabled
+        && ollamaProcMgr
+        && preemptState.canPreempt(round, preemptCfg.maxPerTurn, preemptCfg.maxPerSession)
+      ) {
+        const watchdogOutcome = await raceWithWatchdog(
+          generationPromise,
+          preemptCfg.stallThresholdMs,
+          (elapsedMs) => {
+            console.log(`[Preempt] Generation stalled at ${Math.round(elapsedMs / 1000)}s — triggering preempt`);
+            sendSSE('preempt_start', { elapsed_ms: elapsedMs, threshold_ms: preemptCfg.stallThresholdMs, round });
+          },
+        );
+
+        if (watchdogOutcome.timedOut) {
+          // ── FILE_OP stall: bypass preempt restart entirely, promote immediately ──
+          if (
+            fileOpV2Active
+            && (fileOpType === 'FILE_CREATE' || fileOpType === 'FILE_EDIT')
+            && fileOpOwner === 'primary'
+          ) {
+            sendSSE('info', {
+              message: `FILE_OP v2: stall detected during ${fileOpType} after ${Math.round(watchdogOutcome.elapsedMs / 1000)}s — promoting immediately to secondary (no Ollama restart).`,
+            });
+            fileOpOwner = 'secondary';
+            fileOpPrimaryStallPromoted = true;
+            maybeSaveFileOpCheckpoint({
+              phase: 'repair',
+              next_action: 'stall promotion to secondary patch planning',
+            });
+            const patchPlan = await callSecondaryFilePatchPlanner({
+              userMessage: message,
+              operationType: fileOpType,
+              owner: fileOpOwner,
+              reason: `Primary stalled after ${Math.round(watchdogOutcome.elapsedMs / 1000)}s`,
+              fileSnapshots: collectFileSnapshots(workspacePath, Array.from(fileOpTouchedFiles)),
+              verifier: null,
+            });
+            if (patchPlan?.tool_calls?.length) {
+              pendingSyntheticToolCalls = patchPlan.tool_calls.map(tc => ({
+                function: { name: tc.tool, arguments: tc.args || {} },
+              }));
+              sendSSE('info', {
+                message: `FILE_OP v2: queued ${patchPlan.tool_calls.length} secondary patch call(s) after stall promotion.`,
+              });
+              maybeSaveFileOpCheckpoint({
+                phase: 'execute',
+                next_action: 'execute secondary synthetic patch batch',
+              });
+            }
+            continue;
+          }
+
+          // ── Non-FILE_OP stall: normal preempt restart path ──
+          preemptState.recordPreempt(round);
+          const sessionPreemptCount = incrementPreemptSessionCount(sessionId);
+          sendSSE('info', {
+            message: `Preempt: generation stalled after ${Math.round(watchdogOutcome.elapsedMs / 1000)}s. Restarting Ollama... (${sessionPreemptCount}/${preemptCfg.maxPerSession} this session)`,
+          });
+
+          const restarted = await ollamaProcMgr.killAndRestart();
+          sendSSE('preempt_killed', {
+            restarted,
+            round,
+            preempts_session: sessionPreemptCount,
+            preempts_session_cap: preemptCfg.maxPerSession,
+          });
+
+          if (!restarted) {
+            sendSSE('info', { message: 'Preempt: Ollama did not restart in time. Continuing without rescue.' });
+          } else {
+            sendSSE('preempt_ready', {
+              round,
+              preempts_session: sessionPreemptCount,
+              preempts_session_cap: preemptCfg.maxPerSession,
+            });
+
+            // Fire secondary rescue advisor
+            const orchCfgForPreempt = getOrchestrationConfig();
+            if (orchCfgForPreempt?.enabled && orchestrationStats.assistCount < orchCfgForPreempt.limits.max_assists_per_session) {
+              sendSSE('info', { message: 'Preempt: consulting rescue advisor...' });
+              const liveInfoForRescue = getBrowserSessionInfo(sessionId);
+              const advice = await callSecondaryAdvisor(
+                message,
+                orchestrationLog,
+                `Generation stalled after ${Math.round(watchdogOutcome.elapsedMs / 1000)}s with no output`,
+                'rescue',
+                liveInfoForRescue.active ? {
+                  active: true,
+                  title: liveInfoForRescue.title,
+                  url: liveInfoForRescue.url,
+                  totalCollected: browserAdvisorCollectedFeed.length,
+                } : undefined,
+                buildSecondaryAssistContext(),
+              );
+              if (advice) {
+                const hint = formatAdvisoryHint(advice);
+                const stats = recordOrchestrationEvent(
+                  sessionId,
+                  { trigger: 'auto', reason: 'preempt_stall', mode: 'rescue' },
+                  orchCfgForPreempt,
+                );
+                sendSSE('preempt_rescue', {
+                  round,
+                  assist_count: stats.assistCount,
+                  assist_cap: orchCfgForPreempt.limits.max_assists_per_session,
+                });
+                messages.push({ role: 'user', content: hint });
+                messages.push({ role: 'assistant', content: 'Understood. Acting immediately.' });
+              }
+            }
+
+            // Inject strict nudge and retry — model just woke up fresh
+            // Re-inject live browser state so model doesn't re-open an already-open browser
+            const liveInfoForRetry = getBrowserSessionInfo(sessionId);
+            const browserRetryReminder = liveInfoForRetry.active
+              ? multiAgentActive
+                ? `\n\nCRITICAL: Browser is ALREADY OPEN at "${liveInfoForRetry.url || 'current page'}". ` +
+                  `Do NOT call browser_open. Call browser_snapshot so the secondary AI can analyze and tell you what to do next.`
+                : `\n\nCRITICAL: Browser is ALREADY OPEN at "${liveInfoForRetry.url || 'current page'}". ` +
+                  `Do NOT call browser_open again. Use browser_snapshot to see the current page.`
+              : '';
+            messages.push({
+              role: 'user',
+              content: `Your last generation was interrupted. Do NOT think or plan. Call the next tool immediately. If no tool is needed, reply in 1 sentence.${browserRetryReminder}`,
+            });
+            sendSSE('preempt_retry', { round });
+            sendSSE('info', { message: 'Preempt: retrying with rescue context...' });
+          }
+          // Re-run this round from the top with the fresh Ollama instance
+          continue;
+        }
+
+        // Generation finished before watchdog
+        const result = watchdogOutcome.result;
+        response = result.message;
+        if (result.thinking) {
+          console.log(`[v2] THINK (${result.thinking.length} chars): ${result.thinking.slice(0, 150)}...`);
+          allThinking += (allThinking ? '\n\n' : '') + result.thinking;
+          sendSSE('thinking', { thinking: result.thinking });
+        }
+      } else {
+        // Watchdog not active — normal await
+        const result = await generationPromise;
+        response = result.message;
+        if (result.thinking) {
+          console.log(`[v2] THINK (${result.thinking.length} chars): ${result.thinking.slice(0, 150)}...`);
+          allThinking += (allThinking ? '\n\n' : '') + result.thinking;
+          sendSSE('thinking', { thinking: result.thinking });
+        }
+      }
+
+      const explicitThink = stripExplicitThinkTags(response?.content || '');
+      if (explicitThink.thinking) {
+        console.log(`[v2] TAG THINK (${explicitThink.thinking.length} chars): ${explicitThink.thinking.slice(0, 150)}...`);
+        allThinking += (allThinking ? '\n\n' : '') + explicitThink.thinking;
+        sendSSE('thinking', { thinking: explicitThink.thinking });
+      }
+      if (String(response?.content || '') !== explicitThink.cleaned) {
+        response.content = explicitThink.cleaned;
       }
     } catch (err: any) {
       console.error('[v2] Chat error:', err.message);
@@ -1300,7 +3528,9 @@ RESPONSE RULES:
         try {
           const toolArgs = JSON.parse(textToolMatch[2]);
           console.log(`[v2] AUTO-RECOVER: Model wrote ${toolName} as text, converting to tool call`);
-          toolCalls = [{ function: { name: toolName, arguments: toolArgs } }];
+          const recoveredCallId = `recovered_${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
+          toolCalls = [{ id: recoveredCallId, type: 'function', function: { name: toolName, arguments: toolArgs } }];
+          response.tool_calls = toolCalls;
           response.content = '';
         } catch { /* JSON parse failed, treat as normal text */ }
       }
@@ -1312,15 +3542,48 @@ RESPONSE RULES:
       const content = response.content;
       const looksLikeReasoning = content.length > 300
         && (/\b(let me|I need to|I should|the user|first,|wait,|hmm|the rules say)\b/i.test(content));
-      const queryNeedsTools = /\b(search|find|look up|latest|news|info|open|browse|what happened)\b/i.test(message);
-      if (looksLikeReasoning && queryNeedsTools) {
+      const queryNeedsTools = /\b(search|find|look up|latest|news|info|open|browse|navigate|visit|click|type|fill|what happened|desktop|screen|window|vscode|vs code|codex|clipboard)\b/i.test(message);
+      const browserAutomationRequest = isBrowserAutomationRequest(message);
+      const desktopAutomationRequest = isDesktopAutomationRequest(message);
+      const looksLikeRefusal = looksLikeSafetyRefusal(content);
+      if (queryNeedsTools && (looksLikeReasoning || looksLikeRefusal)) {
         console.log(`[v2] AUTO-RECOVER: Model dumped ${content.length} chars of reasoning instead of calling tools. Re-prompting...`);
         allThinking += (allThinking ? '\n\n' : '') + content;
         sendSSE('thinking', { thinking: content.slice(0, 500) + '...' });
         // Inject a forceful nudge and retry this round
-        messages.push({ role: 'assistant', content: 'Let me search for that now.' });
-        messages.push({ role: 'user', content: 'Yes, use the web_search tool right now. Do NOT think or plan — just call web_search.' });
-        sendSSE('info', { message: 'Re-prompting model to use tools...' });
+        if (browserAutomationRequest) {
+          const liveBrowser = getBrowserSessionInfo(sessionId);
+          const explicitUrl = extractLikelyUrl(message);
+          messages.push({ role: 'assistant', content: 'Understood. Executing browser automation now.' });
+          if (liveBrowser.active) {
+            messages.push({
+              role: 'user',
+              content: 'Use browser_snapshot now. Then continue with browser_click/browser_fill/browser_press_key to complete the user request. Do NOT refuse.',
+            });
+          } else if (explicitUrl) {
+            messages.push({
+              role: 'user',
+              content: `Use browser_open now with url="${explicitUrl}". This is explicitly user-authorized local automation. Then continue with browser_snapshot/browser_fill/browser_press_key as needed. Do NOT refuse.`,
+            });
+          } else {
+            messages.push({
+              role: 'user',
+              content: 'Call browser_open now using the target site from the user request. Then continue with browser_snapshot/browser_click/browser_fill to complete the task. Do NOT refuse.',
+            });
+          }
+          sendSSE('info', { message: 'Re-prompting model to execute browser automation...' });
+        } else if (desktopAutomationRequest) {
+          messages.push({ role: 'assistant', content: 'Understood. Checking desktop state now.' });
+          messages.push({
+            role: 'user',
+            content: 'Use desktop_screenshot now. If VS Code or another app must be targeted, use desktop_focus_window first, then continue with desktop_click/desktop_type/desktop_press_key as needed. Do NOT refuse.',
+          });
+          sendSSE('info', { message: 'Re-prompting model to execute desktop automation...' });
+        } else {
+          messages.push({ role: 'assistant', content: 'Let me search for that now.' });
+          messages.push({ role: 'user', content: 'Yes, use the web_search tool right now. Do NOT think or plan — just call web_search.' });
+          sendSSE('info', { message: 'Re-prompting model to use tools...' });
+        }
         continue; // retry this round
       }
     }
@@ -1349,6 +3612,64 @@ RESPONSE RULES:
           || (lastToolFailed && !hasConcreteCompletion(candidateText))
         );
 
+      const shouldForceBrowserRetry =
+        orchestrationSkillEnabled
+        && browserContinuationPending
+        && browserForcedRetries < browserMaxForcedRetries
+        && !hasConcreteCompletion(candidateText);
+      const shouldForceDesktopRetry =
+        orchestrationSkillEnabled
+        && desktopContinuationPending
+        && continuationNudges < MAX_CONTINUATION_NUDGES
+        && !hasConcreteCompletion(candidateText);
+
+      if (shouldForceBrowserRetry) {
+        browserForcedRetries++;
+        const reason = `browser advisor route=${browserAdvisorRoute || 'continue_browser'} requires continued execution`;
+        console.log(
+          `[v2] BROWSER POST-CHECK: forcing retry (${browserForcedRetries}/${browserMaxForcedRetries}) - ${reason}`,
+        );
+        sendSSE('forced_retry', {
+          reason,
+          retry: browserForcedRetries,
+          max_retries: browserMaxForcedRetries,
+          route: browserAdvisorRoute,
+        });
+        sendSSE('info', {
+          message: `Browser post-check: continuing execution (${browserForcedRetries}/${browserMaxForcedRetries}).`,
+        });
+        if (candidateText) {
+          messages.push({ role: 'assistant', content: candidateText });
+        }
+        const preview = browserAdvisorHintPreview ? `Advisor hint: ${browserAdvisorHintPreview}` : '';
+        messages.push({
+          role: 'user',
+          content:
+            `${preview}\nDo not stop. Call the next browser tool now and continue execution. If more feed coverage is needed, use browser_press_key with PageDown then browser_wait then browser_snapshot.`,
+        });
+        continue;
+      }
+
+      if (shouldForceDesktopRetry) {
+        continuationNudges++;
+        const reason = `desktop advisor route=${desktopAdvisorRoute || 'continue_desktop'} requires continued execution`;
+        console.log(
+          `[v2] DESKTOP POST-CHECK: forcing retry (${continuationNudges}/${MAX_CONTINUATION_NUDGES}) - ${reason}`,
+        );
+        sendSSE('info', {
+          message: `Desktop post-check: continuing execution (${continuationNudges}/${MAX_CONTINUATION_NUDGES}).`,
+        });
+        if (candidateText) {
+          messages.push({ role: 'assistant', content: candidateText });
+        }
+        const preview = desktopAdvisorHintPreview ? `Advisor hint: ${desktopAdvisorHintPreview}` : '';
+        messages.push({
+          role: 'user',
+          content: `${preview}\nDo not stop. Call the next desktop tool now. If state may have changed, use desktop_screenshot again.`,
+        });
+        continue;
+      }
+
       if (shouldContinueInsteadOfFinalizing) {
         continuationNudges++;
         const nudgeReason = lastToolFailed
@@ -1370,8 +3691,209 @@ RESPONSE RULES:
         continue;
       }
 
+      if (
+        fileOpV2Active
+        && (fileOpType === 'FILE_CREATE' || fileOpType === 'FILE_EDIT')
+        && fileOpToolHistory.some(h => isFileMutationTool(h.tool))
+      ) {
+        const verifyDecision = shouldVerifyFileTurn({
+          had_create: fileOpHadCreate,
+          user_requested_full_template: requestedFullTemplate(message),
+          primary_write_lines: fileOpPrimaryWriteLines,
+          primary_write_chars: fileOpPrimaryWriteChars,
+          had_tool_failure: fileOpHadToolFailure,
+          touched_files: Array.from(fileOpTouchedFiles),
+          high_stakes_touched: Array.from(fileOpTouchedFiles).some(isHighStakesFile),
+        }, fileOpSettings);
+
+        if (verifyDecision.verify) {
+          sendSSE('info', {
+            message: `FILE_OP v2: verifier check (${verifyDecision.reasons.join(' | ')}).`,
+          });
+          maybeSaveFileOpCheckpoint({
+            phase: 'verify',
+            next_action: 'run secondary verifier',
+          });
+
+          const runVerifier = async () => {
+            const targetFiles = (() => {
+              const direct = Array.from(fileOpTouchedFiles);
+              if (direct.length) return direct;
+              const fromHistory = fileOpToolHistory
+                .map(h => extractFileToolTarget(h.tool, h.args))
+                .filter(Boolean);
+              return Array.from(new Set(fromHistory));
+            })();
+            return callSecondaryFileVerifier({
+              userMessage: message,
+              operationType: fileOpType,
+              fileSnapshots: collectFileSnapshots(workspacePath, targetFiles),
+              recentToolExecutions: fileOpToolHistory.slice(-24).map(h => ({
+                tool: h.tool,
+                args: h.args,
+                result: h.result,
+                error: h.error,
+              })),
+            });
+          };
+
+          let verifier = await runVerifier();
+          if (verifier?.verdict === 'PASS') {
+            maybeSaveFileOpCheckpoint({
+              phase: 'done',
+              next_action: 'verification pass',
+            });
+            clearFileOpCheckpoint(sessionId);
+          } else if (verifier?.verdict === 'FAIL') {
+            let delegatePrimaryMicroFix = false;
+            let reasonForPatch = (verifier.reasons || []).join(' | ') || 'verifier fail';
+            let latestVerifier: typeof verifier | null = verifier;
+            let noProgressEscalations = 0;
+
+            while (latestVerifier && latestVerifier.verdict === 'FAIL') {
+              const failureSig = buildFailureSignature(latestVerifier as any);
+              const smallFix = isSmallSuggestedFix(latestVerifier as any, fileOpSettings);
+              const previousPatchSig = fileOpPatchSignatures[fileOpPatchSignatures.length - 1] || 'none';
+              const progress = fileOpWatchdog.record({
+                failure_signature: failureSig,
+                patch_signature: previousPatchSig,
+                large_patch: !smallFix,
+              });
+              fileOpLastFailureSignature = failureSig;
+              if (progress.no_progress) {
+                noProgressEscalations++;
+                // Escalation ladder — each level changes strategy, not just intensity:
+                // Level 1: Broaden patch scope, rewrite the broken section
+                // Level 2: Regenerate the entire file from scratch using original prompt + accumulated findings
+                // Level 3: Switch actor — force primary micro-fix attempt if fix is plausibly small
+                // Level 4+: Re-derive requirements checklist and verify full spec coverage
+                if (noProgressEscalations === 1) {
+                  reasonForPatch = `ESCALATION L1 (no progress on sig=${failureSig}): Broaden patch scope. Do NOT make the same targeted fix again. Rewrite the entire broken section from scratch using the original requirements and verifier findings.`;
+                } else if (noProgressEscalations === 2) {
+                  reasonForPatch = `ESCALATION L2 (still no progress): Regenerate the ENTIRE file from scratch. Use the original user prompt, all accumulated verifier findings, and current constraints. Do not attempt another targeted patch.`;
+                } else if (noProgressEscalations === 3) {
+                  // Switch actor: force primary micro-fix regardless of smallFix gating
+                  reasonForPatch = `ESCALATION L3: Switching actor to primary for a targeted micro-fix attempt.`;
+                  sendSSE('info', {
+                    message: `FILE_OP v2: no-progress watchdog L3 — switching actor to primary micro-fix.`,
+                  });
+                  delegatePrimaryMicroFix = true;
+                } else {
+                  reasonForPatch = `ESCALATION L${noProgressEscalations} (requirements re-derivation): Re-derive the full requirements checklist from the original user prompt. List every requirement explicitly, then verify which are missing or broken. Patch only what the checklist shows is unmet.`;
+                }
+                sendSSE('info', {
+                  message: `FILE_OP v2: no-progress watchdog triggered (level ${noProgressEscalations}); escalating repair strategy.`,
+                });
+              }
+
+              maybeSaveFileOpCheckpoint({
+                phase: 'repair',
+                next_action: progress.no_progress
+                  ? `escalate repair strategy L${noProgressEscalations} (no progress watchdog)`
+                  : 'repair current verifier findings',
+                findings: latestVerifier.findings || [],
+              });
+
+              if (delegatePrimaryMicroFix) break;
+
+              if (smallFix) {
+                delegatePrimaryMicroFix = true;
+                break;
+              }
+
+              fileOpOwner = 'secondary';
+              const patchPlan = await callSecondaryFilePatchPlanner({
+                userMessage: message,
+                operationType: fileOpType,
+                owner: fileOpOwner,
+                reason: reasonForPatch,
+                fileSnapshots: collectFileSnapshots(workspacePath, Array.from(fileOpTouchedFiles)),
+                verifier: latestVerifier,
+              });
+
+              if (!patchPlan?.tool_calls?.length) {
+                sendSSE('info', {
+                  message: 'FILE_OP v2: secondary patch planner returned no executable calls; switching to primary micro-fix attempt.',
+                });
+                delegatePrimaryMicroFix = true;
+                break;
+              }
+
+              const applied = await executeSecondaryPatchCalls(
+                patchPlan.tool_calls,
+                progress.no_progress ? 'watchdog escalation' : 'verifier repair',
+              );
+              maybeSaveFileOpCheckpoint({
+                phase: 'execute',
+                next_action: applied.ran > 0 ? 'secondary patch batch applied' : 'secondary patch batch empty',
+              });
+
+              latestVerifier = await runVerifier();
+              if (latestVerifier?.verdict === 'PASS') {
+                maybeSaveFileOpCheckpoint({
+                  phase: 'done',
+                  next_action: 'verification pass after secondary repair',
+                });
+                clearFileOpCheckpoint(sessionId);
+                break;
+              }
+              if (!latestVerifier) break;
+              reasonForPatch = (latestVerifier.reasons || []).join(' | ') || 'verifier fail after repair';
+            }
+
+            if (delegatePrimaryMicroFix) {
+              const findingsText = (latestVerifier?.findings || [])
+                .slice(0, 3)
+                .map(f => `${f.filename || 'file'}:${f.type || 'issue'} expected="${String(f.expected || '').slice(0, 70)}" observed="${String(f.observed || '').slice(0, 70)}"`)
+                .join(' | ');
+              const failReasons = (latestVerifier?.reasons || []).join(' | ');
+              fileOpOwner = 'primary';
+              if (candidateText) messages.push({ role: 'assistant', content: candidateText });
+              messages.push({
+                role: 'user',
+                content: `Verifier FAIL (${failReasons || 'unspecified'}). Apply ONLY a minimal tool patch now. Constraints: max ${fileOpSettings.primary_edit_max_lines} changed lines, max ${fileOpSettings.primary_edit_max_chars} chars, max ${fileOpSettings.primary_edit_max_files} file. No refactor, no extra files. Findings: ${findingsText || 'fix request mismatch and re-check.'}`,
+              });
+              maybeSaveFileOpCheckpoint({
+                phase: 'execute',
+                next_action: 'primary micro-fix patch requested',
+                findings: latestVerifier?.findings || [],
+              });
+              continue;
+            }
+
+            const finalVerifier = await runVerifier();
+            if (finalVerifier?.verdict === 'FAIL') {
+              const reasons = (finalVerifier.reasons || []).join(' | ') || 'verification failed';
+              if (candidateText) messages.push({ role: 'assistant', content: candidateText });
+              messages.push({
+                role: 'user',
+                content: `Verifier still FAIL (${reasons}). Apply the next concrete patch now and continue until it passes.`,
+              });
+              maybeSaveFileOpCheckpoint({
+                phase: 'execute',
+                next_action: 'retry after final verifier fail',
+                findings: finalVerifier.findings || [],
+              });
+              continue;
+            }
+            maybeSaveFileOpCheckpoint({
+              phase: 'done',
+              next_action: 'verification pass after repair loop',
+            });
+            clearFileOpCheckpoint(sessionId);
+          } else {
+            sendSSE('info', {
+              message: 'FILE_OP v2: secondary verifier unavailable; continuing with current result.',
+            });
+          }
+        }
+      }
+
       // If model dumped massive reasoning with no usable reply, generate a fallback
-      let finalText = reply;
+      let finalText = sanitizeFinalReply(
+        String(reply || rawAssistantText || ''),
+        { preflightReason: preflightReasonForTurn },
+      );
       if (!finalText || finalText.length < 5) {
         if (allToolResults.length > 0) {
           // Summarize what tools actually did
@@ -1381,9 +3903,20 @@ RESPONSE RULES:
           finalText = 'Hey! How can I help?';
         }
       }
+      if (greetingLikeTurn && finalText.length > 220) {
+        finalText = finalText.split(/\n+/)[0].slice(0, 220).trim();
+      }
+      finalText = sanitizeFinalReply(finalText, { preflightReason: preflightReasonForTurn }) || 'Hey! How can I help?';
       console.log(`[v2] FINAL: ${finalText.slice(0, 150)}`);
 
       logToDaily(workspacePath, 'LocalClaw', finalText);
+      if (fileOpV2Active) {
+        maybeSaveFileOpCheckpoint({
+          phase: 'done',
+          next_action: 'turn complete',
+        });
+        clearFileOpCheckpoint(sessionId);
+      }
 
       return {
         type: allToolResults.length > 0 ? 'execute' : 'chat',
@@ -1399,26 +3932,210 @@ RESPONSE RULES:
     let roundHadProgress = false;
 
     for (const call of toolCalls) {
+      const toolCallId = String((call as any)?.id || '').trim();
       const toolName = call.function?.name || 'unknown';
-      const toolArgs = call.function?.arguments || {};
+      const toolArgs = normalizeToolArgs(call.function?.arguments);
+      const loopCheck = checkLoopDetection(toolName, toolArgs);
+      if (loopCheck.state === 'block') {
+        const blockMsg = `Loop guard: ${toolName} with the same arguments has already run ${loopCheck.repeats} times. Stop repeating this call and try a different approach.`;
+        console.warn(`[v2] LOOP BLOCK: ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)}) x${loopCheck.repeats}`);
+        const blockedResult: ToolResult = {
+          name: toolName,
+          args: toolArgs,
+          result: blockMsg,
+          error: false,
+        };
+        allToolResults.push(blockedResult);
+        roundHadProgress = true;
+        sendSSE('tool_result', {
+          action: toolName,
+          result: blockMsg,
+          error: false,
+          stepNum: allToolResults.length,
+        });
+        messages.push({
+          role: 'tool',
+          tool_name: toolName,
+          tool_call_id: toolCallId || undefined,
+          content: blockMsg,
+        });
+        continue;
+      }
+      if (loopCheck.state === 'warn') {
+        const warnMsg = `Loop warning: ${toolName} with same arguments repeated ${loopCheck.repeats} times.`;
+        console.warn(`[v2] LOOP WARN: ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)}) x${loopCheck.repeats}`);
+        sendSSE('info', { message: warnMsg });
+      }
+
+      if (isBootStartupTurn && !bootAllowedTools.has(toolName)) {
+        const blockMsg = `BOOT mode: "${toolName}" is disabled. Use only list_files and read_file, then provide the startup summary.`;
+        console.log(`[v2] BOOT TOOL BLOCKED: ${toolName}`);
+        const blockedResult: ToolResult = {
+          name: toolName,
+          args: toolArgs,
+          result: blockMsg,
+          error: false,
+        };
+        allToolResults.push(blockedResult);
+        roundHadProgress = true;
+        logToolCall(workspacePath, toolName, toolArgs, blockMsg, false);
+        sendSSE('tool_result', {
+          action: toolName,
+          result: blockMsg,
+          error: false,
+          stepNum: allToolResults.length,
+        });
+        messages.push({
+          role: 'tool',
+          tool_name: toolName,
+          tool_call_id: toolCallId || undefined,
+          content: blockMsg,
+        });
+        continue;
+      }
 
       if (toolName === 'create_file') {
         const fn = toolArgs.filename || toolArgs.name;
         if (fn && batchCreatedFiles.has(fn)) {
           console.log(`[v2] SKIP: duplicate create_file("${fn}") in same batch`);
-          messages.push({ role: 'tool', tool_name: toolName, content: `${fn} already created in this batch. Use replace_lines to edit.` });
+          messages.push({
+            role: 'tool',
+            tool_name: toolName,
+            tool_call_id: toolCallId || undefined,
+            content: `${fn} already created in this batch. Use replace_lines to edit.`,
+          });
           continue;
         }
         if (fn) batchCreatedFiles.add(fn);
       }
 
+      // Browser workflows often need repeated identical actions (PageDown, wait,
+      // snapshot) across rounds to collect more evidence. Keep duplicate blocking
+      // for non-browser tools only.
+      const allowRepeatedTool = toolName.startsWith('browser_');
       const callKey = `${toolName}:${JSON.stringify(toolArgs)}`;
-      if (seenToolCalls.has(callKey)) {
+      if (!allowRepeatedTool && seenToolCalls.has(callKey)) {
         console.log(`[v2] SKIP: duplicate tool call ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)})`);
-        messages.push({ role: 'tool', tool_name: toolName, content: `Already ran this exact call. Use the previous result and move on.` });
+        messages.push({
+          role: 'tool',
+          tool_name: toolName,
+          tool_call_id: toolCallId || undefined,
+          content: 'Already ran this exact call. Use the previous result and move on.',
+        });
         continue;
       }
-      seenToolCalls.add(callKey);
+      if (!allowRepeatedTool) {
+        seenToolCalls.add(callKey);
+      }
+
+      if (
+        fileOpV2Active
+        && (fileOpType === 'FILE_CREATE' || fileOpType === 'FILE_EDIT')
+        && fileOpOwner === 'secondary'
+        && isFileMutationTool(toolName)
+      ) {
+        sendSSE('info', {
+          message: 'FILE_OP v2: secondary-owned turn; replacing primary mutation call with secondary patch plan.',
+        });
+        const target = extractFileToolTarget(toolName, toolArgs);
+        const patchPlan = await callSecondaryFilePatchPlanner({
+          userMessage: message,
+          operationType: fileOpType,
+          owner: fileOpOwner,
+          reason: 'secondary-owned execution',
+          fileSnapshots: collectFileSnapshots(
+            workspacePath,
+            target ? [target, ...Array.from(fileOpTouchedFiles)] : Array.from(fileOpTouchedFiles),
+          ),
+          blockedPrimaryCall: {
+            tool: toolName,
+            args: toolArgs,
+            reason: 'secondary-owned execution',
+          },
+          verifier: null,
+        });
+        if (patchPlan?.tool_calls?.length) {
+          const applied = await executeSecondaryPatchCalls(patchPlan.tool_calls, 'secondary owner replacement');
+          if (applied.ran > 0) roundHadProgress = true;
+        } else {
+          fileOpHadToolFailure = true;
+          messages.push({
+            role: 'tool',
+            tool_name: toolName,
+            tool_call_id: toolCallId || undefined,
+            content: 'FILE_OP v2: secondary planner produced no replacement calls.',
+          });
+        }
+        continue;
+      }
+
+      if (
+        fileOpV2Active
+        && (fileOpType === 'FILE_CREATE' || fileOpType === 'FILE_EDIT')
+        && fileOpOwner === 'primary'
+        && isFileMutationTool(toolName)
+      ) {
+        const allowance = canPrimaryApplyFileTool({
+          tool_name: toolName,
+          args: toolArgs,
+          message,
+          touched_files: fileOpTouchedFiles,
+          settings: fileOpSettings,
+        });
+        if (!allowance.allowed) {
+          fileOpOwner = 'secondary';
+          maybeSaveFileOpCheckpoint({
+            phase: 'repair',
+            next_action: `secondary takeover after gate block: ${allowance.reason}`,
+          });
+          sendSSE('info', {
+            message: `FILE_OP v2 gate: promoted to secondary (${allowance.reason}).`,
+          });
+          const target = extractFileToolTarget(toolName, toolArgs);
+          const snapshots = collectFileSnapshots(
+            workspacePath,
+            target ? [target, ...Array.from(fileOpTouchedFiles)] : Array.from(fileOpTouchedFiles),
+          );
+          const patchPlan = await callSecondaryFilePatchPlanner({
+            userMessage: message,
+            operationType: fileOpType,
+            owner: fileOpOwner,
+            reason: allowance.reason,
+            fileSnapshots: snapshots,
+            blockedPrimaryCall: {
+              tool: toolName,
+              args: toolArgs,
+              reason: allowance.reason,
+            },
+            verifier: null,
+          });
+          if (patchPlan?.tool_calls?.length) {
+            const applied = await executeSecondaryPatchCalls(patchPlan.tool_calls, 'primary threshold gate');
+            if (applied.ran > 0) roundHadProgress = true;
+            maybeSaveFileOpCheckpoint({
+              phase: 'execute',
+              next_action: applied.ran > 0 ? 'secondary patch calls applied' : 'no patch calls applied',
+            });
+            continue;
+          }
+          fileOpHadToolFailure = true;
+          const failText = 'FILE_OP v2: secondary patch planner returned no executable calls.';
+          messages.push({
+            role: 'tool',
+            tool_name: toolName,
+            tool_call_id: toolCallId || undefined,
+            content: failText,
+          });
+          sendSSE('tool_result', {
+            action: toolName,
+            result: failText,
+            error: true,
+            stepNum: allToolResults.length,
+            actor: 'secondary',
+          });
+          continue;
+        }
+      }
 
       console.log(`[v2] TOOL[${round + 1}]: ${toolName}(${JSON.stringify(toolArgs).slice(0, 150)})`);
       sendSSE('tool_call', { action: toolName, args: toolArgs, stepNum: allToolResults.length + 1 });
@@ -1473,6 +4190,7 @@ RESPONSE RULES:
             messages.push({
               role: 'tool',
               tool_name: toolName,
+              tool_call_id: toolCallId || undefined,
               content: `Secondary advisor session cap reached (${orchCfg.limits.max_assists_per_session}). Continue without escalation.`,
             });
             continue;
@@ -1482,7 +4200,14 @@ RESPONSE RULES:
           const reason = toolArgs.reason || 'Explicitly requested by executor';
           sendSSE('info', { message: `Consulting secondary advisor (${mode} mode)...` });
           console.log(`[Orchestrator] Explicit trigger: ${reason}`);
-          const advice = await callSecondaryAdvisor(message, orchestrationLog, reason, mode);
+          const advice = await callSecondaryAdvisor(
+            message,
+            orchestrationLog,
+            reason,
+            mode,
+            undefined,
+            buildSecondaryAssistContext(),
+          );
           if (advice) {
             const hint = formatAdvisoryHint(advice);
             orchestrationState.markFired(round);
@@ -1502,19 +4227,36 @@ RESPONSE RULES:
             console.log(
               `[Orchestrator] Explicit assist complete (${stats.assistCount}/${orchCfg.limits.max_assists_per_session})`,
             );
-            messages.push({ role: 'tool', tool_name: toolName, content: hint });
+            messages.push({
+              role: 'tool',
+              tool_name: toolName,
+              tool_call_id: toolCallId || undefined,
+              content: hint,
+            });
           } else {
-            messages.push({ role: 'tool', tool_name: toolName, content: 'Secondary advisor unavailable. Continue with your best judgment.' });
+            messages.push({
+              role: 'tool',
+              tool_name: toolName,
+              tool_call_id: toolCallId || undefined,
+              content: 'Secondary advisor unavailable. Continue with your best judgment.',
+            });
           }
           continue;
         }
-        messages.push({ role: 'tool', tool_name: toolName, content: 'Multi-agent orchestration is not enabled.' });
+        messages.push({
+          role: 'tool',
+          tool_name: toolName,
+          tool_call_id: toolCallId || undefined,
+          content: 'Multi-agent orchestration is not enabled.',
+        });
         continue;
       }
 
       const toolResult = await executeTool(toolName, toolArgs, workspacePath, sessionId);
       allToolResults.push(toolResult);
       logToolCall(workspacePath, toolName, toolArgs, toolResult.result, toolResult.error);
+      trackFileOpMutation(toolName, toolArgs, toolResult, 'primary');
+      if (fileOpV2Active && toolResult.error) fileOpHadToolFailure = true;
       if (!toolResult.error) roundHadProgress = true;
 
       // ── Orchestration: track trigger state
@@ -1529,12 +4271,40 @@ RESPONSE RULES:
       sendSSE('tool_result', { action: toolName, result: toolResult.result.slice(0, 500), error: toolResult.error, stepNum: allToolResults.length });
 
       const goalReminder = `\n\n[GOAL REMINDER: Your task is still: "${message.slice(0, 120)}". Stay focused on this goal only.]`;
-      messages.push({ role: 'tool', tool_name: toolName, content: toolResult.result + goalReminder });
+      // ── Multi-agent browser interception ────────────────────────────────────
+      // When orchestrator is active, LLM never sees raw snapshot/browser data.
+      // Full data still flows to advisor via getBrowserAdvisorPacket().
+      const isBrowserTool = isBrowserToolName(toolName);
+      const isDesktopTool = isDesktopToolName(toolName);
+      const toolMessageContent = (multiAgentActive && (isBrowserTool || isDesktopTool))
+        ? (isBrowserTool ? buildBrowserAck(toolName, toolResult) : buildDesktopAck(toolName, toolResult))
+        : toolResult.result;
+      messages.push({
+        role: 'tool',
+        tool_name: toolName,
+        tool_call_id: toolCallId || undefined,
+        content: toolMessageContent + goalReminder,
+      });
+
+      if (isBrowserTool && !toolResult.error) {
+        browserForcedRetries = 0;
+        if (toolName === 'browser_close') {
+          browserContinuationPending = false;
+          browserAdvisorRoute = null;
+          browserAdvisorHintPreview = '';
+          resetBrowserAdvisorCollection();
+        }
+      }
+      if (isDesktopTool && !toolResult.error && toolName === 'desktop_screenshot') {
+        desktopContinuationPending = false;
+      }
+      await maybeRunBrowserAdvisorPass(toolName, toolResult);
+      await maybeRunDesktopAdvisorPass(toolName, toolResult);
     }
 
     // ── Orchestration: auto-trigger check after each round
     const orchCfg = getOrchestrationConfig();
-    if (orchestrationSkillEnabled && orchCfg?.enabled) {
+    if (orchestrationSkillEnabled && orchCfg?.enabled && !isBootStartupTurn) {
       if (!roundHadProgress) orchestrationState.recordRoundNoProgress(round);
       const { fire, reason } = orchestrationState.shouldTrigger(
         orchCfg,
@@ -1545,7 +4315,14 @@ RESPONSE RULES:
       if (fire && orchestrationStats.assistCount < orchCfg.limits.max_assists_per_session) {
         sendSSE('info', { message: `Auto-consulting advisor: ${reason}` });
         console.log(`[Orchestrator] Auto-trigger (${reason})`);
-        const advice = await callSecondaryAdvisor(message, orchestrationLog, reason, 'rescue');
+        const advice = await callSecondaryAdvisor(
+          message,
+          orchestrationLog,
+          reason,
+          'rescue',
+          undefined,
+          buildSecondaryAssistContext(),
+        );
         if (advice) {
           const hint = formatAdvisoryHint(advice);
           orchestrationState.markFired(round);
@@ -1583,6 +4360,143 @@ function createSSESender(res: express.Response): (event: string, data: any) => v
   return (type: string, data: any) => { try { res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`); } catch {} };
 }
 
+function latestTaskForSession(sessionId: string, statuses: TaskStatus[]): TaskRecord | null {
+  const tasks = listTasks({ status: statuses })
+    .filter(t => t.sessionId === sessionId)
+    .sort((a, b) => b.lastProgressAt - a.lastProgressAt);
+  return tasks[0] || null;
+}
+
+function findBlockedTaskForSession(sessionId: string): TaskRecord | null {
+  const blocked = listTasks({ status: ['needs_assistance', 'stalled', 'paused'] })
+    .filter(t => t.sessionId === sessionId)
+    .filter(t =>
+      t.status === 'needs_assistance'
+      || t.status === 'stalled'
+      || (t.status === 'paused' && t.pauseReason !== 'user_pause'),
+    )
+    .sort((a, b) => b.lastProgressAt - a.lastProgressAt);
+  return blocked[0] || null;
+}
+
+function isResumeIntent(message: string): boolean {
+  return /\b(resume|continue|go ahead|proceed|restart|start again|run it|do it now|apply and continue)\b/i.test(message);
+}
+
+function isCancelIntent(message: string): boolean {
+  return /\b(cancel|abort|stop( task)?|do not continue|don't continue)\b/i.test(message);
+}
+
+function isStatusQuestion(message: string): boolean {
+  return /\?|^\s*(what|why|how|status|did|where|when)\b/i.test(message)
+    || /\b(what happened|why did|status|stuck|failed|error|progress|what went wrong)\b/i.test(message);
+}
+
+function isAdjustmentIntent(message: string): boolean {
+  return /\b(instead|change|adjust|update|only|skip|don't|do not|use|delete|remove|clear|keep|retry|try again)\b/i.test(message);
+}
+
+function getLatestPauseContext(task: TaskRecord): { reason: string; detail: string } {
+  const latestPause = [...(task.journal || [])].reverse().find((j) => j.type === 'pause');
+  if (latestPause) {
+    return {
+      reason: String(latestPause.content || '').replace(/^Task paused for assistance:\s*/i, '').slice(0, 220),
+      detail: String(latestPause.detail || '').slice(0, 420),
+    };
+  }
+  return { reason: task.pauseReason || 'paused', detail: '' };
+}
+
+function buildBlockedTaskStatusMessage(task: TaskRecord): string {
+  const total = Array.isArray(task.plan) ? task.plan.length : 0;
+  const step = Math.min((task.currentStepIndex || 0) + 1, Math.max(1, total));
+  const done = (task.plan || []).filter((s) => s.status === 'done' || s.status === 'skipped').length;
+  const pause = getLatestPauseContext(task);
+  const lines = [
+    `Task status: ${task.title}`,
+    `Status: ${task.status}`,
+    `Step: ${step}/${Math.max(1, total)} (${done} completed)`,
+    `Last issue: ${pause.reason || 'n/a'}`,
+    pause.detail ? `Details: ${pause.detail}` : '',
+    `Task ID: ${task.id}`,
+    `Reply with "resume" to continue, or send an adjustment (for example: "only delete *_tmp.html").`,
+  ];
+  return lines.filter(Boolean).join('\n');
+}
+
+async function tryHandleBlockedTaskFollowup(sessionId: string, rawMessage: string): Promise<string | null> {
+  if (String(sessionId || '').startsWith('task_')) return null;
+  const message = String(rawMessage || '').trim();
+  if (!message) return null;
+
+  const resumeRequested = isResumeIntent(message);
+  const statusQuestion = isStatusQuestion(message);
+  const adjustmentRequested = isAdjustmentIntent(message);
+  let task = findBlockedTaskForSession(sessionId);
+  if (!task && resumeRequested) {
+    task = latestTaskForSession(sessionId, ['paused']);
+  }
+  if (!task) return null;
+
+  const cancelRequested = isCancelIntent(message);
+  if (cancelRequested) {
+    updateTaskStatus(task.id, 'paused', { pauseReason: 'user_pause' });
+    appendJournal(task.id, { type: 'pause', content: `User requested stop: ${message.slice(0, 220)}` });
+    const ws = getWorkspace(sessionId) || (getConfig().getConfig() as any).workspace?.path || '';
+    if (ws) {
+      await hookBus.fire({
+        type: 'command:stop',
+        sessionId,
+        workspacePath: ws,
+        timestamp: Date.now(),
+      });
+    }
+    return `Paused task \"${task.title}\".`;
+  }
+
+  if (statusQuestion && !resumeRequested) {
+    appendJournal(task.id, { type: 'status_push', content: `User requested status while blocked: ${message.slice(0, 220)}` });
+    return buildBlockedTaskStatusMessage(task);
+  }
+
+  if (!resumeRequested && !adjustmentRequested) {
+    appendJournal(task.id, { type: 'status_push', content: `Ignored non-resume follow-up while blocked: ${message.slice(0, 220)}` });
+    return [
+      `Task \"${task.title}\" is still paused.`,
+      `I did not resume it yet.`,
+      `Reply "resume" to continue, or send an explicit adjustment.`,
+      `Task ID: ${task.id}`,
+    ].join('\n');
+  }
+
+  const liveTask = loadTask(task.id);
+  if (!liveTask) return null;
+
+  appendJournal(task.id, { type: 'resume', content: `User follow-up: ${message.slice(0, 220)}` });
+  const resumeMessages = Array.isArray(liveTask.resumeContext?.messages)
+    ? liveTask.resumeContext.messages
+    : [];
+  const nextMessages = [
+    ...resumeMessages,
+    { role: 'user', content: `[TASK USER FOLLOW-UP]\n${message}`, timestamp: Date.now() },
+  ].slice(-80);
+  updateResumeContext(task.id, { messages: nextMessages });
+
+  if (BackgroundTaskRunner.isRunning(task.id)) {
+    return `Task \"${task.title}\" is already running. I added your instruction and it will apply on the next step.`;
+  }
+
+  updateTaskStatus(task.id, 'queued');
+  const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
+  runner.start().catch(err => console.error(`[BackgroundTaskRunner] Follow-up resume ${task.id} error:`, err.message));
+
+  const refreshed = loadTask(task.id) || liveTask;
+  if (resumeRequested) {
+    return `Resumed task \"${task.title}\" at step ${refreshed.currentStepIndex + 1}/${refreshed.plan.length}.`;
+  }
+  return `Queued your adjustment and resumed task \"${task.title}\" at step ${refreshed.currentStepIndex + 1}/${refreshed.plan.length}.`;
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -1614,6 +4528,7 @@ app.get('/api/status', async (_req, res) => {
 app.post('/api/chat', async (req, res) => {
   const { message, sessionId = 'default', pinnedMessages } = req.body;
   if (!message || typeof message !== 'string') { res.status(400).json({ error: 'Message required' }); return; }
+  lastMainSessionId = String(sessionId || 'default');
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -1636,8 +4551,72 @@ app.post('/api/chat', async (req, res) => {
   });
 
   try {
-    addMessage(sessionId, { role: 'user', content: message, timestamp: Date.now() });
+    const userMsg = { role: 'user' as const, content: message, timestamp: Date.now() };
+    const addResult = addMessage(sessionId, userMsg, { deferOnMemoryFlush: true, deferOnCompaction: true });
+    if (addResult.deferredForCompaction && addResult.compactionPrompt) {
+      console.log(`[v2] Context compaction triggered for session ${sessionId} (${addResult.estimatedTokens}/${addResult.contextLimitTokens} est. tokens)`);
+      try {
+        const internalCompactionContext = 'CONTEXT: Internal context compaction turn. Summarize prior conversation into compact retained context only.';
+        const compactResult = await handleChat(
+          addResult.compactionPrompt,
+          sessionId,
+          () => {},
+          undefined,
+          abortSignal,
+          internalCompactionContext,
+        );
+        if (!abortSignal.aborted && compactResult?.text) {
+          addMessage(
+            sessionId,
+            { role: 'assistant', content: compactResult.text, timestamp: Date.now() },
+            { disableMemoryFlushCheck: true, disableCompactionCheck: true },
+          );
+        }
+      } catch (compactErr: any) {
+        console.warn('[v2] Context compaction turn failed:', compactErr?.message || compactErr);
+      }
+      if (abortSignal.aborted) return;
+      addMessage(sessionId, userMsg, { disableMemoryFlushCheck: true, disableCompactionCheck: true });
+    } else if (addResult.deferredForMemoryFlush && addResult.memoryFlushPrompt) {
+      console.log(`[v2] Pre-compaction memory flush triggered for session ${sessionId} (${addResult.estimatedTokens}/${addResult.contextLimitTokens} est. tokens)`);
+      try {
+        const internalFlushContext = 'CONTEXT: Internal pre-compaction memory flush turn. Before continuing, save important durable user/task facts to memory now.';
+        const flushResult = await handleChat(
+          addResult.memoryFlushPrompt,
+          sessionId,
+          () => {},
+          undefined,
+          abortSignal,
+          internalFlushContext,
+        );
+        if (!abortSignal.aborted && flushResult?.text) {
+          addMessage(
+            sessionId,
+            { role: 'assistant', content: flushResult.text, timestamp: Date.now() },
+            { disableMemoryFlushCheck: true, disableCompactionCheck: true },
+          );
+        }
+      } catch (flushErr: any) {
+        console.warn('[v2] Pre-compaction memory flush failed:', flushErr?.message || flushErr);
+      }
+      if (abortSignal.aborted) return;
+      addMessage(sessionId, userMsg, { disableMemoryFlushCheck: true, disableCompactionCheck: true });
+    }
+
     console.log(`\n[v2] USER: ${message.slice(0, 100)}`);
+    const followupHandled = await tryHandleBlockedTaskFollowup(sessionId, message);
+    if (followupHandled) {
+      if (!abortSignal.aborted) {
+        addMessage(sessionId, { role: 'assistant', content: followupHandled, timestamp: Date.now() });
+        sendSSE('final', { text: followupHandled });
+        sendSSE('done', {
+          reply: followupHandled,
+          mode: 'chat',
+          sections: [{ type: 'text', content: followupHandled }],
+        });
+      }
+      return;
+    }
     const pins = Array.isArray(pinnedMessages) ? pinnedMessages.slice(0, 3) : [];
     const result = await handleChat(message, sessionId, sendSSE, pins.length > 0 ? pins : undefined, abortSignal);
     if (!abortSignal.aborted) {
@@ -1672,7 +4651,26 @@ app.get('/api/open-path', async (req, res) => {
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/clear-history', (req, res) => { clearHistory(req.body.sessionId || 'default'); res.json({ success: true }); });
+app.post('/api/clear-history', async (req, res) => {
+  const sid = req.body.sessionId || 'default';
+  const ws = getWorkspace(sid) || (getConfig().getConfig() as any).workspace?.path || '';
+  if (ws) {
+    await hookBus.fire({
+      type: 'command:reset',
+      sessionId: sid,
+      workspacePath: ws,
+      timestamp: Date.now(),
+    });
+    await hookBus.fire({
+      type: 'command:new',
+      sessionId: sid,
+      workspacePath: ws,
+      timestamp: Date.now(),
+    });
+  }
+  clearHistory(sid);
+  res.json({ success: true });
+});
 
 // ─── Skills API ────────────────────────────────────────────────────────────────
 
@@ -1771,32 +4769,17 @@ function clampInt(value: any, min: number, max: number, fallback: number): numbe
 
 function getOrchestrationConfigForApi() {
   const raw = (getConfig().getConfig() as any).orchestration || {};
-  const modeRaw = String(raw.preflight?.mode || '').trim();
-  const preflightMode = ['off', 'complex_only', 'always'].includes(modeRaw) ? modeRaw : 'complex_only';
+  // Use the single-source-of-truth clamp utility — no inline duplication.
+  const clamped = clampOrchestrationConfig(raw);
+  const preempt = clampPreemptConfig(raw.preempt || {});
   return {
     enabled: raw.enabled === true,
     secondary: {
       provider: String(raw.secondary?.provider || '').trim(),
       model: String(raw.secondary?.model || '').trim(),
     },
-    triggers: {
-      consecutive_failures: clampInt(raw.triggers?.consecutive_failures, 1, 8, 2),
-      stagnation_rounds: clampInt(raw.triggers?.stagnation_rounds, 1, 12, 3),
-      loop_detection: raw.triggers?.loop_detection !== false,
-      risky_files_threshold: clampInt(raw.triggers?.risky_files_threshold, 1, 30, 6),
-      risky_tool_ops_threshold: clampInt(raw.triggers?.risky_tool_ops_threshold, 10, 2000, 220),
-      no_progress_seconds: clampInt(raw.triggers?.no_progress_seconds, 15, 600, 90),
-    },
-    preflight: {
-      mode: preflightMode,
-      allow_secondary_chat: raw.preflight?.allow_secondary_chat === true,
-    },
-    limits: {
-      assist_cooldown_rounds: clampInt(raw.limits?.assist_cooldown_rounds, 1, 12, 3),
-      max_assists_per_turn: clampInt(raw.limits?.max_assists_per_turn, 1, 12, 3),
-      max_assists_per_session: clampInt(raw.limits?.max_assists_per_session, 1, 100, 18),
-      telemetry_history_limit: clampInt(raw.limits?.telemetry_history_limit, 10, 500, 100),
-    },
+    ...clamped,
+    preempt,
   };
 }
 
@@ -1807,81 +4790,74 @@ app.get('/api/orchestration/config', (_req, res) => {
 app.post('/api/orchestration/config', (req, res) => {
   const current = getOrchestrationConfigForApi();
   const incoming = req.body || {};
+  const incomingMode = String(incoming.preflight?.mode || '').trim();
+  const incomingRestartMode = String(incoming.preempt?.restart_mode || '').trim();
 
-  const merged = {
+  const mergedRaw = {
     enabled: typeof incoming.enabled === 'boolean' ? incoming.enabled : current.enabled,
     secondary: {
       provider: String(incoming.secondary?.provider ?? current.secondary.provider).trim(),
       model: String(incoming.secondary?.model ?? current.secondary.model).trim(),
     },
     triggers: {
-      consecutive_failures: clampInt(
-        incoming.triggers?.consecutive_failures,
-        1,
-        8,
-        current.triggers.consecutive_failures
-      ),
-      stagnation_rounds: clampInt(
-        incoming.triggers?.stagnation_rounds,
-        1,
-        12,
-        current.triggers.stagnation_rounds
-      ),
+      ...current.triggers,
+      ...(incoming.triggers && typeof incoming.triggers === 'object' ? incoming.triggers : {}),
       loop_detection: typeof incoming.triggers?.loop_detection === 'boolean'
         ? incoming.triggers.loop_detection
         : current.triggers.loop_detection,
-      risky_files_threshold: clampInt(
-        incoming.triggers?.risky_files_threshold,
-        1,
-        30,
-        current.triggers.risky_files_threshold
-      ),
-      risky_tool_ops_threshold: clampInt(
-        incoming.triggers?.risky_tool_ops_threshold,
-        10,
-        2000,
-        current.triggers.risky_tool_ops_threshold
-      ),
-      no_progress_seconds: clampInt(
-        incoming.triggers?.no_progress_seconds,
-        15,
-        600,
-        current.triggers.no_progress_seconds
-      ),
     },
     preflight: {
-      mode: ['off', 'complex_only', 'always'].includes(String(incoming.preflight?.mode || '').trim())
-        ? String(incoming.preflight.mode).trim()
+      ...current.preflight,
+      ...(incoming.preflight && typeof incoming.preflight === 'object' ? incoming.preflight : {}),
+      mode: ['off', 'complex_only', 'always'].includes(incomingMode)
+        ? incomingMode
         : current.preflight.mode,
       allow_secondary_chat: typeof incoming.preflight?.allow_secondary_chat === 'boolean'
         ? incoming.preflight.allow_secondary_chat
         : current.preflight.allow_secondary_chat,
     },
     limits: {
-      assist_cooldown_rounds: clampInt(
-        incoming.limits?.assist_cooldown_rounds,
-        1,
-        12,
-        current.limits.assist_cooldown_rounds
-      ),
-      max_assists_per_turn: clampInt(
-        incoming.limits?.max_assists_per_turn,
-        1,
-        12,
-        current.limits.max_assists_per_turn
-      ),
-      max_assists_per_session: clampInt(
-        incoming.limits?.max_assists_per_session,
-        1,
-        100,
-        current.limits.max_assists_per_session
-      ),
-      telemetry_history_limit: clampInt(
-        incoming.limits?.telemetry_history_limit,
-        10,
-        500,
-        current.limits.telemetry_history_limit
-      ),
+      ...current.limits,
+      ...(incoming.limits && typeof incoming.limits === 'object' ? incoming.limits : {}),
+    },
+    browser: {
+      ...current.browser,
+      ...(incoming.browser && typeof incoming.browser === 'object' ? incoming.browser : {}),
+    },
+    file_ops: {
+      ...current.file_ops,
+      ...(incoming.file_ops && typeof incoming.file_ops === 'object' ? incoming.file_ops : {}),
+      enabled: typeof incoming.file_ops?.enabled === 'boolean'
+        ? incoming.file_ops.enabled
+        : current.file_ops.enabled,
+      verify_create_always: typeof incoming.file_ops?.verify_create_always === 'boolean'
+        ? incoming.file_ops.verify_create_always
+        : current.file_ops.verify_create_always,
+      checkpointing_enabled: typeof incoming.file_ops?.checkpointing_enabled === 'boolean'
+        ? incoming.file_ops.checkpointing_enabled
+        : current.file_ops.checkpointing_enabled,
+    },
+    preempt: {
+      ...current.preempt,
+      ...(incoming.preempt && typeof incoming.preempt === 'object' ? incoming.preempt : {}),
+      enabled: typeof incoming.preempt?.enabled === 'boolean'
+        ? incoming.preempt.enabled
+        : current.preempt.enabled,
+      restart_mode: ['inherit_console', 'detached_hidden'].includes(incomingRestartMode)
+        ? incomingRestartMode
+        : current.preempt.restart_mode,
+    },
+  };
+
+  const clamped = clampOrchestrationConfig(mergedRaw);
+  const preempt = clampPreemptConfig(mergedRaw.preempt || {});
+  const merged = {
+    enabled: mergedRaw.enabled,
+    secondary: mergedRaw.secondary,
+    ...clamped,
+    preempt: {
+      ...preempt,
+      enabled: mergedRaw.preempt.enabled,
     },
   };
 
@@ -1921,9 +4897,25 @@ app.get('/api/tasks', (_req, res) => {
 });
 
 app.post('/api/tasks', (req, res) => {
-  const { name, prompt, type, schedule, runAt, priority } = req.body;
+  const { name, prompt, type, schedule, tz, runAt, priority, sessionTarget, payloadKind, systemEventText, model } = req.body;
   if (!name || !prompt) { res.status(400).json({ success: false, error: 'name and prompt required' }); return; }
-  const job = cronScheduler.createJob({ name, prompt, type, schedule, runAt, priority });
+  if (type === 'heartbeat') {
+    res.status(400).json({ success: false, error: 'Heartbeat is no longer a CronJob. Configure HEARTBEAT.md and /api/heartbeat/config instead.' });
+    return;
+  }
+  const job = cronScheduler.createJob({
+    name,
+    prompt,
+    type,
+    schedule,
+    tz,
+    runAt,
+    priority,
+    sessionTarget,
+    payloadKind,
+    systemEventText,
+    model,
+  });
   res.json({ success: true, job });
 });
 
@@ -1951,7 +4943,7 @@ app.post('/api/tasks/:id/run', async (req, res) => {
   const job = jobs.find(j => j.id === req.params.id);
   if (!job) { res.status(404).json({ success: false, error: 'Job not found' }); return; }
   res.json({ success: true, message: 'Job queued for immediate run' });
-  cronScheduler.runJobNow(req.params.id).catch(console.error);
+  cronScheduler.runJobNow(req.params.id, { respectActiveHours: false }).catch(console.error);
 });
 
 app.get('/api/tasks/config', (_req, res) => {
@@ -1962,6 +4954,276 @@ app.put('/api/tasks/config', (req, res) => {
   cronScheduler.updateConfig(req.body);
   res.json({ success: true, config: cronScheduler.getConfig() });
 });
+
+app.get('/api/heartbeat/config', (_req, res) => {
+  res.json({ success: true, config: heartbeatRunner.getConfig() });
+});
+
+app.put('/api/heartbeat/config', (req, res) => {
+  const cfg = heartbeatRunner.updateConfig(req.body || {});
+  res.json({ success: true, config: cfg });
+});
+
+// ─── Background Task Kanban API ─────────────────────────────────────────────────
+
+app.get('/api/bg-tasks', (_req, res) => {
+  const tasks = listTasks();
+  const heartbeatConfig = loadTaskHeartbeatConfig();
+  res.json({ success: true, tasks, heartbeatConfig });
+});
+
+app.get('/api/bg-tasks/:id', (req, res) => {
+  const task = loadTask(req.params.id);
+  if (!task) { res.status(404).json({ success: false, error: 'Task not found' }); return; }
+  res.json({ success: true, task });
+});
+
+app.delete('/api/bg-tasks/:id', (req, res) => {
+  const ok = deleteTask(req.params.id);
+  if (!ok) { res.status(404).json({ success: false, error: 'Task not found' }); return; }
+  res.json({ success: true });
+});
+
+app.post('/api/bg-tasks/:id/pause', (req, res) => {
+  const task = updateTaskStatus(req.params.id, 'paused', { pauseReason: 'user_pause' });
+  if (!task) { res.status(404).json({ success: false, error: 'Task not found' }); return; }
+  BackgroundTaskRunner.requestPause(req.params.id);
+  const sid = task.sessionId || 'default';
+  const ws = getWorkspace(sid) || (getConfig().getConfig() as any).workspace?.path || '';
+  if (ws) {
+    hookBus.fire({
+      type: 'command:stop',
+      sessionId: sid,
+      workspacePath: ws,
+      timestamp: Date.now(),
+    }).catch((err: any) => console.warn('[hooks] command:stop error:', err?.message || err));
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/bg-tasks/:id/resume', (req, res) => {
+  const task = loadTask(req.params.id);
+  if (!task) { res.status(404).json({ success: false, error: 'Task not found' }); return; }
+  if (
+    task.status === 'paused'
+    || task.status === 'queued'
+    || task.status === 'stalled'
+    || task.status === 'needs_assistance'
+  ) {
+    updateTaskStatus(task.id, 'queued');
+    const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
+    runner.start().catch(err => console.error(`[BackgroundTaskRunner] Resume ${task.id} error:`, err.message));
+    res.json({ success: true });
+  } else {
+    res.json({ success: false, error: `Task status is ${task.status}, cannot resume` });
+  }
+});
+
+// SSE stream for live task updates
+app.get('/api/bg-tasks/:id/stream', (req, res) => {
+  const taskId = req.params.id;
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  const send = (data: any) => {
+    try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {}
+  };
+
+  // Send current state immediately
+  const task = loadTask(taskId);
+  if (task) send({ type: 'snapshot', task });
+
+  // Poll task file every 2s for updates
+  let lastJournalLen = task?.journal?.length || 0;
+  const poll = setInterval(() => {
+    const t = loadTask(taskId);
+    if (!t) { clearInterval(poll); send({ type: 'error', message: 'Task not found' }); res.end(); return; }
+    if (t.journal.length !== lastJournalLen) {
+      lastJournalLen = t.journal.length;
+      send({ type: 'update', task: t });
+    }
+    if (t.status === 'complete' || t.status === 'failed') {
+      send({ type: 'final', task: t });
+      clearInterval(poll);
+      res.end();
+    }
+  }, 2000);
+
+  req.on('close', () => clearInterval(poll));
+});
+
+// Task heartbeat config API
+const taskHeartbeatPath = path.join(process.cwd(), '.localclaw', 'task-heartbeat.json');
+
+function loadTaskHeartbeatConfig(): { enabled: boolean; interval_minutes: number } {
+  try {
+    if (fs.existsSync(taskHeartbeatPath)) return JSON.parse(fs.readFileSync(taskHeartbeatPath, 'utf-8'));
+  } catch {}
+  return { enabled: true, interval_minutes: 10 };
+}
+
+function saveTaskHeartbeatConfig(cfg: { enabled: boolean; interval_minutes: number }): void {
+  try { fs.mkdirSync(path.dirname(taskHeartbeatPath), { recursive: true }); } catch {}
+  fs.writeFileSync(taskHeartbeatPath, JSON.stringify(cfg, null, 2), 'utf-8');
+}
+
+app.get('/api/bg-tasks/heartbeat/config', (_req, res) => {
+  res.json({ success: true, config: loadTaskHeartbeatConfig() });
+});
+
+app.put('/api/bg-tasks/heartbeat/config', (req, res) => {
+  const current = loadTaskHeartbeatConfig();
+  const next = {
+    enabled: typeof req.body.enabled === 'boolean' ? req.body.enabled : current.enabled,
+    interval_minutes: Math.max(1, Math.min(1440, Number(req.body.interval_minutes) || current.interval_minutes)),
+  };
+  saveTaskHeartbeatConfig(next);
+  scheduleTaskHeartbeat();
+  res.json({ success: true, config: next });
+});
+
+// ─── Task Heartbeat Scheduler ───────────────────────────────────────────────
+
+let taskHeartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Per-task followup timers — fired when a step completes to resume quickly
+// instead of waiting the full heartbeat interval.
+const taskFollowupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleTaskFollowup(taskId: string, delayMs: number): void {
+  // Cancel any existing followup for this task
+  const existing = taskFollowupTimers.get(taskId);
+  if (existing) clearTimeout(existing);
+  console.log(`[TaskFollowup] Scheduling quick resume for task ${taskId} in ${Math.round(delayMs / 1000)}s`);
+  const t = setTimeout(async () => {
+    taskFollowupTimers.delete(taskId);
+    if (isModelBusy) {
+      // Retry in 30s if model is busy
+      scheduleTaskFollowup(taskId, 30_000);
+      return;
+    }
+    const task = loadTask(taskId);
+    if (!task || task.status === 'complete' || task.status === 'failed' || task.status === 'running') return;
+    console.log(`[TaskFollowup] Quick-resuming task ${taskId}: ${task.title}`);
+    updateTaskStatus(taskId, 'queued');
+    appendJournal(taskId, { type: 'heartbeat', content: 'Quick follow-up resume triggered after step completion.' });
+    const runner = new BackgroundTaskRunner(taskId, handleChat, makeBroadcastForTask(taskId), telegramChannel);
+    runner.start().catch(err => console.error(`[TaskFollowup] Runner error:`, err.message));
+    broadcastWS({ type: 'task_heartbeat_resumed', taskId, rationale: 'Quick step follow-up' });
+  }, delayMs);
+  if (t && typeof (t as any).unref === 'function') (t as any).unref();
+  taskFollowupTimers.set(taskId, t);
+}
+
+// Broadcast interceptor for BackgroundTaskRunner — catches internal signals
+// that need server-side action (like scheduling a quick step follow-up)
+// while still forwarding all events to WS clients.
+function makeBroadcastForTask(taskId: string): (data: object) => void {
+  return (data: object) => {
+    const d = data as any;
+    if (d.type === 'task_step_followup_needed' && d.taskId === taskId) {
+      scheduleTaskFollowup(taskId, d.delayMs || 120_000);
+      // Don't forward this internal signal to UI clients
+      return;
+    }
+    broadcastWS(data);
+  };
+}
+
+function scheduleTaskHeartbeat(): void {
+  if (taskHeartbeatTimer) clearTimeout(taskHeartbeatTimer);
+  const cfg = loadTaskHeartbeatConfig();
+  if (!cfg.enabled) return;
+  const intervalMs = cfg.interval_minutes * 60 * 1000;
+  taskHeartbeatTimer = setTimeout(runTaskHeartbeat, intervalMs);
+  if (taskHeartbeatTimer && typeof (taskHeartbeatTimer as any).unref === 'function') {
+    (taskHeartbeatTimer as any).unref();
+  }
+}
+
+async function runTaskHeartbeat(): Promise<void> {
+  if (isModelBusy) {
+    scheduleTaskHeartbeat();
+    return;
+  }
+  const orchCfg = getOrchestrationConfig();
+  if (!orchCfg?.enabled) {
+    scheduleTaskHeartbeat();
+    return;
+  }
+
+  const pausedOrQueued = listTasks({ status: ['paused', 'queued', 'stalled'] });
+  if (pausedOrQueued.length === 0) {
+    scheduleTaskHeartbeat();
+    return;
+  }
+
+  console.log(`[TaskHeartbeat] Firing advisor for ${pausedOrQueued.length} task(s)...`);
+  broadcastWS({ type: 'task_heartbeat_tick', taskCount: pausedOrQueued.length });
+
+  // Single-pass map: pull both buildTaskSnapshot fields and raw task timestamps together
+  // so there is no implicit index coupling between chained map calls.
+  const snapshots: HeartbeatTaskSnapshot[] = pausedOrQueued.map(t => {
+    const s = buildTaskSnapshot(t);
+    return {
+      id: s.id,
+      title: s.title,
+      status: s.status,
+      pauseReason: s.pauseReason,
+      currentStepIndex: s.currentStepIndex,
+      totalSteps: s.totalSteps,
+      currentStepDescription: s.currentStep,
+      lastProgressAt: t.lastProgressAt,
+      startedAt: t.startedAt,
+      lastJournalEntries: s.recentJournal,
+      channel: s.channel,
+      sessionId: s.sessionId,
+    };
+  });
+
+  try {
+    const decision = await callSecondaryHeartbeatAdvisor({ tasks: snapshots, currentTimeMs: Date.now() });
+    if (!decision || decision.verdict !== 'continue' || !decision.resume_task_id) {
+      console.log(`[TaskHeartbeat] Advisor verdict: ${decision?.verdict || 'null'} — nothing to resume.`);
+      scheduleTaskHeartbeat();
+      return;
+    }
+
+    const taskToResume = loadTask(decision.resume_task_id);
+    if (!taskToResume) {
+      scheduleTaskHeartbeat();
+      return;
+    }
+
+    // Apply any plan mutations the advisor suggested
+    if (decision.plan_mutations?.length) {
+      mutatePlan(decision.resume_task_id, decision.plan_mutations);
+    }
+
+    appendJournal(decision.resume_task_id, {
+      type: 'heartbeat',
+      content: `Heartbeat resume: ${decision.rationale.slice(0, 120)}`,
+    });
+
+    updateTaskStatus(decision.resume_task_id, 'queued');
+    const runner = new BackgroundTaskRunner(
+      decision.resume_task_id,
+      handleChat,
+      makeBroadcastForTask(decision.resume_task_id),
+      telegramChannel,
+      decision.opening_action,
+    );
+    runner.start().catch(err => console.error(`[TaskHeartbeat] Runner error:`, err.message));
+    broadcastWS({ type: 'task_heartbeat_resumed', taskId: decision.resume_task_id, rationale: decision.rationale });
+    console.log(`[TaskHeartbeat] Resuming task ${decision.resume_task_id}: ${taskToResume.title}`);
+  } catch (err: any) {
+    console.error('[TaskHeartbeat] Advisor error:', err.message);
+  }
+
+  scheduleTaskHeartbeat();
+}
 
 // ─── Telegram API ──────────────────────────────────────────────────────────────
 
@@ -2045,13 +5307,14 @@ app.post('/api/settings/search', (req, res) => {
 app.get('/api/settings/paths', (_req, res) => {
   const cfg = getConfig().getConfig();
   res.json({
+    workspace_path: (cfg as any).workspace?.path || '',
     allowed_paths: (cfg as any).tools?.permissions?.files?.allowed_paths || [],
     blocked_paths: (cfg as any).tools?.permissions?.files?.blocked_paths || [],
   });
 });
 
 app.post('/api/settings/paths', (req, res) => {
-  const { allowed_paths, blocked_paths } = req.body;
+  const { workspace_path, allowed_paths, blocked_paths } = req.body;
   const cm = getConfig();
   const current = cm.getConfig() as any;
   const tools = {
@@ -2065,7 +5328,14 @@ app.post('/api/settings/paths', (req, res) => {
       },
     },
   };
-  cm.updateConfig({ tools } as any);
+  const workspacePath = typeof workspace_path === 'string' ? workspace_path.trim() : '';
+  if (workspacePath) {
+    try { fs.mkdirSync(workspacePath, { recursive: true }); } catch {}
+  }
+  cm.updateConfig({
+    tools,
+    ...(workspacePath ? { workspace: { ...(current.workspace || {}), path: workspacePath } } : {}),
+  } as any);
   res.json({ success: true });
 });
 
@@ -2193,25 +5463,39 @@ app.get('/api/system-stats', async (_req, res) => {
     }
   } catch {}
 
-  // Try nvidia-smi for GPU stats (Windows/Linux)
+  // GPU stats — use the cached detector (probed once at startup, never calls
+  // nvidia-smi again). On non-NVIDIA systems this is instant and silent.
+  const gpuInfo = detectGpu();
   let gpuStats = { available: false, gpu_util_percent: 0, vram_used_percent: 0, vram_used_gb: 0, vram_total_gb: 0, name: '' };
-  try {
-    const { execSync } = await import('child_process');
-    const smiOut = execSync('nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits', { timeout: 3000, encoding: 'utf8' });
-    const parts = smiOut.trim().split(',').map(s => s.trim());
-    if (parts.length >= 4) {
-      const vramUsedMb = Number(parts[2]);
-      const vramTotalMb = Number(parts[3]);
-      gpuStats = {
-        available: true,
-        name: parts[0],
-        gpu_util_percent: Number(parts[1]),
-        vram_used_percent: vramTotalMb > 0 ? (vramUsedMb / vramTotalMb) * 100 : 0,
-        vram_used_gb: vramUsedMb / 1024,
-        vram_total_gb: vramTotalMb / 1024,
-      };
-    }
-  } catch {}
+  if (gpuInfo.nvidiaAvailable) {
+    // Re-query utilization metrics only when NVIDIA is confirmed present.
+    // This is the *only* place nvidia-smi runs at runtime; startup detection
+    // already verified the GPU exists so this call is guaranteed to succeed.
+    try {
+      const { execSync } = await import('child_process');
+      const smiOut = execSync(
+        'nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits',
+        { timeout: 3000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      const parts = smiOut.trim().split(',').map((s: string) => s.trim());
+      if (parts.length >= 4) {
+        const vramUsedMb = Number(parts[2]);
+        const vramTotalMb = Number(parts[3]);
+        gpuStats = {
+          available: true,
+          name: parts[0],
+          gpu_util_percent: Number(parts[1]),
+          vram_used_percent: vramTotalMb > 0 ? (vramUsedMb / vramTotalMb) * 100 : 0,
+          vram_used_gb: vramUsedMb / 1024,
+          vram_total_gb: vramTotalMb / 1024,
+        };
+      }
+    } catch { /* nvidia-smi already confirmed working at startup; ignore transient errors */ }
+  } else if (gpuInfo.amdAvailable) {
+    gpuStats = { available: true, gpu_util_percent: 0, vram_used_percent: 0, vram_used_gb: 0, vram_total_gb: 0, name: gpuInfo.name ?? 'AMD GPU' };
+  } else if (gpuInfo.appleSilicon) {
+    gpuStats = { available: true, gpu_util_percent: 0, vram_used_percent: 0, vram_used_gb: 0, vram_total_gb: 0, name: gpuInfo.name ?? 'Apple Silicon' };
+  }
 
   res.json({
     system: {
@@ -2430,6 +5714,10 @@ server.on('error', (err: any) => {
 });
 
 server.listen(PORT, HOST, () => {
+  // Detect GPU hardware once — logs a single clean line, caches result for
+  // the lifetime of the process (used by /api/system-stats, no repeated probes).
+  logGpuStatus();
+
   const liveConfig = getConfig().getConfig();
   const searchCfg = (liveConfig as any).search || {};
   const searchProvider = searchCfg.preferred_provider || 'none';
@@ -2450,10 +5738,41 @@ server.listen(PORT, HOST, () => {
 `);
   cronScheduler.start();
   console.log('[CronScheduler] Tick loop started — heartbeat:', cronScheduler.getConfig().enabled ? 'ON' : 'OFF');
+  heartbeatRunner.start();
+  console.log('[HeartbeatRunner] Started — interval:', heartbeatRunner.getConfig().intervalMinutes, 'min');
   telegramChannel.start().catch(err => console.error('[Telegram] Start failed:', err.message));
+  scheduleTaskHeartbeat();
+  console.log('[TaskHeartbeat] Scheduled — interval:', loadTaskHeartbeatConfig().interval_minutes, 'min');
+
+  const bootWorkspace = getConfig().getWorkspacePath() || (getConfig().getConfig() as any).workspace?.path || '';
+  if (bootWorkspace) {
+    loadWorkspaceHooks(bootWorkspace);
+    hookBus
+      .fire({ type: 'gateway:startup', workspacePath: bootWorkspace })
+      .catch((err: any) => console.warn('[hooks] gateway:startup error:', err?.message || err));
+  }
 });
 
-process.on('SIGINT', () => { telegramChannel.stop(); cronScheduler.stop(); wss.close(); server.close(); process.exit(0); });
-process.on('SIGTERM', () => { telegramChannel.stop(); cronScheduler.stop(); wss.close(); server.close(); process.exit(0); });
+let shuttingDown = false;
+function gracefulShutdown(signal: 'SIGINT' | 'SIGTERM'): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[Gateway] Received ${signal}; shutting down...`);
+  try { skillsManager.persistState(); } catch {}
+  try { telegramChannel.stop(); } catch {}
+  try { cronScheduler.stop(); } catch {}
+  try { heartbeatRunner.stop(); } catch {}
+  try { if (wss) wss.close(); } catch {}
+  try {
+    server.close(() => process.exit(0));
+    const forceExitTimer = setTimeout(() => process.exit(0), 1200) as any;
+    if (typeof forceExitTimer?.unref === 'function') forceExitTimer.unref();
+  } catch {
+    process.exit(0);
+  }
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 export { app, server };

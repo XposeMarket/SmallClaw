@@ -26,7 +26,7 @@ import {
 } from '../tools/skills';
 import { getToolRegistry } from '../tools/registry';
 import { queryFactRecords, pruneFactStore } from './fact-store';
-import { addMemoryFact, persistMemoryClaim, appendDailyMemoryNote } from './memory-manager';
+import { addMemoryFact, appendDailyMemoryNote } from './memory-manager';
 
 const config = getConfig().getConfig();
 const TOOL_AUDIT_LOG = path.join(config.workspace.path, 'tool_audit.log');
@@ -9720,8 +9720,8 @@ app.post('/api/chat', async (req, res) => {
             const grounded = (fromToolFacts || extracted || subAnswer || '').replace(/\s+/g, ' ').trim().slice(0, 420);
             const canStore = isMemorySafeFact(grounded) && (!freshnessQuery || (hasWebEvidence && agentPolicy.auto_store_web_facts));
             if (canStore) {
-              const memRes = await persistMemoryClaim({
-                claim: grounded,
+              const memRes = await addMemoryFact({
+                fact: grounded,
                 type: freshnessQuery ? 'fact' : 'decision',
                 scope: freshnessQuery ? 'global' : 'session',
                 workspace_id: workspaceId,
@@ -9730,8 +9730,9 @@ app.post('/api/chat', async (req, res) => {
                 source_kind: hasWebEvidence ? 'web' : 'tool',
                 source_ref: sourceUrl || `toolrun:${turnId}:${qi + 1}`,
                 confidence: freshnessQuery ? (hasWebEvidence ? 0.9 : 0.6) : 0.7,
+                routing: 'policy',
               });
-              if (!memRes.success) console.warn('[server] persistMemoryClaim failed:', memRes.message);
+              if (!memRes.success) console.warn('[server] addMemoryFact(policy) failed:', memRes.message);
             }
           } catch (err: any) {
             console.error('[server] Failed unified memory persist:', err?.message || err);

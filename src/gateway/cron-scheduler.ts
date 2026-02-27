@@ -12,6 +12,9 @@
 
 import fs from 'fs';
 import path from 'path';
+import { Cron } from 'croner';
+import { clearHistory } from './session';
+import { getConfig } from '../config/config';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -20,7 +23,12 @@ export interface CronJob {
   name: string;
   prompt: string;
   type: 'one-shot' | 'recurring' | 'heartbeat';
-  schedule: string | null;   // 5-field cron expression, e.g. "*/30 * * * *"
+  schedule: string | null;   // Cron expression (5 or 6 fields), e.g. "*/30 * * * *"
+  tz?: string;               // Optional IANA timezone (e.g. "America/New_York")
+  sessionTarget: 'main' | 'isolated';       // default: isolated
+  payloadKind: 'agentTurn' | 'systemEvent'; // default: agentTurn
+  systemEventText?: string;                  // used when payloadKind=systemEvent
+  model?: string;                            // optional per-job model override
   runAt: string | null;      // ISO timestamp for one-shots
   enabled: boolean;
   priority: number;          // lower number = higher priority
@@ -28,9 +36,11 @@ export interface CronJob {
   lastRun: string | null;
   lastResult: string | null;
   lastDuration: number | null;
+  consecutiveErrors?: number;
+  deleteAfterRun?: boolean;
   nextRun: string | null;
   status: 'scheduled' | 'queued' | 'running' | 'completed' | 'paused';
-  sessionId: string | null;  // auto-created session for completed output
+  lastOutputSessionId: string | null;  // last auto-created session containing output
   createdAt: string;
 }
 
@@ -56,6 +66,39 @@ export interface AutomatedSession {
   createdAt: number;
 }
 
+export interface RunJobNowOptions {
+  // Default false for direct user-triggered runs.
+  // Automated recovery callers should pass true.
+  respectActiveHours?: boolean;
+}
+
+type JobRunStatus = 'ok' | 'success' | 'error';
+
+const TOP_OF_HOUR_STAGGER_MS = 5 * 60 * 1000;
+
+function isTopOfHourExpr(expr: string): boolean {
+  const parts = expr.trim().split(/\s+/);
+  return parts.length === 5 && parts[0] === '0' && parts[1].includes('*');
+}
+
+function computeStaggerMs(jobId: string, schedule: string | null): number {
+  if (!schedule || !isTopOfHourExpr(schedule)) return 0;
+  let hash = 0;
+  for (let i = 0; i < jobId.length; i++) {
+    hash = ((hash << 5) - hash) + jobId.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash) % TOP_OF_HOUR_STAGGER_MS;
+}
+
+function applyDeterministicStagger(nextRunIso: string, jobId: string, schedule: string | null): string {
+  const staggerMs = computeStaggerMs(jobId, schedule);
+  if (staggerMs <= 0) return nextRunIso;
+  const nextRunDate = new Date(nextRunIso);
+  if (!Number.isFinite(nextRunDate.getTime())) return nextRunIso;
+  return new Date(nextRunDate.getTime() + staggerMs).toISOString();
+}
+
 // ─── Minimal Cron Parser ───────────────────────────────────────────────────────
 // Supports: * * * * * (min hour dom month dow)
 // Patterns covered:
@@ -65,72 +108,29 @@ export interface AutomatedSession {
 //   0    H 1 * *   → monthly on 1st at H
 //   *    * * * *   → every minute (should not be used but handled)
 
-function parseField(field: string, min: number, max: number): number[] {
-  const results: number[] = [];
-  if (field === '*') {
-    for (let i = min; i <= max; i++) results.push(i);
-    return results;
-  }
-  if (field.startsWith('*/')) {
-    const step = parseInt(field.slice(2), 10);
-    if (isNaN(step) || step <= 0) return results;
-    for (let i = min; i <= max; i += step) results.push(i);
-    return results;
-  }
-  // comma-separated list
-  for (const part of field.split(',')) {
-    const n = parseInt(part.trim(), 10);
-    if (!isNaN(n) && n >= min && n <= max) results.push(n);
-  }
-  return results;
-}
-
-export function getNextRun(cronExpr: string | null, from: Date): Date {
+export function getNextRun(cronExpr: string | null, from: Date, tz?: string): Date {
   if (!cronExpr) {
-    // Default: 30 minutes from now
     return new Date(from.getTime() + 30 * 60 * 1000);
   }
 
-  const parts = cronExpr.trim().split(/\s+/);
-  if (parts.length !== 5) {
-    // Fallback: every 30 minutes
-    return new Date(from.getTime() + 30 * 60 * 1000);
-  }
-
-  const [minuteField, hourField, domField, , dowField] = parts;
-  const minutes = parseField(minuteField, 0, 59);
-  const hours = parseField(hourField, 0, 23);
-  const doms = parseField(domField, 1, 31);
-  const dows = parseField(dowField, 0, 6);
-
-  // Iterate forward minute by minute (max 1 week)
-  const candidate = new Date(from);
-  candidate.setSeconds(0, 0);
-  candidate.setMinutes(candidate.getMinutes() + 1); // must be in the future
-
-  const maxMs = 7 * 24 * 60 * 60 * 1000;
-  const limit = new Date(from.getTime() + maxMs);
-
-  while (candidate < limit) {
-    const m = candidate.getMinutes();
-    const h = candidate.getHours();
-    const dom = candidate.getDate();
-    const dow = candidate.getDay();
-
-    if (
-      minutes.includes(m) &&
-      hours.includes(h) &&
-      doms.includes(dom) &&
-      dows.includes(dow)
-    ) {
-      return new Date(candidate);
+  try {
+    const cron = new Cron(cronExpr.trim(), {
+      timezone: tz || Intl.DateTimeFormat().resolvedOptions().timeZone,
+      catch: false,
+    });
+    const next = cron.nextRun(from);
+    if (next && Number.isFinite(next.getTime()) && next.getTime() > from.getTime()) {
+      return next;
     }
-
-    candidate.setMinutes(candidate.getMinutes() + 1);
+    // Guard: avoid same-second scheduling loops.
+    const nextSecond = new Date(Math.floor(from.getTime() / 1000) * 1000 + 1000);
+    const retry = cron.nextRun(nextSecond);
+    return retry && retry.getTime() > from.getTime()
+      ? retry
+      : new Date(from.getTime() + 30 * 60 * 1000);
+  } catch {
+    return new Date(from.getTime() + 30 * 60 * 1000);
   }
-
-  // Fallback: 30 min
-  return new Date(from.getTime() + 30 * 60 * 1000);
 }
 
 // ─── Telegram Stub ─────────────────────────────────────────────────────────────
@@ -155,11 +155,16 @@ interface SchedulerDeps {
     sessionId: string,
     sendSSE: (event: string, data: any) => void,
     pinnedMessages?: Array<{ role: string; content: string }>,
-    abortSignal?: { aborted: boolean }
+    abortSignal?: { aborted: boolean },
+    callerContext?: string,
+    modelOverride?: string,
+    executionMode?: 'interactive' | 'background_task' | 'heartbeat' | 'cron'
   ) => Promise<{ type: string; text: string; thinking?: string }>;
   broadcast: (data: object) => void; // WebSocket broadcast to all clients
   getIsModelBusy: () => boolean;     // check if a user chat is in-flight
   deliverTelegram?: (text: string) => Promise<void>; // optional telegram delivery
+  getMainSessionId?: () => string;
+  injectSystemEvent?: (sessionId: string, text: string, job: CronJob) => void;
 }
 
 export class CronScheduler {
@@ -195,9 +200,17 @@ export class CronScheduler {
       if (!fs.existsSync(this.storePath)) return this.defaultStore();
       const raw = fs.readFileSync(this.storePath, 'utf-8');
       const parsed = JSON.parse(raw);
+      const jobs = Array.isArray(parsed.jobs)
+        ? parsed.jobs.map((j: any) => ({
+            ...j,
+            sessionTarget: j?.sessionTarget === 'main' ? 'main' : 'isolated',
+            payloadKind: j?.payloadKind === 'systemEvent' ? 'systemEvent' : 'agentTurn',
+            lastOutputSessionId: j?.lastOutputSessionId ?? j?.sessionId ?? null,
+          }))
+        : [];
       return {
         heartbeat: { ...this.defaultStore().heartbeat, ...(parsed.heartbeat || {}) },
-        jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
+        jobs,
       };
     } catch {
       return this.defaultStore();
@@ -208,9 +221,37 @@ export class CronScheduler {
     try {
       const dir = path.dirname(this.storePath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(this.storePath, JSON.stringify(this.store, null, 2), 'utf-8');
+      const tmp = `${this.storePath}.tmp-${Date.now()}`;
+      fs.writeFileSync(tmp, JSON.stringify(this.store, null, 2), 'utf-8');
+      fs.renameSync(tmp, this.storePath);
     } catch (err: any) {
       console.error('[CronScheduler] Failed to save store:', err.message);
+    }
+  }
+
+  private appendRunHistory(jobId: string, entry: { t: string; status: JobRunStatus; duration: number; result_excerpt: string }): void {
+    try {
+      const baseDir = path.dirname(this.storePath);
+      const runsDir = path.join(baseDir, 'runs');
+      if (!fs.existsSync(runsDir)) fs.mkdirSync(runsDir, { recursive: true });
+      const safeId = String(jobId || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const filePath = path.join(runsDir, `${safeId}.jsonl`);
+
+      const lines = fs.existsSync(filePath)
+        ? fs.readFileSync(filePath, 'utf-8').split(/\r?\n/).filter(Boolean)
+        : [];
+      lines.push(JSON.stringify(entry));
+      let maxRunHistory = 200;
+      try {
+        const raw = Number((getConfig().getConfig() as any)?.tasks?.maxRunHistory);
+        if (Number.isFinite(raw) && raw >= 10) maxRunHistory = Math.floor(raw);
+      } catch {
+        // keep default
+      }
+      const trimmed = lines.slice(-maxRunHistory);
+      fs.writeFileSync(filePath, trimmed.join('\n') + '\n', 'utf-8');
+    } catch (err: any) {
+      console.error(`[CronScheduler] Failed to append run history for ${jobId}:`, err?.message || err);
     }
   }
 
@@ -236,13 +277,19 @@ export class CronScheduler {
   createJob(partial: Partial<CronJob> & { name: string; prompt: string }): CronJob {
     const id = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const now = new Date();
+    const normalizedType: CronJob['type'] = partial.type === 'one-shot' ? 'one-shot' : 'recurring';
 
     const job: CronJob = {
       id,
       name: partial.name,
       prompt: partial.prompt,
-      type: partial.type || 'recurring',
+      type: normalizedType,
       schedule: partial.schedule || '*/30 * * * *',
+      tz: partial.tz,
+      sessionTarget: partial.sessionTarget === 'main' ? 'main' : 'isolated',
+      payloadKind: partial.payloadKind === 'systemEvent' ? 'systemEvent' : 'agentTurn',
+      systemEventText: typeof partial.systemEventText === 'string' ? partial.systemEventText : undefined,
+      model: typeof partial.model === 'string' ? partial.model : undefined,
       runAt: partial.runAt || null,
       enabled: partial.enabled !== false,
       priority: typeof partial.priority === 'number' ? partial.priority : this.store.jobs.length,
@@ -250,11 +297,17 @@ export class CronScheduler {
       lastRun: null,
       lastResult: null,
       lastDuration: null,
-      nextRun: partial.type === 'one-shot' && partial.runAt
+      consecutiveErrors: 0,
+      deleteAfterRun: partial.deleteAfterRun === true,
+      nextRun: normalizedType === 'one-shot' && partial.runAt
         ? partial.runAt
-        : getNextRun(partial.schedule || null, now).toISOString(),
+        : applyDeterministicStagger(
+            getNextRun(partial.schedule || null, now, partial.tz).toISOString(),
+            id,
+            partial.schedule || null
+          ),
       status: 'scheduled',
-      sessionId: null,
+      lastOutputSessionId: null,
       createdAt: now.toISOString(),
     };
 
@@ -268,13 +321,21 @@ export class CronScheduler {
   updateJob(id: string, partial: Partial<CronJob>): CronJob | null {
     const idx = this.store.jobs.findIndex(j => j.id === id);
     if (idx === -1) return null;
-    this.store.jobs[idx] = { ...this.store.jobs[idx], ...partial };
+    const normalizedPartial: Partial<CronJob> = { ...partial };
+    if (partial.type !== undefined) {
+      normalizedPartial.type = partial.type === 'one-shot' ? 'one-shot' : 'recurring';
+    }
+    this.store.jobs[idx] = { ...this.store.jobs[idx], ...normalizedPartial };
     // Recalculate nextRun if schedule changed
-    if (partial.schedule !== undefined || partial.runAt !== undefined) {
+    if (partial.schedule !== undefined || partial.runAt !== undefined || partial.tz !== undefined) {
       const job = this.store.jobs[idx];
       job.nextRun = job.type === 'one-shot' && job.runAt
         ? job.runAt
-        : getNextRun(job.schedule, new Date()).toISOString();
+        : applyDeterministicStagger(
+            getNextRun(job.schedule, new Date(), job.tz).toISOString(),
+            job.id,
+            job.schedule
+          );
     }
     this.saveStore();
     this.broadcastUpdate();
@@ -301,10 +362,18 @@ export class CronScheduler {
     this.broadcastUpdate();
   }
 
-  async runJobNow(id: string): Promise<void> {
+  async runJobNow(id: string, options: RunJobNowOptions = {}): Promise<void> {
     const job = this.store.jobs.find(j => j.id === id);
     if (!job) return;
-    // Run outside the normal tick — ignores model-busy guard (user explicitly requested)
+    if (job.type === 'heartbeat') {
+      console.log(`[CronScheduler] runJobNow ignored for legacy heartbeat job "${job.name}"`);
+      return;
+    }
+    // Run outside the normal tick: ignore model-busy guard (user explicitly requested).
+    if (options.respectActiveHours && !this.isWithinActiveHours()) {
+      console.log(`[CronScheduler] runJobNow skipped for "${job.name}" - outside active hours`);
+      return;
+    }
     await this.executeJob(job);
   }
 
@@ -350,6 +419,7 @@ export class CronScheduler {
     const overdue = this.store.jobs
       .filter(j =>
         j.enabled &&
+        j.type !== 'heartbeat' &&
         j.status !== 'running' &&
         j.status !== 'paused' &&
         j.status !== 'completed' &&
@@ -381,7 +451,15 @@ export class CronScheduler {
     this.deps.broadcast({ type: 'task_running', jobId: job.id, jobName: job.name });
 
     // Fake sessionId for the cron call — isolated from user sessions
-    const cronSessionId = `cron_${job.id}`;
+    const mainSessionId = this.deps.getMainSessionId?.() || 'default';
+    const targetSessionId = job.sessionTarget === 'main'
+      ? mainSessionId
+      : `cron_${job.id}_${Date.now()}`;
+    const isolatedRunSession = job.sessionTarget !== 'main';
+    if (isolatedRunSession) {
+      // Defensive clear to guarantee clean isolated context for this run.
+      clearHistory(targetSessionId);
+    }
 
     // Collect SSE events emitted during the run
     const events: Array<{ type: string; data: any }> = [];
@@ -397,8 +475,28 @@ export class CronScheduler {
     let duration = 0;
 
     try {
-      const result = await this.deps.handleChat(job.prompt, cronSessionId, sendSSE);
-      resultText = result.text || '';
+      if (job.payloadKind === 'systemEvent') {
+        const text = String(job.systemEventText || job.prompt || '').trim();
+        if (text) {
+          this.deps.injectSystemEvent?.(targetSessionId, text, job);
+          resultText = text;
+        } else {
+          resultText = 'SYSTEM_EVENT_EMPTY';
+        }
+      } else {
+        const modelOverride = String(job.model || '').trim() || undefined;
+        const result = await this.deps.handleChat(
+          job.prompt,
+          targetSessionId,
+          sendSSE,
+          undefined,
+          undefined,
+          undefined,
+          modelOverride,
+          'cron'
+        );
+        resultText = result.text || '';
+      }
       duration = Date.now() - start;
     } catch (err: any) {
       resultText = `ERROR: ${err.message}`;
@@ -408,22 +506,38 @@ export class CronScheduler {
 
     // Determine if this is a silent OK or real output
     const isOk = /^\s*HEARTBEAT_OK\s*$/i.test(resultText);
+    const runStatus: JobRunStatus = isOk
+      ? 'ok'
+      : (/^\s*ERROR:/i.test(resultText) ? 'error' : 'success');
 
     job.lastRun = new Date().toISOString();
     job.lastResult = resultText.slice(0, 500);
     job.lastDuration = duration;
 
-    if (job.type === 'one-shot') {
-      job.status = 'completed';
-      job.nextRun = null;
+    if (job.type === 'one-shot' || job.deleteAfterRun) {
+      this.store.jobs = this.store.jobs.filter(j => j.id !== job.id);
     } else {
       job.status = 'scheduled';
-      job.nextRun = getNextRun(job.schedule, new Date()).toISOString();
+      if (runStatus === 'error') {
+        job.consecutiveErrors = (job.consecutiveErrors || 0) + 1;
+        const backoffMs = Math.min(
+          Math.pow(2, job.consecutiveErrors - 1) * 60_000,
+          4 * 60 * 60_000
+        );
+        job.nextRun = new Date(Date.now() + backoffMs).toISOString();
+      } else {
+        job.consecutiveErrors = 0;
+        job.nextRun = applyDeterministicStagger(
+          getNextRun(job.schedule, new Date(), job.tz).toISOString(),
+          job.id,
+          job.schedule
+        );
+      }
     }
 
     let automatedSession: AutomatedSession | null = null;
 
-    if (!isOk && resultText.trim()) {
+    if (!isOk && resultText.trim() && job.payloadKind !== 'systemEvent') {
       // Create an automated chat session with the output
       const sessionId = `auto_${job.id}_${Date.now()}`;
       const title = `🕐 ${job.name} — ${new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
@@ -441,7 +555,7 @@ export class CronScheduler {
         ],
       };
 
-      job.sessionId = sessionId;
+      job.lastOutputSessionId = sessionId;
       console.log(`[CronScheduler] Job "${job.name}" produced output → auto session ${sessionId}`);
 
       // Deliver to Telegram if available
@@ -455,7 +569,18 @@ export class CronScheduler {
       console.log(`[CronScheduler] Job "${job.name}" → HEARTBEAT_OK (suppressed)`);
     }
 
+    this.appendRunHistory(job.id, {
+      t: job.lastRun || new Date().toISOString(),
+      status: runStatus,
+      duration,
+      result_excerpt: resultText.slice(0, 500),
+    });
+
     this.saveStore();
+    if (isolatedRunSession) {
+      // Isolated cron runs should not retain conversation context after completion.
+      clearHistory(targetSessionId);
+    }
     this.runningJobId = null;
 
     // Broadcast final state to all WebSocket clients
@@ -477,3 +602,4 @@ export class CronScheduler {
     this.deps.broadcast({ type: 'tasks_update', jobs: this.store.jobs, config: this.store.heartbeat });
   }
 }
+

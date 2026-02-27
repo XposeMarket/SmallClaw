@@ -1,0 +1,155 @@
+version: "3.9"
+
+# ============================================================
+# SmallClaw / LocalClaw – docker-compose.yml
+#
+# Supported providers (set SMALLCLAW_PROVIDER in .env):
+#   ollama        – bundled Ollama container (default)
+#   lm_studio     – LM Studio on your HOST machine (port 1234)
+#   llama_cpp     – llama.cpp server on your HOST machine (port 8080)
+#   openai        – OpenAI API key (cloud)
+#   openai_codex  – OpenAI OAuth / ChatGPT Plus (cloud)
+#
+# Quick start:
+#   cp .env.example .env        # then edit .env for your provider
+#   docker compose up -d        # start everything
+#   docker compose logs -f      # follow logs
+#   docker compose down         # stop & remove containers
+#   docker compose down -v      # also wipe volumes (full reset)
+# ============================================================
+
+services:
+
+  # ── Ollama ────────────────────────────────────────────────
+  # Only relevant when SMALLCLAW_PROVIDER=ollama.
+  # If you're using lm_studio / llama_cpp / openai / openai_codex
+  # you can comment out or remove the ollama + model-init services.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: smallclaw-ollama
+    restart: unless-stopped
+    profiles:
+      - ollama   # start only when using: docker compose --profile ollama up
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    # ── GPU support ──────────────────────────────────────────
+    # NVIDIA (requires nvidia-container-toolkit on the host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    #
+    # AMD / ROCm:
+    # devices:
+    #   - /dev/kfd
+    #   - /dev/dri
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+  # ── Model pull (one-shot init, Ollama only) ──────────────
+  model-init:
+    image: ollama/ollama:latest
+    container_name: smallclaw-model-init
+    profiles:
+      - ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - DEFAULT_MODEL=${SMALLCLAW_DEFAULT_MODEL:-qwen3:4b}
+    entrypoint: >
+      sh -c "
+        echo '>>> Pulling model: '$$DEFAULT_MODEL;
+        ollama pull $$DEFAULT_MODEL;
+        echo '>>> Done.';
+      "
+    restart: "no"
+
+  # ── SmallClaw Gateway ────────────────────────────────────
+  smallclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smallclaw-app
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-3333}:3333"
+
+    # Allow the container to reach LM Studio / llama.cpp on the HOST.
+    # On Linux, host.docker.internal isn't automatically available so we
+    # inject it via extra_hosts. On Mac/Windows Docker Desktop it works
+    # out of the box, but adding it here doesn't hurt.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - smallclaw_data:/data
+      - smallclaw_workspace:/data/workspace
+      # OpenAI Codex OAuth tokens are stored in ~/.localclaw on your host.
+      # Mount the directory so tokens survive container restarts and the
+      # initial `smallclaw auth login` can be run once on the host.
+      # Comment this out if you're not using openai_codex.
+      - ${LOCALCLAW_CONFIG_DIR:-~/.localclaw}:/root/.localclaw
+
+    environment:
+      - NODE_ENV=production
+      - GATEWAY_PORT=3333
+      - SMALLCLAW_DATA_DIR=/data
+      - SMALLCLAW_WORKSPACE_DIR=/data/workspace
+
+      # ── Active provider ──────────────────────────────────
+      - SMALLCLAW_PROVIDER=${SMALLCLAW_PROVIDER:-ollama}
+
+      # ── Ollama ───────────────────────────────────────────
+      # Points to the bundled container by default.
+      # Override in .env: OLLAMA_HOST=http://host.docker.internal:11434
+      # to use Ollama running on your host machine instead.
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+
+      # ── LM Studio ────────────────────────────────────────
+      # Reaches LM Studio running on the host via host.docker.internal.
+      - LM_STUDIO_ENDPOINT=${LM_STUDIO_ENDPOINT:-http://host.docker.internal:1234}
+      - LM_STUDIO_API_KEY=${LM_STUDIO_API_KEY:-}
+      - LM_STUDIO_MODEL=${LM_STUDIO_MODEL:-}
+
+      # ── llama.cpp ────────────────────────────────────────
+      - LLAMA_CPP_ENDPOINT=${LLAMA_CPP_ENDPOINT:-http://host.docker.internal:8080}
+      - LLAMA_CPP_MODEL=${LLAMA_CPP_MODEL:-}
+
+      # ── OpenAI ───────────────────────────────────────────
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+
+      # ── OpenAI Codex (OAuth) ─────────────────────────────
+      # Tokens live in the mounted ~/.localclaw volume above.
+      - CODEX_MODEL=${CODEX_MODEL:-gpt-5.3-codex}
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+# ── Named volumes ────────────────────────────────────────────
+volumes:
+  ollama_data:
+    driver: local
+  smallclaw_data:
+    driver: local
+  smallclaw_workspace:
+    driver: local

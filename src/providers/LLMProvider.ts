@@ -4,9 +4,23 @@
  * ollama-client.ts delegates to whichever provider is active at runtime.
  */
 
+/**
+ * A single part inside a multimodal content array.
+ * Used only when sending image data to capable secondary models (OpenAI, Codex).
+ * Small primary models (Ollama 4B) always receive plain string content.
+ */
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } };
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  /**
+   * Plain string for all primary (small) model calls.
+   * ContentPart[] only for multimodal secondary advisor calls where the
+   * provider is 'openai' or 'openai_codex' and the model supports vision.
+   */
+  content: string | ContentPart[] | null;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
   name?: string;

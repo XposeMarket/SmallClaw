@@ -15,7 +15,7 @@
 
 import vm from 'vm';
 import { OllamaClient } from './ollama-client.js';
-import { getToolRegistry } from '../tools/registry.js';
+import { getToolRegistry, ToolProfile } from '../tools/registry.js';
 import { buildSystemPrompt, selectSkillSlugsForMessage } from '../config/soul-loader.js';
 import { AgentRole } from '../types.js';
 
@@ -45,6 +45,7 @@ export interface ReactOptions {
   allowHeuristicRouting?: boolean; // kept for API compat, ignored
   formatViolationFuse?: number;
   nativeOnly?: boolean; // kept for API compat, ignored — node_call is always primary now
+  toolProfile?: ToolProfile;
 }
 
 // Detect FINAL: in model response
@@ -92,6 +93,12 @@ export function extractNodeCallBlocks(text: string): string[] {
 }
 // Keep regex for backward compat detection (e.g. checking if node_call exists in text)
 const NODE_CALL_RE = /node_call</gi;
+const URL_LIKE_RE = /\bhttps?:\/\/|www\./i;
+const WEB_HINT_RE = /\b(url|link|website|web|internet|browse|scrape|crawl|fetch|search)\b/i;
+const CODING_HINT_RE = /\b(code|script|file|folder|directory|path|repo|repository|build|compile|test|debug|patch|refactor|typescript|javascript|python|npm|node)\b/i;
+const SKILL_HINT_RE = /\b(skill|clawhub)\b/i;
+const GENERIC_REPEAT_WINDOW = 6;
+const GENERIC_REPEAT_THRESHOLD = 3;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -225,6 +232,8 @@ export async function runNodeCallSandbox(
       env: { NODE_ENV: process.env.NODE_ENV || 'production' },
       platform: process.platform,
       cwd: () => workspacePath,
+      kill: () => { throw new Error('process.kill is blocked in sandbox'); },
+      exit: () => { throw new Error('process.exit is blocked in sandbox'); },
     },
   };
 
@@ -353,7 +362,9 @@ export function formatSandboxResult(result: SandboxResult): string {
 function buildNodeCallSystemPrompt(
   workspacePath: string,
   options: ReactOptions,
-  userMessage: string
+  userMessage: string,
+  toolProfile: ToolProfile,
+  toolSchemas: string
 ): string {
   const today = new Date().toISOString().slice(0, 10);
   const selectedSkillSlugs = Array.isArray(options.skillSlugs) && options.skillSlugs.length
@@ -364,10 +375,14 @@ function buildNodeCallSystemPrompt(
     includeMemory: false,
     extraInstructions: options.extraInstructions,
   });
+  const toolProfileBlock = toolSchemas.trim()
+    ? `TOOL PROFILE: ${toolProfile}\nAVAILABLE TOOLS:\n${toolSchemas}\n`
+    : '';
 
   const executeInstructions = `
 You are in EXECUTE mode. Today is ${today}.
 Workspace: ${workspacePath}
+${toolProfileBlock}
 
 ━━━ HOW TO ACT ━━━
 
@@ -505,6 +520,15 @@ function extractPrimaryUserMessage(input: string): string {
   return raw;
 }
 
+function inferToolProfile(userMessage: string, requestedProfile?: ToolProfile): ToolProfile {
+  if (requestedProfile) return requestedProfile;
+  const text = String(userMessage || '');
+  if (SKILL_HINT_RE.test(text)) return 'full';
+  if (URL_LIKE_RE.test(text) || WEB_HINT_RE.test(text)) return 'web';
+  if (CODING_HINT_RE.test(text)) return 'coding';
+  return 'minimal';
+}
+
 function parseNativeToolArgs(rawArgs: any): any {
   if (rawArgs == null) return {};
   if (typeof rawArgs === 'object') return rawArgs;
@@ -530,6 +554,16 @@ function looksLikeInternalReasoning(text: string): boolean {
   if (/\blet me (think|check|figure|tackle|analyze)\b/.test(t)) return true;
   if (/\btools provided\b/.test(t)) return true;
   return false;
+}
+
+function hashText(input: string): string {
+  const text = String(input || '');
+  let hash = 2166136261; // FNV-1a 32-bit offset basis
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
 }
 
 // ─── Reactor class ────────────────────────────────────────────────────────────
@@ -562,12 +596,15 @@ export class Reactor {
       workspacePath = process.cwd();
     }
 
-    const toolSchemas = this.registry.getToolSchemas();
     const primaryUserMessage = extractPrimaryUserMessage(userMessage);
-    const systemPrompt = buildNodeCallSystemPrompt(workspacePath, options, primaryUserMessage);
+    const inferredToolProfile = inferToolProfile(primaryUserMessage, options.toolProfile);
+    const toolProfile = this.registry.resolveToolProfile(inferredToolProfile);
+    const toolSchemas = this.registry.getToolSchemas(toolProfile);
+    const systemPrompt = buildNodeCallSystemPrompt(workspacePath, options, primaryUserMessage, toolProfile, toolSchemas);
     const nativeSystemPrompt = buildNativeToolSystemPrompt(toolSchemas, options, primaryUserMessage);
 
     console.log(`\n${label} USER   ${primaryUserMessage.slice(0, 120)}`);
+    console.log(`${label} TOOLS  profile=${toolProfile}`);
 
     const startTime = Date.now();
     const historyLines: string[] = [];
@@ -605,7 +642,7 @@ export class Reactor {
     // If not, fall through to the node_call<> primary channel.
     if (NATIVE_TOOL_CALLS_ENABLED) {
       try {
-        const allNativeTools = this.registry.getToolDefinitionsForChat();
+        const allNativeTools = this.registry.getToolDefinitionsForChat(toolProfile);
         const nativeMessages: any[] = [
           { role: 'system', content: nativeSystemPrompt },
           { role: 'user', content: userMessage },
@@ -707,6 +744,7 @@ export class Reactor {
     let nextStepDisableThink = false; // set after format violation — stop model from debugging
     let lastSuccessfulResult = ''; // for repeat-result circuit breaker
     let lastCleanResult = ''; // clean tool output (no "node_call[N] result:" prefix) for FINAL fallback
+    const genericRepeatWindow: Array<{ action: string; resultHash: string }> = [];
     const nodeCallHistory: string[] = [...historyLines];
 
     while (stepCount < maxSteps) {
@@ -768,6 +806,7 @@ export class Reactor {
         formatViolations = 0;
         const allResults: string[] = [];
         const cleanResults: string[] = []; // raw tool output without "node_call[N] result:" prefix
+        const successfulPairsThisStep: Array<{ action: string; resultHash: string }> = [];
 
         for (let i = 0; i < nodeCallMatches.length; i++) {
           const code = nodeCallMatches[i];
@@ -822,6 +861,10 @@ export class Reactor {
           } else {
             allResults.push(`node_call[${i + 1}] result:\n${resultText}`);
             cleanResults.push(resultText);
+            successfulPairsThisStep.push({
+              action: `node_call:${hashText(normalizeForDedup(code))}`,
+              resultHash: hashText(resultText),
+            });
           }
         }
 
@@ -840,6 +883,35 @@ export class Reactor {
         if (nodeCallHistory.length > 20) nodeCallHistory.splice(1, nodeCallHistory.length - 20);
         lastAnswer = resultFeed;
         if (cleanResults.length > 0) lastCleanResult = cleanResults.join(', ');
+
+        // Generic repeat detector for ping-pong/no-progress loops:
+        // if the same (action, result_hash) pair appears >=3 times within the last 6,
+        // stop early with a warning instead of burning all maxSteps.
+        if (!hasErrors && successfulPairsThisStep.length > 0) {
+          for (const pair of successfulPairsThisStep) {
+            genericRepeatWindow.push(pair);
+            if (genericRepeatWindow.length > GENERIC_REPEAT_WINDOW) genericRepeatWindow.shift();
+          }
+          const pairCounts = new Map<string, number>();
+          let detectedRepeat = false;
+          for (const pair of genericRepeatWindow) {
+            const key = `${pair.action}|${pair.resultHash}`;
+            const count = (pairCounts.get(key) || 0) + 1;
+            pairCounts.set(key, count);
+            if (count >= GENERIC_REPEAT_THRESHOLD) {
+              detectedRepeat = true;
+              break;
+            }
+          }
+          if (detectedRepeat) {
+            const warning = 'Warning: No-progress loop detected (repeated action/result pair). Stopping execution.';
+            const finalText = `${warning}${lastCleanResult ? ` Last result: ${lastCleanResult.slice(0, 300)}` : ''}`;
+            console.warn(`${label} WARN   Generic repeat detected (${GENERIC_REPEAT_THRESHOLD}+ in last ${GENERIC_REPEAT_WINDOW}); stopping.`);
+            lastAnswer = finalText;
+            options.onStep?.({ finalAnswer: finalText, stepNum: stepCount });
+            break;
+          }
+        }
 
         // Repeat-result circuit breaker: if the model produced the same successful result
         // as the previous step, it's stuck in a loop. Force FINAL with the clean result.

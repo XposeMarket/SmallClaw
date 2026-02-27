@@ -1,8 +1,8 @@
 import { ToolResult } from '../types.js';
 import { shellTool } from './shell.js';
-import { readTool, writeTool, editTool, listTool, deleteTool, renameTool, copyTool, mkdirTool, statTool, appendTool } from './files.js';
+import { readTool, writeTool, editTool, listTool, deleteTool, renameTool, copyTool, mkdirTool, statTool, appendTool, applyPatchTool } from './files.js';
 import { webSearchTool, webFetchTool } from './web.js';
-import { memoryWriteTool } from './memory.js';
+import { memorySearchTool, memoryWriteTool } from './memory.js';
 import { skillListTool, skillSearchTool, skillInstallTool, skillRemoveTool, skillExecTool } from './skills.js';
 import { timeNowTool } from './time.js';
 
@@ -11,38 +11,89 @@ export interface Tool {
   description: string;
   execute: (args: any) => Promise<ToolResult>;
   schema: Record<string, string>;
+  // Optional explicit OpenAPI-style JSON schema for native function-call parameters.
+  // When provided, this is used instead of description-based type inference.
+  jsonSchema?: Record<string, any>;
+}
+
+export type ToolProfile = 'minimal' | 'coding' | 'web' | 'full';
+
+const TOOL_PROFILE_TOOL_NAMES: Record<Exclude<ToolProfile, 'full'>, ReadonlySet<string>> = {
+  minimal: new Set([
+    'memory_search',
+    'memory_write',
+    'time_now',
+  ]),
+  coding: new Set([
+    'shell',
+    'read',
+    'write',
+    'edit',
+    'list',
+    'delete',
+    'rename',
+    'copy',
+    'mkdir',
+    'stat',
+    'append',
+    'apply_patch',
+    'memory_search',
+    'memory_write',
+  ]),
+  web: new Set([
+    'web_search',
+    'web_fetch',
+    'memory_search',
+    'memory_write',
+  ]),
+};
+
+function isToolProfile(value: string): value is ToolProfile {
+  return value === 'minimal' || value === 'coding' || value === 'web' || value === 'full';
 }
 
 class ToolRegistry {
   private tools: Map<string, Tool> = new Map();
 
+  private registerSafe(tool: Tool): void {
+    try {
+      this.register(tool);
+    } catch (err: any) {
+      const label = tool?.name || 'unknown_tool';
+      const message = String(err?.message || err || 'unknown error');
+      console.warn(`[tools] Failed to register "${label}": ${message}`);
+    }
+  }
+
   constructor() {
     // Core filesystem + shell
-    this.register(shellTool);
-    this.register(readTool);
-    this.register(writeTool);
-    this.register(editTool);
-    this.register(listTool);
-    this.register(deleteTool);
+    this.registerSafe(shellTool);
+    this.registerSafe(readTool);
+    this.registerSafe(writeTool);
+    this.registerSafe(editTool);
+    this.registerSafe(listTool);
+    this.registerSafe(deleteTool);
     // Additional filesystem utilities
-    this.register(renameTool);
-    this.register(copyTool);
-    this.register(mkdirTool);
-    this.register(statTool);
-    this.register(appendTool);
+    this.registerSafe(renameTool);
+    this.registerSafe(copyTool);
+    this.registerSafe(mkdirTool);
+    this.registerSafe(statTool);
+    this.registerSafe(appendTool);
+    this.registerSafe(applyPatchTool);
     // Web tools
-    this.register(webSearchTool);
-    this.register(webFetchTool);
-    // Memory tool
-    this.register(memoryWriteTool);
+    this.registerSafe(webSearchTool);
+    this.registerSafe(webFetchTool);
+    // Memory tools
+    this.registerSafe(memoryWriteTool);
+    this.registerSafe(memorySearchTool);
     // Time tool (system clock — no network)
-    this.register(timeNowTool);
+    this.registerSafe(timeNowTool);
     // ClawHub skills tools
-    this.register(skillListTool);
-    this.register(skillSearchTool);
-    this.register(skillInstallTool);
-    this.register(skillRemoveTool);
-    this.register(skillExecTool);
+    this.registerSafe(skillListTool);
+    this.registerSafe(skillSearchTool);
+    this.registerSafe(skillInstallTool);
+    this.registerSafe(skillRemoveTool);
+    this.registerSafe(skillExecTool);
   }
 
   register(tool: Tool): void {
@@ -55,6 +106,17 @@ class ToolRegistry {
 
   list(): Tool[] {
     return Array.from(this.tools.values());
+  }
+
+  private listByProfile(profile: ToolProfile = 'full'): Tool[] {
+    if (profile === 'full') return this.list();
+    const toolNames = TOOL_PROFILE_TOOL_NAMES[profile];
+    return this.list().filter((tool) => toolNames.has(tool.name));
+  }
+
+  resolveToolProfile(profile?: string | null): ToolProfile {
+    const normalized = String(profile || '').trim().toLowerCase();
+    return isToolProfile(normalized) ? normalized : 'full';
   }
 
   async execute(toolName: string, args: any): Promise<ToolResult> {
@@ -77,8 +139,8 @@ class ToolRegistry {
     }
   }
 
-  getToolSchemas(): string {
-    const tools = this.list();
+  getToolSchemas(profile: ToolProfile = 'full'): string {
+    const tools = this.listByProfile(profile);
     return tools.map(tool => {
       const schemaStr = Object.entries(tool.schema)
         .map(([key, desc]) => `  - ${key}: ${desc}`)
@@ -88,8 +150,8 @@ class ToolRegistry {
     }).join('\n\n');
   }
 
-  getToolDefinitionsForChat(): any[] {
-    const tools = this.list();
+  getToolDefinitionsForChat(profile: ToolProfile = 'full'): any[] {
+    const tools = this.listByProfile(profile);
     const inferParamSchema = (key: string, desc: string): any => {
       const k = String(key || '').toLowerCase();
       const d = String(desc || '').toLowerCase();
@@ -114,21 +176,36 @@ class ToolRegistry {
       }
       return { type: 'string', description: String(desc || '') };
     };
-    return tools.map((tool) => {
+    const buildInferredParameters = (tool: Tool): Record<string, any> => {
       const properties: Record<string, any> = {};
       for (const [key, desc] of Object.entries(tool.schema || {})) {
         properties[key] = inferParamSchema(key, String(desc || ''));
       }
       return {
+        type: 'object',
+        properties,
+        additionalProperties: true,
+      };
+    };
+    const normalizeExplicitParameters = (tool: Tool): Record<string, any> | null => {
+      const raw = tool.jsonSchema;
+      if (!raw || typeof raw !== 'object') return null;
+      const normalized: Record<string, any> = { ...raw };
+      if (normalized.type == null) normalized.type = 'object';
+      if (normalized.properties == null) normalized.properties = {};
+      if (normalized.additionalProperties == null) normalized.additionalProperties = true;
+      return normalized;
+    };
+    return tools.map((tool) => {
+      const explicitParameters = normalizeExplicitParameters(tool);
+      const inferredParameters = buildInferredParameters(tool);
+      const parameters = explicitParameters || inferredParameters;
+      return {
         type: 'function',
         function: {
           name: tool.name,
           description: tool.description,
-          parameters: {
-            type: 'object',
-            properties,
-            additionalProperties: true,
-          },
+          parameters,
         },
       };
     });
@@ -148,3 +225,4 @@ export function getToolRegistry(): ToolRegistry {
   }
   return registryInstance;
 }
+

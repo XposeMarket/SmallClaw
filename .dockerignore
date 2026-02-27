@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Build output (builder stage handles this)
+dist/
+
+# Node modules (installed fresh inside the image)
+node_modules/
+
+# Dev / temp files
+*.log
+*.tgz
+.tmp_*
+tmp_*
+workspace/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs & screenshots (not needed at runtime)
+*.md
+*.png
+*.docx
+
+# IDE
+.vscode/
+.idea/

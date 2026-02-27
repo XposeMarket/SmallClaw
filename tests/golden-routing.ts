@@ -8,7 +8,7 @@ async function run() {
     const line = `[golden] checkpoint ${n}\n`;
     try { fs.appendFileSync(path.join(process.cwd(), 'tests', '.golden-progress.log'), line); } catch {}
   };
-  const mod = await import('../src/gateway/server');
+  const mod = await import('../src/gateway/server-legacy');
   const api = (mod as any).default || mod;
   const normalizeUserRequest = api.normalizeUserRequest as (m: string) => { search_text: string; chat_text: string };
   const decideRoute = api.decideRoute as (n: { search_text: string; chat_text: string; raw_text?: string }) => any;

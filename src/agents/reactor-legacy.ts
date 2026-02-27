@@ -15,7 +15,7 @@
 
 import vm from 'vm';
 import { OllamaClient } from './ollama-client.js';
-import { getToolRegistry } from '../tools/registry.js';
+import { getToolRegistry, ToolProfile } from '../tools/registry.js';
 import { buildSystemPrompt, selectSkillSlugsForMessage } from '../config/soul-loader.js';
 import { AgentRole } from '../types.js';
 
@@ -45,6 +45,7 @@ export interface ReactOptions {
   allowHeuristicRouting?: boolean; // kept for API compat, ignored
   formatViolationFuse?: number;
   nativeOnly?: boolean; // kept for API compat, ignored — node_call is always primary now
+  toolProfile?: ToolProfile;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -91,6 +92,10 @@ function extractNodeCallBlocks(text: string): string[] {
 }
 // Keep regex for backward compat detection (e.g. checking if node_call exists in text)
 const NODE_CALL_RE = /node_call</gi;
+const URL_LIKE_RE = /\bhttps?:\/\/|www\./i;
+const WEB_HINT_RE = /\b(url|link|website|web|internet|browse|scrape|crawl|fetch|search)\b/i;
+const CODING_HINT_RE = /\b(code|script|file|folder|directory|path|repo|repository|build|compile|test|debug|patch|refactor|typescript|javascript|python|npm|node)\b/i;
+const SKILL_HINT_RE = /\b(skill|clawhub)\b/i;
 
 // Detect FINAL: in model response
 const FINAL_RE = /FINAL:\s*([\s\S]*?)(?:---END---|$)/i;
@@ -319,7 +324,9 @@ function formatSandboxResult(result: SandboxResult): string {
 function buildNodeCallSystemPrompt(
   workspacePath: string,
   options: ReactOptions,
-  userMessage: string
+  userMessage: string,
+  toolProfile: ToolProfile,
+  toolSchemas: string
 ): string {
   const today = new Date().toISOString().slice(0, 10);
   const selectedSkillSlugs = Array.isArray(options.skillSlugs) && options.skillSlugs.length
@@ -330,10 +337,14 @@ function buildNodeCallSystemPrompt(
     includeMemory: false,
     extraInstructions: options.extraInstructions,
   });
+  const toolProfileBlock = toolSchemas.trim()
+    ? `TOOL PROFILE: ${toolProfile}\nAVAILABLE TOOLS:\n${toolSchemas}\n`
+    : '';
 
   const executeInstructions = `
 You are in EXECUTE mode. Today is ${today}.
 Workspace: ${workspacePath}
+${toolProfileBlock}
 
 ━━━ HOW TO ACT ━━━
 
@@ -471,6 +482,15 @@ function extractPrimaryUserMessage(input: string): string {
   return raw;
 }
 
+function inferToolProfile(userMessage: string, requestedProfile?: ToolProfile): ToolProfile {
+  if (requestedProfile) return requestedProfile;
+  const text = String(userMessage || '');
+  if (SKILL_HINT_RE.test(text)) return 'full';
+  if (URL_LIKE_RE.test(text) || WEB_HINT_RE.test(text)) return 'web';
+  if (CODING_HINT_RE.test(text)) return 'coding';
+  return 'minimal';
+}
+
 function parseNativeToolArgs(rawArgs: any): any {
   if (rawArgs == null) return {};
   if (typeof rawArgs === 'object') return rawArgs;
@@ -528,12 +548,15 @@ export class Reactor {
       workspacePath = process.cwd();
     }
 
-    const toolSchemas = this.registry.getToolSchemas();
     const primaryUserMessage = extractPrimaryUserMessage(userMessage);
-    const systemPrompt = buildNodeCallSystemPrompt(workspacePath, options, primaryUserMessage);
+    const inferredToolProfile = inferToolProfile(primaryUserMessage, options.toolProfile);
+    const toolProfile = this.registry.resolveToolProfile(inferredToolProfile);
+    const toolSchemas = this.registry.getToolSchemas(toolProfile);
+    const systemPrompt = buildNodeCallSystemPrompt(workspacePath, options, primaryUserMessage, toolProfile, toolSchemas);
     const nativeSystemPrompt = buildNativeToolSystemPrompt(toolSchemas, options, primaryUserMessage);
 
     console.log(`\n${label} USER   ${primaryUserMessage.slice(0, 120)}`);
+    console.log(`${label} TOOLS  profile=${toolProfile}`);
 
     const startTime = Date.now();
     const historyLines: string[] = [];
@@ -571,7 +594,7 @@ export class Reactor {
     // If not, fall through to the node_call<> primary channel.
     if (NATIVE_TOOL_CALLS_ENABLED) {
       try {
-        const allNativeTools = this.registry.getToolDefinitionsForChat();
+        const allNativeTools = this.registry.getToolDefinitionsForChat(toolProfile);
         const nativeMessages: any[] = [
           { role: 'system', content: nativeSystemPrompt },
           { role: 'user', content: userMessage },

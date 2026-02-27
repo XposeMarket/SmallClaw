@@ -12,7 +12,8 @@
     "dev": "tsx src/cli/index.ts",
     "start": "node dist/cli/index.js",
     "gateway": "tsx src/gateway/server-v2.ts",
-    "test": "tsx tests/golden-routing.ts"
+    "test": "tsx tests/golden-routing.ts",
+    "test:desktop": "tsx tests/desktop-tools.ts"
   },
   "keywords": [
     "ai",
@@ -28,11 +29,13 @@
     "chalk": "^4.1.2",
     "commander": "^12.0.0",
     "cors": "^2.8.6",
+    "croner": "^10.0.1",
     "dotenv": "^16.4.0",
     "express": "^4.18.0",
     "node-pty": "^1.1.0",
     "ollama": "^0.5.0",
     "playwright": "^1.58.2",
+    "tesseract.js": "^5.1.1",
     "ws": "^8.16.0",
     "zod": "^3.22.0"
   },

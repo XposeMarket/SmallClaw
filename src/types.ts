@@ -197,6 +197,11 @@ export interface LocalClawConfig {
   workspace: {
     path: string;
   };
+  session?: {
+    maxMessages?: number;
+    compactionThreshold?: number;
+    memoryFlushThreshold?: number;
+  };
   telegram?: {
     enabled: boolean;
     botToken: string;
@@ -235,6 +240,32 @@ export interface LocalClawConfig {
       max_assists_per_turn: number;
       max_assists_per_session: number;
       telemetry_history_limit: number;
+    };
+    browser?: {
+      max_advisor_calls_per_turn?: number;
+      max_collected_items?: number;
+      max_forced_retries?: number;
+      min_feed_items_before_answer?: number;
+    };
+    preempt?: {
+      enabled?: boolean;
+      stall_threshold_seconds?: number;
+      max_preempts_per_turn?: number;
+      max_preempts_per_session?: number;
+      restart_mode?: 'inherit_console' | 'detached_hidden';
+    };
+    file_ops?: {
+      enabled?: boolean;
+      primary_create_max_lines?: number;
+      primary_create_max_chars?: number;
+      primary_edit_max_lines?: number;
+      primary_edit_max_chars?: number;
+      primary_edit_max_files?: number;
+      verify_create_always?: boolean;
+      verify_large_payload_lines?: number;
+      verify_large_payload_chars?: number;
+      watchdog_no_progress_cycles?: number;
+      checkpointing_enabled?: boolean;
     };
   };
   agent_policy?: {

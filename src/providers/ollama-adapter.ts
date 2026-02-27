@@ -5,7 +5,21 @@
  */
 
 import { Ollama } from 'ollama';
-import type { LLMProvider, ChatMessage, ChatOptions, ChatResult, GenerateOptions, GenerateResult, ModelInfo } from './LLMProvider';
+import type { LLMProvider, ChatMessage, ContentPart, ChatOptions, ChatResult, GenerateOptions, GenerateResult, ModelInfo } from './LLMProvider';
+
+/**
+ * Coerce a message's content to a plain string.
+ * Ollama 4B models do not support multimodal content arrays.
+ * If a ContentPart[] somehow reaches this adapter, extract only the text parts.
+ */
+function contentToString(content: string | ContentPart[] | null): string {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  return content
+    .filter((p): p is Extract<ContentPart, { type: 'text' }> => p.type === 'text')
+    .map(p => p.text)
+    .join('\n');
+}
 
 export class OllamaAdapter implements LLMProvider {
   readonly id = 'ollama' as const;
@@ -25,6 +39,13 @@ export class OllamaAdapter implements LLMProvider {
   }
 
   async chat(messages: ChatMessage[], model: string, options?: ChatOptions): Promise<ChatResult> {
+    // Normalize all messages to string content before sending to Ollama.
+    // Small models do not support ContentPart[] arrays.
+    const normalizedMessages = messages.map(m => ({
+      ...m,
+      content: contentToString(m.content),
+    }));
+
     const thinkCandidates = this.buildThinkCandidates(options?.think);
     let lastError: any = null;
 
@@ -32,7 +53,7 @@ export class OllamaAdapter implements LLMProvider {
       try {
         const response: any = await this.client.chat({
           model,
-          messages: messages as any,
+          messages: normalizedMessages as any,
           tools: options?.tools,
           ...(Array.isArray(options?.tools) && options!.tools!.length ? { tool_choice: 'auto' } : {}),
           options: {

@@ -112,6 +112,8 @@ export class SkillsManager {
 
   // Scan skills directory for SKILL.md files
   scanSkills() {
+    // Refresh persisted enabled-state before rebuilding skill list.
+    this.loadEnabledState();
     this.skills.clear();
 
     if (!fs.existsSync(this.skillsDir)) return;
@@ -149,6 +151,11 @@ export class SkillsManager {
     }
 
     console.log(`[Skills] Loaded ${this.skills.size} skills (${this.getEnabledSkills().length} enabled)`);
+  }
+
+  // Persist current enabled-state map to disk (best effort).
+  persistState() {
+    this.saveEnabledState();
   }
 
   // Get all skills

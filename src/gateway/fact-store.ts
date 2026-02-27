@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { mmrRerank } from '../tools/memory-mmr.js';
 
 export type FactScope = 'session' | 'global';
 export type FactType =
@@ -41,6 +42,10 @@ type FactStore = {
 };
 
 const SESSION_FACT_DEFAULT_TTL_HOURS = 6;
+const FACT_TEMPORAL_HALF_LIFE_DAYS = 30;
+const FACT_TEMPORAL_LAMBDA = Math.LN2 / FACT_TEMPORAL_HALF_LIFE_DAYS;
+let _storeCache: FactStore | null = null;
+let _storeMtime = 0;
 
 function getStorePath(): string {
   const projectCfg = path.join(process.cwd(), '.localclaw');
@@ -50,7 +55,13 @@ function getStorePath(): string {
 
 function loadStore(): FactStore {
   const p = getStorePath();
-  if (!fs.existsSync(p)) return { version: 1, records: [] };
+  try {
+    const stat = fs.statSync(p);
+    if (_storeCache && stat.mtimeMs === _storeMtime) return _storeCache;
+    _storeMtime = stat.mtimeMs;
+  } catch {
+    return _storeCache || { version: 1, records: [] };
+  }
   try {
     const raw = JSON.parse(fs.readFileSync(p, 'utf-8'));
     if (!raw || !Array.isArray(raw.records)) return { version: 1, records: [] };
@@ -113,6 +124,7 @@ function loadStore(): FactStore {
     if (records.length !== freshOnly.length) changed = true;
     const out = { version: 1, records };
     if (changed) saveStore(out);
+    _storeCache = out;
     return out;
   } catch {
     return { version: 1, records: [] };
@@ -125,6 +137,12 @@ function saveStore(store: FactStore): void {
   const tmp = `${p}.tmp-${Date.now()}`;
   fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf-8');
   fs.renameSync(tmp, p);
+  _storeCache = store;
+  try {
+    _storeMtime = fs.statSync(p).mtimeMs;
+  } catch {
+    // leave cache mtime unchanged if stat fails transiently
+  }
 }
 
 export function defaultExpiryHoursForKey(key: string): number | undefined {
@@ -212,13 +230,27 @@ export function queryFactRecords(opts: {
   includeGlobal?: boolean;
   max?: number;
   includeStale?: boolean;
+  useMmr?: boolean;
 }): FactRecord[] {
+  function temporalDecayMultiplier(updatedAt: string, sourceRef?: string): number {
+    // Evergreen note-paths (no YYYY-MM-DD segment) are not time-decayed.
+    const hasPathLikeRef = typeof sourceRef === 'string' && /[\\/]/.test(sourceRef);
+    if (hasPathLikeRef && !/\b\d{4}-\d{2}-\d{2}\b/.test(String(sourceRef))) {
+      return 1;
+    }
+    const ts = new Date(updatedAt).getTime();
+    if (!Number.isFinite(ts)) return 1;
+    const ageDays = (Date.now() - ts) / (24 * 3600 * 1000);
+    return Math.exp(-FACT_TEMPORAL_LAMBDA * Math.max(0, ageDays));
+  }
+
   const query = String(opts.query || '').toLowerCase();
   const toks = query.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(t => t.length >= 4);
   const now = Date.now();
   const includeGlobal = opts.includeGlobal ?? true;
   const max = opts.max ?? 6;
   const includeStale = opts.includeStale ?? false;
+  const useMmr = opts.useMmr ?? true;
   const store = loadStore();
 
   const candidates = store.records.filter(r => {
@@ -243,9 +275,11 @@ export function queryFactRecords(opts: {
     if (r.scope === 'session') score += 0.5;
     if (r.actor === 'user' || r.source_kind === 'user') score += 1.2;
     if (typeof r.confidence === 'number') score += Math.max(0, Math.min(1, r.confidence));
+    score *= temporalDecayMultiplier(r.updated_at, r.source_ref);
     return { r, score };
   }).filter(x => x.score > 0)
     .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
       const aUser = (a.r.actor === 'user' || a.r.source_kind === 'user') ? 1 : 0;
       const bUser = (b.r.actor === 'user' || b.r.source_kind === 'user') ? 1 : 0;
       if (bUser !== aUser) return bUser - aUser;
@@ -255,13 +289,23 @@ export function queryFactRecords(opts: {
       const aTime = new Date(a.r.updated_at).getTime();
       const bTime = new Date(b.r.updated_at).getTime();
       if (bTime !== aTime) return bTime - aTime;
-      return b.score - a.score;
+      return 0;
     });
 
   // Conflict resolver: one best record per key.
-  const byKey = new Map<string, FactRecord>();
+  const byKey = new Map<string, { record: FactRecord; score: number }>();
   for (const row of scored) {
-    if (!byKey.has(row.r.key)) byKey.set(row.r.key, row.r);
+    if (!byKey.has(row.r.key)) byKey.set(row.r.key, { record: row.r, score: row.score });
   }
-  return Array.from(byKey.values()).slice(0, max);
+
+  const unique = Array.from(byKey.entries()).map(([id, v]) => ({
+    id,
+    score: v.score,
+    content: `${v.record.key} ${v.record.value}`,
+  }));
+  const reranked = mmrRerank(unique, { enabled: useMmr, lambda: 0.7, max });
+  return reranked
+    .map((item) => byKey.get(item.id)?.record)
+    .filter((r): r is FactRecord => Boolean(r))
+    .slice(0, max);
 }

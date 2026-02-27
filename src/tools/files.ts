@@ -2,8 +2,13 @@ import fs from 'fs/promises';
 import path from 'path';
 import fsSync from 'fs';
 import os from 'os';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { getConfig } from '../config/config.js';
 import { ToolResult } from '../types.js';
+
+const execFileAsync = promisify(execFile);
+const PATCH_OUTPUT_MAX_CHARS = 8000;
 
 // Helper function to check if path is allowed
 function resolveWorkspacePath(targetPath: string): string {
@@ -55,6 +60,107 @@ function isPathAllowed(targetPath: string): { allowed: boolean; reason?: string 
   }
 
   return { allowed: true };
+}
+
+function truncateOutput(text: string): string {
+  const t = String(text || '').trim();
+  if (!t) return '';
+  if (t.length <= PATCH_OUTPUT_MAX_CHARS) return t;
+  return `${t.slice(0, PATCH_OUTPUT_MAX_CHARS)} ...[truncated]`;
+}
+
+function countSkippedPatches(text: string): number {
+  const src = String(text || '')
+    .replace(/\x1b\[[0-9;]*m/g, '');
+  if (!src) return 0;
+  const matches = src.match(/Skipped patch\b/gi);
+  return matches ? matches.length : 0;
+}
+
+function parsePatchPathToken(raw: string): string {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('"')) {
+    const m = trimmed.match(/^"([^"]+)"/);
+    return m?.[1] || '';
+  }
+  return trimmed.split(/\s+/)[0] || '';
+}
+
+function normalizePatchPath(rawPath: string): string {
+  let p = String(rawPath || '').trim();
+  if (!p || p === '/dev/null') return '';
+  if (p.startsWith('a/') || p.startsWith('b/')) p = p.slice(2);
+  return p;
+}
+
+function extractPatchTargetPaths(patchText: string): string[] {
+  const paths = new Set<string>();
+  const lines = String(patchText || '').split('\n');
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      const m = line.match(/^diff --git\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]+)"|(\S+))/);
+      const left = normalizePatchPath(m?.[1] || m?.[2] || '');
+      const right = normalizePatchPath(m?.[3] || m?.[4] || '');
+      if (left) paths.add(left);
+      if (right) paths.add(right);
+      continue;
+    }
+
+    if (line.startsWith('--- ') || line.startsWith('+++ ')) {
+      const token = parsePatchPathToken(line.slice(4));
+      const normalized = normalizePatchPath(token);
+      if (normalized) paths.add(normalized);
+      continue;
+    }
+
+    if (line.startsWith('rename from ')) {
+      const fromPath = normalizePatchPath(line.slice('rename from '.length));
+      if (fromPath) paths.add(fromPath);
+      continue;
+    }
+
+    if (line.startsWith('rename to ')) {
+      const toPath = normalizePatchPath(line.slice('rename to '.length));
+      if (toPath) paths.add(toPath);
+    }
+  }
+
+  return Array.from(paths);
+}
+
+function validatePatchPaths(paths: string[]): { ok: true; relativePaths: string[] } | { ok: false; error: string } {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    return { ok: false, error: 'No target paths found in patch. Include standard unified diff headers (---/+++).' };
+  }
+
+  const unique = Array.from(new Set(paths.map(p => String(p || '').trim()).filter(Boolean)));
+  for (const relPath of unique) {
+    if (path.isAbsolute(relPath)) {
+      return { ok: false, error: `Patch path must be relative: ${relPath}` };
+    }
+    const absPath = resolveWorkspacePath(relPath);
+    const pathCheck = isPathAllowed(absPath);
+    if (!pathCheck.allowed) {
+      return { ok: false, error: `Patch path not allowed (${relPath}): ${pathCheck.reason}` };
+    }
+  }
+
+  return { ok: true, relativePaths: unique };
+}
+
+async function runGitApply(workspacePath: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  const out = await execFileAsync('git', args, {
+    cwd: workspacePath,
+    windowsHide: true,
+    maxBuffer: 8 * 1024 * 1024,
+    encoding: 'utf8',
+  } as any);
+  return {
+    stdout: String((out as any)?.stdout || ''),
+    stderr: String((out as any)?.stderr || ''),
+  };
 }
 
 // READ TOOL
@@ -496,5 +602,84 @@ export const appendTool = {
   schema: {
     path: 'string (required) - Path to file',
     content: 'string (required) - Text to append'
+  }
+};
+
+// ── APPLY PATCH ────────────────────────────────────────────────────────────────
+export interface ApplyPatchArgs {
+  patch: string;
+  check?: boolean;
+}
+
+export async function executeApplyPatch(args: ApplyPatchArgs): Promise<ToolResult> {
+  const patchText = String(args?.patch || '');
+  if (!patchText.trim()) {
+    return { success: false, error: 'patch is required (unified diff string).' };
+  }
+
+  const targetPaths = extractPatchTargetPaths(patchText);
+  const validation = validatePatchPaths(targetPaths);
+  if (!validation.ok) return { success: false, error: validation.error };
+
+  const workspacePath = getConfig().getConfig().workspace.path;
+  const tempPatchPath = path.join(
+    os.tmpdir(),
+    `smallclaw-apply-${Date.now()}-${Math.random().toString(36).slice(2)}.patch`
+  );
+
+  try {
+    await fs.writeFile(tempPatchPath, patchText, 'utf-8');
+    const checked = await runGitApply(workspacePath, ['apply', '--check', '--whitespace=nowarn', '--recount', '--verbose', tempPatchPath]);
+    const checkedOutput = [checked.stdout, checked.stderr].filter(Boolean).join('\n');
+    const skippedOnCheck = countSkippedPatches(checkedOutput);
+    if (skippedOnCheck >= validation.relativePaths.length) {
+      const msg = truncateOutput(checkedOutput) || 'Patch check skipped all target files.';
+      return { success: false, error: `apply_patch check failed: ${msg}` };
+    }
+
+    if (args.check === true) {
+      return {
+        success: true,
+        data: {
+          checked_only: true,
+          files: validation.relativePaths,
+          file_count: validation.relativePaths.length,
+        },
+        stdout: `Patch check passed for ${validation.relativePaths.length} file(s).`,
+      };
+    }
+
+    const applied = await runGitApply(workspacePath, ['apply', '--whitespace=nowarn', '--recount', '--verbose', tempPatchPath]);
+    const rawOutput = [applied.stdout, applied.stderr].filter(Boolean).join('\n');
+    const skippedOnApply = countSkippedPatches(rawOutput);
+    if (skippedOnApply >= validation.relativePaths.length) {
+      const msg = truncateOutput(rawOutput) || 'Patch apply skipped all target files.';
+      return { success: false, error: `apply_patch failed: ${msg}` };
+    }
+    const output = truncateOutput(rawOutput);
+
+    return {
+      success: true,
+      data: {
+        files: validation.relativePaths,
+        file_count: validation.relativePaths.length,
+      },
+      stdout: output || `Patch applied to ${validation.relativePaths.length} file(s).`,
+    };
+  } catch (err: any) {
+    const details = truncateOutput(String(err?.stderr || err?.stdout || err?.message || err || 'unknown error'));
+    return { success: false, error: `apply_patch failed: ${details}` };
+  } finally {
+    await fs.unlink(tempPatchPath).catch(() => {});
+  }
+}
+
+export const applyPatchTool = {
+  name: 'apply_patch',
+  description: 'Apply a unified diff patch to workspace files',
+  execute: executeApplyPatch,
+  schema: {
+    patch: 'string (required) - Unified diff patch text',
+    check: 'boolean (optional) - Validate patch only without applying it',
   }
 };

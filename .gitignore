@@ -2,6 +2,9 @@
 # LocalClaw - .gitignore
 # ============================================================
 
+# --- DOCKER / ENV ---
+.env
+
 # --- SECRETS & CONFIG (NEVER COMMIT) ---
 .localclaw/config.json
 .localclaw/credentials/
@@ -14,6 +17,12 @@
 .localclaw/self_learning.json
 .localclaw/jobs.db
 .localclaw/update_state.json
+.localclaw/tasks/
+.localclaw/jobs/
+.localclaw/ocr-cache/
+.localclaw/heartbeat/
+.localclaw/task-heartbeat.json
+.localclaw/cron/runs/
 
 # --- WORKSPACE RUNTIME FILES ---
 workspace/memory/
@@ -34,11 +43,15 @@ tmp_payload.json
 mnt/
 .tmp_*
 .tmp_*/
+.tmp_openclaw_*/
+.tmp_codex_*
 
 # --- NODE ---
 node_modules/
 dist/
 *.js.map
+package/
+*.tgz
 
 # --- TEST ARTIFACTS ---
 tests/.golden-progress.log

@@ -3,12 +3,26 @@ import path from 'path';
 import os from 'os';
 import { LocalClawConfig } from '../types.js';
 
-// Prefer config next to the project (D:\localclaw\.localclaw), fall back to home
+// ── Config & workspace directory resolution ──────────────────────────────────
+// Priority:
+//   1. SMALLCLAW_DATA_DIR env var   (set by Docker / CI)
+//   2. .localclaw/ next to the project root
+//   3. ~/.localclaw in the user's home directory
 const PROJECT_CONFIG = path.join(__dirname, '..', '..', '.localclaw');
-const HOME_CONFIG = path.join(os.homedir(), '.localclaw');
-const CONFIG_DIR = fs.existsSync(PROJECT_CONFIG) ? PROJECT_CONFIG : HOME_CONFIG;
+const HOME_CONFIG    = path.join(os.homedir(), '.localclaw');
+const CONFIG_DIR =
+  process.env.SMALLCLAW_DATA_DIR
+    ? path.join(process.env.SMALLCLAW_DATA_DIR, '.localclaw')
+    : fs.existsSync(PROJECT_CONFIG)
+      ? PROJECT_CONFIG
+      : HOME_CONFIG;
+
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
-const WORKSPACE_DIR = path.join('d:', 'localclaw', 'workspace');
+
+// Workspace: env var → config-dir-relative default (cross-platform safe)
+const WORKSPACE_DIR =
+  process.env.SMALLCLAW_WORKSPACE_DIR ??
+  path.join(CONFIG_DIR, '..', 'workspace');
 
 export const DEFAULT_CONFIG: LocalClawConfig = {
   version: '1.0.1',
@@ -21,13 +35,41 @@ export const DEFAULT_CONFIG: LocalClawConfig = {
     }
   },
   ollama: {
-    endpoint: 'http://localhost:11434',
+    endpoint: process.env.OLLAMA_HOST ?? 'http://localhost:11434',
     timeout: 120,
     concurrency: {
       llm_workers: 1,
       tool_workers: 3
     }
   },
+  // ── Provider config – built from env vars so Docker works out of the box.
+  // Any values in config.json will override these at load time.
+  llm: {
+    provider: (process.env.SMALLCLAW_PROVIDER as any) ?? 'ollama',
+    providers: {
+      ollama: {
+        endpoint: process.env.OLLAMA_HOST ?? 'http://localhost:11434',
+        model:    'qwen3:4b',
+      },
+      lm_studio: {
+        endpoint: process.env.LM_STUDIO_ENDPOINT ?? 'http://localhost:1234',
+        model:    process.env.LM_STUDIO_MODEL    ?? '',
+        api_key:  process.env.LM_STUDIO_API_KEY  ?? undefined,
+      },
+      llama_cpp: {
+        endpoint: process.env.LLAMA_CPP_ENDPOINT ?? 'http://localhost:8080',
+        model:    process.env.LLAMA_CPP_MODEL    ?? '',
+      },
+      openai: {
+        // Supports inline value OR env: reference
+        api_key: process.env.OPENAI_API_KEY ? `env:OPENAI_API_KEY` : '',
+        model:   process.env.OPENAI_MODEL   ?? 'gpt-4o',
+      },
+      openai_codex: {
+        model: process.env.CODEX_MODEL ?? 'gpt-5.3-codex',
+      },
+    },
+  } as any,
   models: {
     primary: 'qwen3:4b',
     roles: {
@@ -77,6 +119,11 @@ export const DEFAULT_CONFIG: LocalClawConfig = {
   workspace: {
     path: WORKSPACE_DIR
   },
+  session: {
+    maxMessages: 120,
+    compactionThreshold: 0.7,
+    memoryFlushThreshold: 0.75,
+  },
   orchestration: {
     enabled: false,
     secondary: {
@@ -101,6 +148,32 @@ export const DEFAULT_CONFIG: LocalClawConfig = {
       max_assists_per_session: 18,
       telemetry_history_limit: 100,
     },
+    browser: {
+      max_advisor_calls_per_turn: 5,
+      max_collected_items: 80,
+      max_forced_retries: 2,
+      min_feed_items_before_answer: 12,
+    },
+    preempt: {
+      enabled: false,
+      stall_threshold_seconds: 45,
+      max_preempts_per_turn: 1,
+      max_preempts_per_session: 3,
+      restart_mode: process.platform === 'win32' ? 'inherit_console' : 'detached_hidden',
+    },
+    file_ops: {
+      enabled: true,
+      primary_create_max_lines: 80,
+      primary_create_max_chars: 3500,
+      primary_edit_max_lines: 12,
+      primary_edit_max_chars: 800,
+      primary_edit_max_files: 1,
+      verify_create_always: true,
+      verify_large_payload_lines: 25,
+      verify_large_payload_chars: 1200,
+      watchdog_no_progress_cycles: 3,
+      checkpointing_enabled: true,
+    },
   }
 };
 
@@ -115,9 +188,22 @@ export class ConfigManager {
     try {
       if (fs.existsSync(CONFIG_FILE)) {
         const data = fs.readFileSync(CONFIG_FILE, 'utf-8');
-        const loadedConfig = JSON.parse(data);
-        // Merge with defaults to ensure all fields exist
-        return { ...DEFAULT_CONFIG, ...loadedConfig };
+        const loaded = JSON.parse(data);
+
+        // Deep-merge the llm.providers block so env-var defaults for
+        // providers not present in config.json are preserved.
+        const mergedLlm = loaded.llm
+          ? {
+              ...DEFAULT_CONFIG.llm,
+              ...loaded.llm,
+              providers: {
+                ...(DEFAULT_CONFIG.llm as any)?.providers,
+                ...loaded.llm.providers,
+              },
+            }
+          : DEFAULT_CONFIG.llm;
+
+        return { ...DEFAULT_CONFIG, ...loaded, llm: mergedLlm };
       }
     } catch (error) {
       console.warn('Failed to load config, using defaults:', error);

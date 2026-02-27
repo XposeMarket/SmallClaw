@@ -1,6 +1,7 @@
 import { ToolResult } from '../types.js';
 import { loadMemory, updateMemory } from '../config/soul-loader.js';
-import { getConfig } from '../config/config.js';
+import { queryFactRecords } from '../gateway/fact-store.js';
+import { sanitizeMemoryText } from './memory-utils.js';
 
 // MEMORY_WRITE: model appends or replaces a bullet in memory.md
 export async function executeMemoryWrite(args: { fact: string; action?: 'append' | 'replace_all' | 'upsert'; key?: string; reference?: string; source_tool?: string; source_output?: string; actor?: 'agent' | 'user' | 'system' }): Promise<ToolResult> {
@@ -8,22 +9,12 @@ export async function executeMemoryWrite(args: { fact: string; action?: 'append'
   const action = args.action ?? 'append';
 
   try {
-    const cfg = getConfig().getConfig();
-    const truncateLen = cfg.memory_options?.truncate_length ?? 1000;
-    const sanitize = (s: any) => {
-      if (s == null) return '';
-      let t = typeof s === 'string' ? s : JSON.stringify(s);
-      t = t.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
-      if (t.length > truncateLen) t = t.slice(0, truncateLen) + '\n...[truncated]';
-      return t;
-    };
-
-    const fact = sanitize(args.fact.trim());
+    const fact = sanitizeMemoryText(args.fact.trim());
     const actor = args.actor || 'agent';
-    const reference = args.reference ? sanitize(args.reference) : undefined;
-    const source_tool = args.source_tool ? sanitize(args.source_tool) : undefined;
-    const source_output = args.source_output ? sanitize(args.source_output) : undefined;
-    const key = args.key ? sanitize(args.key) : undefined;
+    const reference = args.reference ? sanitizeMemoryText(args.reference) : undefined;
+    const source_tool = args.source_tool ? sanitizeMemoryText(args.source_tool) : undefined;
+    const source_output = args.source_output ? sanitizeMemoryText(args.source_output) : undefined;
+    const key = args.key ? sanitizeMemoryText(args.key) : undefined;
 
     // Build bullet with metadata
     const metaParts: string[] = [];
@@ -82,5 +73,68 @@ export const memoryWriteTool = {
     source_tool: 'string (optional) - tool that produced this fact (e.g., web_search)',
     source_output: 'string (optional) - raw tool output or snippet',
     actor: 'string (optional) - who added the fact: agent|user|system'
+  },
+};
+
+// MEMORY_SEARCH: semantic lookup over typed memory facts
+export async function executeMemorySearch(args: { query: string; session_id?: string; max?: number }): Promise<ToolResult> {
+  const query = String(args?.query || '').trim();
+  if (!query) return { success: false, error: 'query is required' };
+
+  try {
+    const sessionId = String(args?.session_id || '').trim() || undefined;
+    const maxRaw = Number(args?.max ?? 5);
+    const max = Number.isFinite(maxRaw) ? Math.min(Math.max(Math.floor(maxRaw), 1), 25) : 5;
+
+    const matches = queryFactRecords({
+      query,
+      session_id: sessionId,
+      includeGlobal: true,
+      max,
+      includeStale: false,
+    });
+
+    const results = matches.map((m) => ({
+      key: m.key,
+      value: m.value,
+      scope: m.scope,
+      session_id: m.session_id,
+      type: m.type,
+      confidence: m.confidence,
+      source_tool: m.source_tool,
+      source_url: m.source_url,
+      updated_at: m.updated_at,
+      verified_at: m.verified_at,
+      expires_at: m.expires_at,
+      actor: m.actor,
+    }));
+
+    const stdout = results.length
+      ? results.map((r, i) => `${i + 1}. [${r.key}] ${r.value}`).join('\n')
+      : 'No memory matches found.';
+
+    return {
+      success: true,
+      stdout,
+      data: {
+        query,
+        session_id: sessionId,
+        count: results.length,
+        results,
+      },
+    };
+  } catch (err: any) {
+    return { success: false, error: `Memory search failed: ${err.message}` };
+  }
+}
+
+export const memorySearchTool = {
+  name: 'memory_search',
+  description: 'Search long-term memory for relevant facts',
+  execute: executeMemorySearch,
+  schema: {
+    query: 'string (required) - what to look for',
+    session_id: 'string (optional) - narrow to session scope',
+    max: 'number (optional, default 5) - max results',
   },
 };

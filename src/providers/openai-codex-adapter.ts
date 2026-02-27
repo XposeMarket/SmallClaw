@@ -13,8 +13,9 @@
  * Tool calls come back as response.output items with type "function_call".
  */
 
-import type { LLMProvider, ChatMessage, ChatOptions, ChatResult, GenerateOptions, GenerateResult, ModelInfo } from './LLMProvider';
+import type { LLMProvider, ChatMessage, ContentPart, ChatOptions, ChatResult, GenerateOptions, GenerateResult, ModelInfo } from './LLMProvider';
 import { loadTokens, getValidToken } from '../auth/openai-oauth';
+import { contentToString } from './content-utils';
 
 const CODEX_ENDPOINT = 'https://chatgpt.com/backend-api/codex/responses';
 
@@ -54,32 +55,91 @@ export class OpenAICodexAdapter implements LLMProvider {
     return headers;
   }
 
-  // Convert SmallClaw ChatMessage[] → Codex input[] format
+  // Convert SmallClaw ChatMessage[] -> Codex input[] format.
+  // Handles both plain string content and ContentPart[] (multimodal vision calls).
+  // Guarantees non-empty function call IDs for both function_call and function_call_output.
   private buildInput(messages: ChatMessage[]): any[] {
-    return messages
-      .filter(m => m.role !== 'system') // system handled separately as instructions
-      .map(m => {
-        if (m.role === 'tool') {
-          return {
-            type: 'function_call_output',
-            call_id: m.tool_call_id || '',
-            output: m.content || '',
-          };
-        }
-        if (m.role === 'assistant' && m.tool_calls?.length) {
-          return m.tool_calls.map(tc => ({
+    const input: any[] = [];
+    const pendingCallIds: string[] = [];
+    let fallbackSeq = 0;
+    const nextFallbackCallId = () => `autocall_${Date.now()}_${++fallbackSeq}`;
+    const asJsonArgumentString = (value: any): string => {
+      if (typeof value === 'string') return value.trim() || '{}';
+      if (value == null) return '{}';
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return '{}';
+      }
+    };
+
+    for (const m of messages) {
+      if (m.role === 'system') continue; // system handled separately as instructions
+
+      if (m.role === 'assistant' && m.tool_calls?.length) {
+        for (const tc of m.tool_calls) {
+          const callId = String(tc?.id || '').trim() || nextFallbackCallId();
+          pendingCallIds.push(callId);
+          input.push({
             type: 'function_call',
-            call_id: tc.id,
-            name: tc.function.name,
-            arguments: tc.function.arguments,
-          }));
+            call_id: callId,
+            name: String(tc?.function?.name || ''),
+            arguments: asJsonArgumentString(tc?.function?.arguments),
+          });
         }
-        return {
-          role: m.role,
-          content: typeof m.content === 'string' ? m.content : '',
-        };
-      })
-      .flat();
+        continue;
+      }
+
+      if (m.role === 'tool') {
+        let callId = String(m.tool_call_id || '').trim();
+        if (!callId && pendingCallIds.length > 0) {
+          callId = pendingCallIds.shift()!;
+        }
+        if (!callId) {
+          // Some internal orchestration paths emit informational "tool" messages
+          // that are not outputs for a real function_call. Codex rejects those as
+          // function_call_output without a matching call_id, so preserve them as
+          // plain assistant text context instead.
+          const toolName = String((m as any).tool_name || m.name || 'tool').slice(0, 80);
+          const content = typeof m.content === 'string' ? m.content : '';
+          input.push({
+            role: 'assistant',
+            content: `[tool-note:${toolName}] ${content}`.slice(0, 12000),
+          });
+          continue;
+        }
+        input.push({
+          type: 'function_call_output',
+          call_id: callId,
+          output: typeof m.content === 'string' ? m.content : '',
+        });
+        continue;
+      }
+
+      // Multimodal content: convert ContentPart[] to Codex content array format
+      if (Array.isArray(m.content)) {
+        const parts: any[] = m.content.map((part: ContentPart) => {
+          if (part.type === 'text') return { type: 'input_text', text: part.text };
+          if (part.type === 'image_url') {
+            return {
+              type: 'input_image',
+              image_url: part.image_url.url,
+              detail: part.image_url.detail ?? 'low',
+            };
+          }
+          return { type: 'input_text', text: '' };
+        });
+        input.push({ role: m.role, content: parts });
+        continue;
+      }
+
+      input.push({
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content : '',
+      });
+    }
+
+    return input;
   }
 
   async chat(messages: ChatMessage[], model: string, options?: ChatOptions): Promise<ChatResult> {
@@ -87,7 +147,7 @@ export class OpenAICodexAdapter implements LLMProvider {
 
     // Extract system message as instructions
     const systemMsg = messages.find(m => m.role === 'system');
-    const instructions = systemMsg?.content || undefined;
+    const instructions = systemMsg ? contentToString(systemMsg.content) : '';
 
     const body: any = {
       model,
@@ -231,7 +291,7 @@ export class OpenAICodexAdapter implements LLMProvider {
     const result = await this.chat(messages, model, {
       max_tokens:  options?.max_tokens,
     });
-    return { response: result.message.content || '' };
+    return { response: contentToString(result.message.content) };
   }
 
   async listModels(): Promise<ModelInfo[]> {
