@@ -1,4 +1,4 @@
-﻿/**
+/**
  * background-task-runner.ts
  *
  * Executes a TaskRecord autonomously in the background, detached from any HTTP request.
@@ -13,10 +13,11 @@ import {
   appendJournal,
   mutatePlan,
   updateResumeContext,
+  resolveSubagentCompletion,
   type TaskRecord,
 } from './task-store';
 import { clearHistory, addMessage, getHistory, flushSession } from './session';
-import { callSecondaryAdvisor } from '../orchestration/multi-agent';
+import { callSecondaryTaskStepAuditor } from '../orchestration/multi-agent';
 
 // Pause registry (global singleton map).
 // Server-v2 calls BackgroundTaskRunner.requestPause(id) to signal a running
@@ -55,14 +56,20 @@ export class BackgroundTaskRunner {
     executionMode?: 'interactive' | 'background_task' | 'heartbeat' | 'cron',
   ) => Promise<{ type: string; text: string; thinking?: string }>;
   private broadcast: (data: object) => void;
-  private telegramChannel: { sendToAllowed: (text: string) => Promise<void> } | null;
+  private telegramChannel: {
+    sendToAllowed: (text: string) => Promise<void>;
+    sendMessage?: (chatId: number, text: string) => Promise<void>;
+  } | null;
   private openingAction: string | undefined;
 
   constructor(
     taskId: string,
     handleChat: BackgroundTaskRunner['handleChat'],
     broadcast: (data: object) => void,
-    telegramChannel: { sendToAllowed: (text: string) => Promise<void> } | null,
+    telegramChannel: {
+      sendToAllowed: (text: string) => Promise<void>;
+      sendMessage?: (chatId: number, text: string) => Promise<void>;
+    } | null,
     openingAction?: string,
   ) {
     this.taskId = taskId;
@@ -111,6 +118,12 @@ export class BackgroundTaskRunner {
   }
 
   private _buildCallerContext(task: TaskRecord): string {
+    const profileNote = task.subagentProfile
+      ? `\nSub-agent role: ${task.subagentProfile}. Stay focused on your assigned task only. Do NOT call delegate_to_specialist or subagent_spawn.`
+      : '';
+    const resumeNote = task.resumeContext?.onResumeInstruction
+      ? `\n${task.resumeContext.onResumeInstruction}`
+      : '';
     return [
       `[BACKGROUND TASK CONTEXT]`,
       `Task ID: ${task.id}`,
@@ -120,7 +133,7 @@ export class BackgroundTaskRunner {
       task.plan[task.currentStepIndex]
         ? `Step Description: ${task.plan[task.currentStepIndex].description}`
         : '',
-      `You are running autonomously. Execute the task step by step.`,
+      `You are running autonomously. Execute the task step by step.${profileNote}${resumeNote}`,
       `[/BACKGROUND TASK CONTEXT]`,
     ].filter(Boolean).join('\n');
   }
@@ -157,49 +170,42 @@ export class BackgroundTaskRunner {
     });
   }
 
-  private async _verifyStepCompletion(stepDescription: string, stepResult: string): Promise<{ complete: boolean; reason: string }> {
-    const step = String(stepDescription || '').trim() || 'No step description provided.';
-    const result = String(stepResult || '').trim() || '(empty result)';
-    const goal = [
-      'Evaluate whether this task step is complete.',
-      'Reply YES or NO with one sentence reason.',
-      `STEP: ${step.slice(0, 500)}`,
-      `RESULT: ${result.slice(0, 1200)}`,
-    ].join('\n');
-    const advice = await callSecondaryAdvisor(
-      goal,
-      [`Step: ${step.slice(0, 320)}`, `Result: ${result.slice(0, 500)}`],
-      'Step completion verification (strict YES/NO)',
-      'rescue',
-    );
+  /**
+   * Fast-path check: did the model's result already satisfy the top-level goal,
+   * even though we're mid-plan?  Looks for explicit TASK_COMPLETE signals or
+   * result text that clearly matches the original task prompt.
+   *
+   * Returns true only when there is strong evidence the user's goal is done.
+   * Erring on the side of false keeps the normal verifier path as the default.
+   */
+  private _isGoalAchievedEarly(task: TaskRecord, resultText: string): boolean {
+    const text = resultText.toLowerCase();
 
-    if (!advice) {
-      return { complete: true, reason: 'Verifier unavailable; proceeding without blocking.' };
-    }
+    // Explicit model signal
+    if (/task[_\s-]?complete[:\s]/i.test(resultText)) return true;
 
-    const evidence = [
-      String(advice.raw_response || ''),
-      ...(advice.hints || []).map((h) => String(h || '')),
-      ...(advice.next_actions || []).map((a) => String(a || '')),
-    ]
-      .filter(Boolean)
-      .join('\n')
-      .replace(/\s+/g, ' ')
-      .trim();
+    // The model quoted or summarised the original goal and said it's done
+    const referenceWords = task.prompt.toLowerCase().split(/\s+/).filter(w => w.length > 4).slice(0, 12);
 
-    const verdictMatch = evidence.match(/\b(YES|NO)\b/i);
-    if (verdictMatch) {
-      const complete = verdictMatch[1].toUpperCase() === 'YES';
-      const sentence = evidence.split(/[.!?]\s+/)[0] || evidence;
-      return { complete, reason: sentence.slice(0, 280) };
-    }
+    const hitCount = referenceWords.filter(w => text.includes(w)).length;
+    const hitRatio = referenceWords.length > 0 ? hitCount / referenceWords.length : 0;
 
-    const negativeCue = /\b(not complete|incomplete|missing|failed|did not|does not|cannot verify|needs retry|retry)\b/i.test(evidence);
-    const complete = !negativeCue;
-    return {
-      complete,
-      reason: (evidence.split(/[.!?]\s+/)[0] || (complete ? 'Step appears complete.' : 'Step appears incomplete.')).slice(0, 280),
-    };
+    const completionPhrases = [
+      'successfully sent', 'has replied', 'chatgpt responded', 'chatgpt replied',
+      'message sent', 'reply received', 'goal accomplished', 'already done',
+      'already completed', 'already achieved', 'task is done', 'task already',
+      'objective met', 'objective achieved',
+    ];
+    const hasCompletionPhrase = completionPhrases.some(p => text.includes(p));
+
+    // Strong signal: result references the goal AND contains a completion phrase
+    if (hitRatio >= 0.5 && hasCompletionPhrase) return true;
+
+    // Very strong signal: step 1 already captured the full answer
+    // (e.g. the browser opened, the message was sent, the reply was read)
+    if (task.currentStepIndex === 0 && hasCompletionPhrase && hitRatio >= 0.3) return true;
+
+    return false;
   }
 
   private async _withRoundTimeout<T>(
@@ -374,6 +380,8 @@ export class BackgroundTaskRunner {
     const toolSignatureCounts = new Map<string, number>();
     let currentRoundSignatures: string[] = [];
     let roundStallReason: string | null = null;
+    // Full evidence log for the current round — used by the step auditor.
+    let currentRoundToolLog: Array<{ tool: string; args: any; result: string; error: boolean }> = [];
     const finalizeRoundSignatures = (): void => {
       signatureRounds.push(currentRoundSignatures);
       while (signatureRounds.length > 6) {
@@ -388,6 +396,10 @@ export class BackgroundTaskRunner {
 
     const sendSSE = (event: string, data: any) => {
       if (event === 'tool_call') {
+        // Refresh the open task panel on every tool call so steps update in real-time.
+        // task_step_done only fires after verification, so without this the panel is
+        // stale while the task is actively running between step completions.
+        this._broadcast('task_panel_update', { taskId });
         const sig = `${String(data.action || 'unknown')}:${JSON.stringify(data.args || {})}`;
         currentRoundSignatures.push(sig);
         const next = (toolSignatureCounts.get(sig) || 0) + 1;
@@ -400,12 +412,22 @@ export class BackgroundTaskRunner {
           content: `${data.action || 'unknown'}(${JSON.stringify(data.args || {}).slice(0, 80)})`,
         });
         this._broadcast('task_tool_call', { taskId, tool: data.action, args: data.args });
+        // Pre-populate an entry; result will be filled in by the tool_result handler.
+        currentRoundToolLog.push({ tool: String(data.action || 'unknown'), args: data.args ?? {}, result: '', error: false });
       } else if (event === 'tool_result') {
         appendJournal(taskId, {
           type: 'tool_result',
           content: `${data.action || 'unknown'}: ${String(data.result || '').slice(0, 120)}${data.error ? ' [ERROR]' : ''}`,
           detail: data.error ? String(data.result || '') : undefined,
         });
+        // Fill in result for the matching pending entry so the auditor has full evidence.
+        for (let i = currentRoundToolLog.length - 1; i >= 0; i--) {
+          if (currentRoundToolLog[i].tool === (data.action || 'unknown') && currentRoundToolLog[i].result === '') {
+            currentRoundToolLog[i].result = String(data.result || '').slice(0, 1200);
+            currentRoundToolLog[i].error = !!data.error;
+            break;
+          }
+        }
       }
     };
 
@@ -424,6 +446,15 @@ export class BackgroundTaskRunner {
         updateTaskStatus(taskId, 'paused', { pauseReason: 'user_pause' });
         appendJournal(taskId, { type: 'pause', content: 'Paused by user request.' });
         this._broadcast('task_paused', { taskId, reason: 'user_pause' });
+        flushSession(sessionId);
+        return;
+      }
+
+      // Parent is blocked waiting for child sub-agents to finish — exit loop.
+      // scheduleTaskFollowup() will re-queue this task when all children complete.
+      if (task.status === 'waiting_subagent') {
+        activeRunners.delete(taskId);
+        appendJournal(taskId, { type: 'pause', content: 'Waiting for sub-agents to complete.' });
         flushSession(sessionId);
         return;
       }
@@ -457,10 +488,23 @@ export class BackgroundTaskRunner {
       firstRound = false;
       currentRoundSignatures = [];
       roundStallReason = null;
+      currentRoundToolLog = [];
 
       const roundOutcome = await this._runRoundWithRetry(task, prompt, sessionId, sendSSE, abortSignal);
       finalizeRoundSignatures();
       if (roundStallReason) {
+        // Deliver whatever the agent produced before pausing — the inline reasoning /
+        // final message was already computed but never sent because the stall check
+        // fires before _deliverToChannel. Flush it now so the user sees it in chat.
+        const partialResult = roundOutcome.ok ? String(roundOutcome.result?.text || '').trim() : '';
+        if (partialResult) {
+          try {
+            const freshTask = loadTask(taskId);
+            if (freshTask) {
+              await this._deliverToChannel(freshTask, partialResult);
+            }
+          } catch { /* best effort */ }
+        }
         await this._pauseForAssistance(task, roundStallReason);
         return;
       }
@@ -501,48 +545,132 @@ export class BackgroundTaskRunner {
         return;
       }
 
-      const verify = await this._verifyStepCompletion(
-        currentStep?.description || 'No step description provided.',
-        result.text || '',
-      );
-      if (!verify.complete) {
+      // ── Early goal-completion fast-path ──────────────────────────────────
+      // If the model's result already satisfies the original user goal
+      // (e.g. it opened ChatGPT, sent the message, and got a reply in step 1),
+      // mark the task complete immediately without running the remaining plan steps.
+      {
+        const freshForGoalCheck = loadTask(taskId);
+        if (freshForGoalCheck && this._isGoalAchievedEarly(freshForGoalCheck, lastResultSummary)) {
+          const summary = lastResultSummary.slice(0, 400);
+          updateTaskStatus(taskId, 'complete', { finalSummary: summary });
+          appendJournal(taskId, {
+            type: 'status_push',
+            content: `Goal achieved early at step ${freshForGoalCheck.currentStepIndex + 1} — skipping remaining ${freshForGoalCheck.plan.length - freshForGoalCheck.currentStepIndex - 1} step(s). ${summary}`,
+          });
+          this._broadcast('task_complete', { taskId, summary });
+          await this._deliverToChannel(freshForGoalCheck, `Task complete: ${freshForGoalCheck.title}\n\n${summary}`, { forceTelegram: true });
+          this._persistResumeContextSnapshot(taskId, sessionId);
+          flushSession(sessionId);
+          return;
+        }
+      }
+
+      // If handleChat hit its internal tool-round cap, skip verification and
+      // just continue to the next round — the step isn't done yet but the work
+      // is still in progress. Treating this as a verification failure would
+      // incorrectly burn retries and eventually kill the task.
+      const hitMaxSteps = /^hit max steps/i.test(lastResultSummary);
+      if (hitMaxSteps) {
+        appendJournal(taskId, { type: 'status_push', content: 'Round hit max tool steps - continuing to next round.' });
+        continue;
+      }
+
+      // Multi-step evidence audit:
+      // Ask the secondary model to inspect this round's tool evidence and
+      // mark every pending plan step that is provably complete.
+      const pendingSteps = freshTask.plan
+        .map((s, i) => ({ index: i, description: s.description, status: s.status }))
+        .filter(s => s.status !== 'done' && s.status !== 'skipped');
+
+      const auditResult = await callSecondaryTaskStepAuditor({
+        pendingSteps: pendingSteps.map(s => ({ index: s.index, description: s.description })),
+        toolCallLog: currentRoundToolLog,
+        resultText: lastResultSummary,
+      });
+
+      if (!auditResult || auditResult.completed_steps.length === 0) {
+        // Auditor found nothing done, treat as incomplete and retry.
         const stepIndex = freshTask.currentStepIndex;
         const retries = (stepVerificationRetries.get(stepIndex) || 0) + 1;
         stepVerificationRetries.set(stepIndex, retries);
-        stepRetryHints.set(stepIndex, verify.reason);
+        const reason = auditResult
+          ? 'No plan steps were evidenced as complete by this round\'s tool calls.'
+          : 'Step auditor unavailable; assuming incomplete.';
+        stepRetryHints.set(stepIndex, reason);
         appendJournal(taskId, {
           type: 'status_push',
-          content: `Verifier says step ${stepIndex + 1} incomplete (${retries}/${MAX_STEP_VERIFICATION_RETRIES}): ${verify.reason}`,
+          content: `Auditor found no completed steps (${retries}/${MAX_STEP_VERIFICATION_RETRIES}): ${reason}`,
         });
         if (retries >= MAX_STEP_VERIFICATION_RETRIES) {
           await this._pauseForAssistance(
             task,
             `Step ${stepIndex + 1} failed verification after ${retries} retries.`,
-            verify.reason,
+            reason,
           );
           flushSession(sessionId);
           return;
         }
         continue;
       }
-      stepRetryHints.delete(freshTask.currentStepIndex);
-      stepVerificationRetries.delete(freshTask.currentStepIndex);
 
-      const completedStep = freshTask.currentStepIndex;
-      mutatePlan(taskId, [{
-        op: 'complete',
-        step_index: completedStep,
-        notes: result.text.slice(0, 200),
-      }]);
+      const completedIndices = Array.from(new Set(auditResult.completed_steps))
+        .filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < freshTask.plan.length)
+        .sort((a, b) => a - b);
 
+      if (completedIndices.length === 0) {
+        const stepIndex = freshTask.currentStepIndex;
+        const retries = (stepVerificationRetries.get(stepIndex) || 0) + 1;
+        stepVerificationRetries.set(stepIndex, retries);
+        const reason = 'Auditor returned only out-of-range step indices.';
+        stepRetryHints.set(stepIndex, reason);
+        appendJournal(taskId, {
+          type: 'status_push',
+          content: `Auditor result rejected (${retries}/${MAX_STEP_VERIFICATION_RETRIES}): ${reason}`,
+        });
+        if (retries >= MAX_STEP_VERIFICATION_RETRIES) {
+          await this._pauseForAssistance(
+            task,
+            `Step ${stepIndex + 1} failed verification after ${retries} retries.`,
+            reason,
+          );
+          flushSession(sessionId);
+          return;
+        }
+        continue;
+      }
+
+      const mutations = completedIndices.map((idx) => ({
+        op: 'complete' as const,
+        step_index: idx,
+        notes: (auditResult.notes[idx] || lastResultSummary).slice(0, 200),
+      }));
+
+      appendJournal(taskId, {
+        type: 'status_push',
+        content: `Auditor confirmed step(s) ${completedIndices.map(i => i + 1).join(', ')} complete based on tool evidence.`,
+      });
+      mutatePlan(taskId, mutations);
+
+      // Clear retry state for any step that just got confirmed.
+      for (const idx of completedIndices) {
+        stepRetryHints.delete(idx);
+        stepVerificationRetries.delete(idx);
+      }
+
+      // Reload after mutations and advance currentStepIndex past all completed/skipped steps.
       const updated = loadTask(taskId);
       if (!updated) return;
 
-      const nextStep = updated.currentStepIndex + 1;
-      const allDone = nextStep >= updated.plan.length
-        || updated.plan.slice(nextStep).every(s => s.status === 'done' || s.status === 'skipped');
+      const previousStep = updated.currentStepIndex;
+      let nextStep = previousStep;
+      while (nextStep < updated.plan.length) {
+        const status = updated.plan[nextStep]?.status;
+        if (status !== 'done' && status !== 'skipped') break;
+        nextStep++;
+      }
 
-      if (allDone) {
+      if (nextStep >= updated.plan.length) {
         updateTaskStatus(taskId, 'complete', { finalSummary: result.text });
         appendJournal(taskId, { type: 'status_push', content: `Task complete: ${result.text.slice(0, 200)}` });
         this._broadcast('task_complete', { taskId, summary: result.text });
@@ -552,21 +680,23 @@ export class BackgroundTaskRunner {
         return;
       }
 
-      updated.currentStepIndex = nextStep;
-      saveTask(updated);
-      appendJournal(taskId, {
-        type: 'status_push',
-        content: `Step ${completedStep + 1} done. Continuing automatically to step ${nextStep + 1}.`,
-      });
-      this._broadcast('task_step_done', {
-        taskId,
-        completedStep,
-        nextStep,
-        autoContinued: true,
-      });
+      if (nextStep !== previousStep) {
+        updated.currentStepIndex = nextStep;
+        saveTask(updated);
+        appendJournal(taskId, {
+          type: 'status_push',
+          content: `Step pointer advanced from ${previousStep + 1} to ${nextStep + 1} after multi-step audit.`,
+        });
+        this._broadcast('task_step_done', {
+          taskId,
+          completedStep: previousStep,
+          completedSteps: completedIndices,
+          nextStep,
+          autoContinued: true,
+        });
+      }
     }
   }
-
   private async _pauseForAssistance(task: TaskRecord, reason: string, detail?: string): Promise<void> {
     updateTaskStatus(task.id, 'needs_assistance', { pauseReason: 'error' });
     appendJournal(task.id, {
@@ -610,6 +740,27 @@ export class BackgroundTaskRunner {
     message: string,
     opts?: { forceTelegram?: boolean },
   ): Promise<void> {
+    // ─ Sub-agent path: notify parent instead of delivering to user chat ─
+    if (task.parentTaskId) {
+      try {
+        const { parentTask, allChildrenDone } = resolveSubagentCompletion(task.id, message);
+        if (parentTask && allChildrenDone) {
+          console.log(`[SubAgent] All children done for parent ${parentTask.id} — scheduling quick resume.`);
+          // Signal the broadcast interceptor in server-v2 to scheduleTaskFollowup
+          this._broadcast('task_step_followup_needed', {
+            taskId: parentTask.id,
+            delayMs: 2000,
+          });
+        } else if (parentTask) {
+          console.log(`[SubAgent] Child ${task.id} done; parent ${parentTask.id} still waiting on more children.`);
+        }
+      } catch (e) {
+        console.warn('[SubAgent] resolveSubagentCompletion error:', e);
+      }
+      // Sub-agents never deliver directly to user chat — return early.
+      return;
+    }
+
     try {
       addMessage(task.sessionId, {
         role: 'user',
@@ -622,7 +773,13 @@ export class BackgroundTaskRunner {
     }
 
     if ((opts?.forceTelegram || task.channel === 'telegram') && this.telegramChannel) {
-      try { await this.telegramChannel.sendToAllowed(message); } catch (e) {
+      try {
+        if (task.telegramChatId && typeof this.telegramChannel.sendMessage === 'function') {
+          await this.telegramChannel.sendMessage(task.telegramChatId, message);
+        } else {
+          await this.telegramChannel.sendToAllowed(message);
+        }
+      } catch (e) {
         console.warn('[BTR] Delivery failed (telegram):', e);
       }
     }
@@ -636,3 +793,4 @@ export class BackgroundTaskRunner {
     });
   }
 }
+

@@ -8,8 +8,10 @@
 # --- SECRETS & CONFIG (NEVER COMMIT) ---
 .localclaw/config.json
 .localclaw/credentials/
+.localclaw/vault/
 .smallclaw/config.json
 .smallclaw/credentials/
+.smallclaw/vault/
 
 # --- RUNTIME DATA ---
 .localclaw/sessions/
@@ -44,9 +46,20 @@
 .smallclaw/.migrated-from-localclaw
 
 # --- WORKSPACE RUNTIME FILES ---
+# Keep: SOUL.md, SELF.md, IDENTITY.md, USER.md, MEMORY.md, AGENTS.md, TOOLS.md, BOOT.md, README.md
+# These are default templates that ship with SmallClaw — new users need them.
+# Ignore: daily memory logs, tool audit log, heartbeat, and any AI-generated scratch files.
 workspace/memory/
 workspace/tool_audit.log
 workspace/HEARTBEAT.md
+workspace/note.txt
+workspace/*.html
+workspace/*.js
+workspace/*.css
+workspace/*.py
+workspace/*.sh
+workspace/*.bat
+workspace/*.txt
 
 # --- DASHBOARD RUNTIME STATE ---
 ai-dashboard/dashboard-state.json

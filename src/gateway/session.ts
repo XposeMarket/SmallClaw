@@ -28,7 +28,15 @@ export interface Session {
 }
 
 const sessions = new Map<string, Session>();
-export const PRE_COMPACTION_MEMORY_FLUSH_PROMPT = 'Before continuing: write any important facts from this conversation to memory now.';
+export const PRE_COMPACTION_MEMORY_FLUSH_PROMPT = [
+  'SYSTEM: Context is getting long. Before we continue, do this NOW (be quick):',
+  '1. memory_write — save any new facts, preferences, or decisions from this session',
+  '2. persona_update USER.md — update anything new you learned about your human (name, preferences, quirks, projects)',
+  '3. persona_update SOUL.md — if you developed any new operating principles or learned how to work better with this human, add them',
+  '4. write — log a 1-2 line session note to workspace/memory/<today>.md',
+  'After writing, reply with just: NO_REPLY (the user does not need to see this turn)',
+  'Only send a real reply if there is something critical to tell the user right now.',
+].join('\n');
 export const PRE_COMPACTION_SUMMARY_PROMPT = 'Before continuing: summarize the conversation so far into a compact context note. Include goals, constraints, decisions, and open items in <= 180 words.';
 const API_HISTORY_PRUNE_THRESHOLD_CHARS = 3000;
 const API_HISTORY_PRUNE_KEEP_CHARS = 2500;
@@ -389,6 +397,23 @@ export function cleanupSessions(nowMs: number = Date.now()): { deleted: number; 
   return { deleted, scanned };
 }
 
+function scrubSession(session: Session): Session {
+  // MED-02 fix: scrub secrets from message content before persisting to disk.
+  // Imported lazily to avoid circular dependency at module load time.
+  try {
+    const { scrubSecrets } = require('../security/vault');
+    return {
+      ...session,
+      history: session.history.map(msg => ({
+        ...msg,
+        content: scrubSecrets(String(msg.content || '')),
+      })),
+    };
+  } catch {
+    return session; // scrub failure must never break session saving
+  }
+}
+
 function saveSession(id: string): void {
   const session = sessions.get(id);
   if (!session) return;
@@ -402,7 +427,7 @@ function saveSession(id: string): void {
     if (!latest) return;
     ensureSessionDir();
     try {
-      fs.writeFileSync(getSessionPath(id), JSON.stringify(latest, null, 2));
+      fs.writeFileSync(getSessionPath(id), JSON.stringify(scrubSession(latest), null, 2));
     } catch (err) {
       console.warn(`[session] Failed to save session ${id}:`, err);
     }

@@ -265,6 +265,59 @@ Config is stored in `.smallclaw/config.json` in the project folder (or `~/.small
 
 Most settings can be changed live from the Settings panel without restarting the gateway.
 
+### Agents Array Example
+
+User-defined agents (no preset roles). Put this in `.smallclaw/config.json`:
+
+```jsonc
+{
+  "agents": [
+    {
+      "id": "main",
+      "name": "Rafi",
+      "description": "My main daily assistant. Handles chat, tasks, and general requests.",
+      "emoji": "🦞",
+      "default": true,
+      "workspace": "D:/SmallClaw/workspace",
+      "tools": { "profile": "full" },
+      "minimalPrompt": false
+    },
+    {
+      "id": "researcher",
+      "name": "Scout",
+      "description": "Deep web research. Given a topic, returns a structured research brief.",
+      "emoji": "🔍",
+      "workspace": "D:/SmallClaw/agents/researcher/workspace",
+      "model": "ollama/qwen3:4b",
+      "tools": { "profile": "web", "deny": ["browser"] },
+      "minimalPrompt": true,
+      "maxSteps": 10
+    },
+    {
+      "id": "writer",
+      "name": "Quill",
+      "description": "Content writer. Takes research briefs and produces polished drafts.",
+      "emoji": "✍️",
+      "workspace": "D:/SmallClaw/agents/writer/workspace",
+      "tools": { "profile": "coding", "deny": ["web_search", "web_fetch", "browser"] },
+      "minimalPrompt": true
+    },
+    {
+      "id": "orchestrator",
+      "name": "Director",
+      "description": "Coordinates other agents. Runs on a cron schedule to manage autonomous pipelines.",
+      "emoji": "🎬",
+      "workspace": "D:/SmallClaw/agents/orchestrator/workspace",
+      "tools": { "profile": "full" },
+      "minimalPrompt": false,
+      "canSpawn": true,
+      "spawnAllowlist": ["researcher", "writer"],
+      "cronSchedule": "0 8 * * *"
+    }
+  ]
+}
+```
+
 ## Self-Updating
 
 SmallClaw includes a built-in updater. In most cases, users can update from any install directory with:

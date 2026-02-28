@@ -235,6 +235,39 @@ async function getOrCreateSession(sessionId: string): Promise<BrowserSession> {
   const session: BrowserSession = { browser, context, page, lastSnapshot: '', lastSnapshotAt: 0, createdAt: Date.now() };
   sessions.set(sessionId, session);
   console.log(`[Browser] Session created for ${sessionId}`);
+
+  // Auto-handle OAuth popups (e.g. "Continue as Raul" Google sign-in dialog).
+  // These appear as new pages in the context and are invisible to the DOM snapshot.
+  // We click the primary confirm button automatically so the agent doesn't get stuck.
+  context.on('page', async (popup: any) => {
+    try {
+      await popup.waitForLoadState('domcontentloaded').catch(() => {});
+      const popupUrl = popup.url();
+      console.log(`[Browser] Popup opened: ${popupUrl}`);
+      // Google OAuth confirm page: click the blue continue/confirm button
+      const confirmSelectors = [
+        'button[id="submit_approve_access"]',  // Google OAuth approve
+        'button:has-text("Continue")',
+        'button:has-text("Allow")',
+        'button:has-text("Confirm")',
+        'button:has-text("Accept")',
+        '#submit_approve_access',
+      ];
+      for (const sel of confirmSelectors) {
+        try {
+          const btn = popup.locator(sel).first();
+          if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+            await btn.click();
+            console.log(`[Browser] Auto-clicked popup confirm: ${sel}`);
+            break;
+          }
+        } catch { /* try next selector */ }
+      }
+    } catch (err: any) {
+      console.warn(`[Browser] Popup handler error: ${err.message}`);
+    }
+  });
+
   return session;
 }
 
@@ -359,21 +392,63 @@ async function takeSnapshot(page: PwPage, maxElements: number = 100): Promise<st
       diagnostics.included = results.length;
       return { elements: results, diagnostics };
     }, maxElements);
-    const elements = Array.isArray(snapshotData?.elements) ? snapshotData.elements : [];
-    const diagnostics = snapshotData?.diagnostics || {
-      scanned: elements.length,
-      included: elements.length,
-      hidden: 0,
-      unlabeled_non_input: 0,
-      unnamed_input_included: 0,
+    const rawElements = Array.isArray(snapshotData?.elements) ? snapshotData.elements : [];
+    const elements: SnapElement[] = rawElements
+      .map((raw: any, idx: number) => {
+        const role = String(raw?.role || raw?.tag || 'element').trim().toLowerCase() || 'element';
+        const tag = String(raw?.tag || role || 'div').trim().toLowerCase() || 'div';
+        const name = String(raw?.name || raw?.placeholder || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+        const type = raw?.type ? String(raw.type).replace(/\s+/g, ' ').trim().slice(0, 40) : undefined;
+        const placeholder = raw?.placeholder
+          ? String(raw.placeholder).replace(/\s+/g, ' ').trim().slice(0, 80)
+          : undefined;
+        const value = raw?.value
+          ? String(raw.value).replace(/\s+/g, ' ').trim().slice(0, 60)
+          : undefined;
+        const isInput = !!raw?.isInput
+          || ['textbox', 'searchbox', 'combobox', 'textarea'].includes(role)
+          || tag === 'input'
+          || tag === 'textarea'
+          || tag === 'select';
+        return {
+          ref: idx + 1,
+          tag,
+          role,
+          name,
+          type,
+          placeholder,
+          value,
+          isInput,
+        };
+      })
+      .filter((el) => el.name.length > 0 || el.isInput);
+
+    const toCount = (value: unknown, fallback: number): number => {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
     };
+    const rawDiagnostics = snapshotData?.diagnostics && typeof snapshotData.diagnostics === 'object'
+      ? snapshotData.diagnostics as Record<string, unknown>
+      : {};
+    const diagnostics = {
+      scanned: toCount(rawDiagnostics.scanned, Math.max(rawElements.length, elements.length)),
+      included: elements.length,
+      hidden: toCount(rawDiagnostics.hidden, 0),
+      unlabeled_non_input: toCount(rawDiagnostics.unlabeled_non_input, 0),
+      unnamed_input_included: toCount(rawDiagnostics.unnamed_input_included, 0),
+    };
+    if (diagnostics.scanned < diagnostics.included) {
+      diagnostics.scanned = diagnostics.included;
+    }
 
     // Build compact text for the LLM
+    const displayUrlRaw = String(url || '').replace(/\s+/g, ' ').trim();
+    const displayUrl = displayUrlRaw.length > 360 ? `${displayUrlRaw.slice(0, 357)}...` : displayUrlRaw;
     const lines = [
       `Page: ${title}`,
-      `URL: ${url}`,
       `Elements (${elements.length}):`,
       `Snapshot diagnostics: scanned=${diagnostics.scanned} included=${diagnostics.included} hidden=${diagnostics.hidden} unlabeled_non_input=${diagnostics.unlabeled_non_input} unnamed_input_included=${diagnostics.unnamed_input_included}`,
+      `URL: ${displayUrl}`,
       '',
     ];
     for (const el of elements) {
@@ -385,7 +460,26 @@ async function takeSnapshot(page: PwPage, maxElements: number = 100): Promise<st
       if (el.value) line += ` value="${el.value}"`;
       lines.push(line);
     }
-    return lines.join('\n');
+    const snapshotText = lines.join('\n');
+
+    // Login wall detection — append an explicit action hint so the agent doesn't loop.
+    // If the page looks like a login wall and there's a one-click sign-in button, say so.
+    const elementText = elements.map(e => e.name).join(' ').toLowerCase();
+    const isLoginWall = /join today|sign in|log in|create account/i.test(title + ' ' + elementText);
+    if (isLoginWall) {
+      const signInRef = elements.find(e =>
+        /sign in as|continue as|sign in with google|sign in with apple/i.test(e.name)
+      );
+      if (signInRef) {
+        return snapshotText + `\n\n[LOGIN PAGE DETECTED] Click @${signInRef.ref} ("${signInRef.name}") to sign in immediately. Do NOT loop on snapshots.`;
+      }
+      const plainSignIn = elements.find(e => /^sign in$/i.test(e.name.trim()));
+      if (plainSignIn) {
+        return snapshotText + `\n\n[LOGIN PAGE DETECTED] Click @${plainSignIn.ref} ("${plainSignIn.name}") to proceed to the login form.`;
+      }
+    }
+
+    return snapshotText;
   } catch (err: any) {
     return `Snapshot error: ${err.message}`;
   }
@@ -883,6 +977,12 @@ export async function browserSnapshot(sessionId: string): Promise<string> {
   const session = sessions.get(sessionId);
   if (!session) return 'ERROR: No browser session. Use browser_open first.';
   try {
+    // Wait for the DOM to settle before snapshotting — SPAs (like x.com) may still
+    // be hydrating after domcontentloaded, leaving querySelectorAll with 0 results.
+    // networkidle is best-effort; we proceed even if it times out.
+    await session.page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+    // Additional settle time for React/Next/Vue hydration to mount interactive elements.
+    await session.page.waitForTimeout(600);
     const snapshot = await takeSnapshot(session.page);
     session.lastSnapshot = snapshot;
     session.lastSnapshotAt = Date.now();
@@ -1012,7 +1112,7 @@ export function getBrowserToolDefinitions(): any[] {
       type: 'function',
       function: {
         name: 'browser_open',
-        description: 'Open a URL in the browser. Returns a snapshot of interactive page elements with @ref numbers — this IS your view of the page, read it immediately. Find the link or button you need by its @ref number, then use browser_click to navigate. Do NOT call browser_open again for a different URL within the same site — use browser_click on the link @ref instead. For searches, build a direct search URL (e.g. github.com/search?q=query, reddit.com/search/?q=query). Elements marked [INPUT] can be filled. If element count looks low, call browser_wait to let JS finish loading.',
+        description: 'Open a URL in a Playwright-controlled Chrome browser (NOT your regular Chrome or Edge). This is the ONLY correct way to open URLs for browser automation — NEVER use run_command to open chrome/edge, as those windows are invisible to all other browser tools. Always use browser_open first to establish a session before using browser_snapshot, browser_click, etc. Returns a snapshot of interactive page elements with @ref numbers — read it immediately. Do NOT call browser_open again for a different URL within the same site — use browser_click on the link @ref instead. For searches, build a direct search URL (e.g. github.com/search?q=query). Elements marked [INPUT] can be filled. If element count looks low, call browser_wait to let JS finish loading.',
         parameters: {
           type: 'object', required: ['url'],
           properties: { url: { type: 'string', description: 'Full URL to navigate to. For searches, build the search URL directly.' } },

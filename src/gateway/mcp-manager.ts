@@ -10,6 +10,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import { log } from '../security/log-scrubber';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -108,11 +109,85 @@ export class MCPManager {
 
   getConfigs(): MCPServerConfig[] { return this.configs; }
 
+  // ── CRIT-02 fix: validate command before accepting MCP config ─────────────────
+  // MCP stdio configs spawn real processes. Validate the command is in the
+  // known-safe allowlist so a prompt-injected instruction cannot register
+  // an arbitrary binary as an MCP server.
+  static validateStdioCommand(command: string): { valid: boolean; reason?: string } {
+    if (!command || typeof command !== 'string') {
+      return { valid: false, reason: 'command must be a non-empty string' };
+    }
+
+    // Resolve just the base executable name (strip path prefix if present)
+    const exe = path.basename(command).toLowerCase().replace(/\.exe$/i, '');
+
+    const ALLOWED_EXECUTABLES = new Set([
+      // Node / JS runtimes
+      'node', 'nodejs', 'npx', 'tsx', 'ts-node',
+      // Python runtimes
+      'python', 'python3', 'python3.11', 'python3.12', 'uvx', 'uv',
+      // Package runners
+      'npx', 'pnpx', 'bunx', 'deno',
+      // Common MCP server wrappers
+      'mcp', 'mcp-server',
+    ]);
+
+    if (!ALLOWED_EXECUTABLES.has(exe)) {
+      return {
+        valid: false,
+        reason: `Executable "${exe}" is not in the MCP allowed-command list. ` +
+          `Allowed: ${[...ALLOWED_EXECUTABLES].join(', ')}`
+      };
+    }
+
+    // Block shell metacharacters in command string itself
+    if (/[;&|`$><]/.test(command)) {
+      return { valid: false, reason: 'command contains shell metacharacters' };
+    }
+
+    return { valid: true };
+  }
+
+  // ── CRIT-02 / HIGH-04 fix: sanitize env vars ────────────────────────────
+  // Prevent attackers from injecting PATH, NODE_OPTIONS, LD_PRELOAD, etc.
+  static sanitizeEnv(env: Record<string, string>): Record<string, string> {
+    // Explicitly blocked env vars that could hijack process execution
+    const BLOCKED_ENV_KEYS = new Set([
+      'PATH', 'NODE_OPTIONS', 'NODE_PATH',
+      'LD_PRELOAD', 'LD_LIBRARY_PATH',
+      'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH', // macOS
+      'PYTHONPATH', 'PYTHONSTARTUP',
+      'RUBYOPT', 'RUBYLIB',
+      'PERL5OPT', 'PERL5LIB',
+      'HOME', 'USERPROFILE',  // prevent redirecting home dir
+      'TMPDIR', 'TEMP', 'TMP', // prevent temp dir hijacking
+      'SHELL', 'COMSPEC',      // prevent shell override
+    ]);
+
+    const sanitized: Record<string, string> = {};
+    for (const [k, v] of Object.entries(env)) {
+      if (BLOCKED_ENV_KEYS.has(k.toUpperCase()) || BLOCKED_ENV_KEYS.has(k)) {
+        log.warn('[MCP] Blocked dangerous env var in server config:', k);
+        continue;
+      }
+      sanitized[k] = String(v);
+    }
+    return sanitized;
+  }
+
   upsertConfig(cfg: MCPServerConfig): void {
+    // Validate stdio command before persisting
+    if (cfg.transport === 'stdio' && cfg.command) {
+      const validation = MCPManager.validateStdioCommand(cfg.command);
+      if (!validation.valid) {
+        throw new Error(`[MCP] Rejected config for "${cfg.id}": ${validation.reason}`);
+      }
+    }
     const idx = this.configs.findIndex(c => c.id === cfg.id);
     if (idx >= 0) this.configs[idx] = cfg;
     else this.configs.push(cfg);
     this.save();
+    log.security('[MCP] Config saved for server:', cfg.id, 'transport:', cfg.transport);
   }
 
   deleteConfig(id: string): boolean {
@@ -154,11 +229,16 @@ export class MCPManager {
 
     return new Promise((resolve) => {
       try {
-        const env = { ...process.env, ...(cfg.env || {}) };
+        // HIGH-04: sanitize env vars — block PATH, NODE_OPTIONS, LD_PRELOAD etc.
+        const safeUserEnv = MCPManager.sanitizeEnv(cfg.env || {});
+        const env = { ...process.env, ...safeUserEnv };
+
+        // CRIT-02: shell: false always — args are passed as a list, not a shell string.
+        // This prevents metacharacter injection via cfg.args on all platforms.
         const proc = spawn(cfg.command!, cfg.args || [], {
           env,
           stdio: ['pipe', 'pipe', 'pipe'],
-          shell: process.platform === 'win32',
+          shell: false,  // SECURITY: never true — prevents shell injection via args
         });
 
         session.process = proc;

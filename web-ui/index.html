@@ -2006,6 +2006,7 @@
       <button id="settings-tab-policy" class="sidebar-action" onclick="setSettingsTab('policy')">Agent Policy</button>
       <button id="settings-tab-security" class="sidebar-action" onclick="setSettingsTab('security')">Security</button>
       <button id="settings-tab-models" class="sidebar-action" onclick="setSettingsTab('models')">Models</button>
+      <button id="settings-tab-agents" class="sidebar-action" onclick="setSettingsTab('agents')">Agents</button>
       <button id="settings-tab-channels" class="sidebar-action" onclick="setSettingsTab('channels')">Channels</button>
       <button id="settings-tab-integrations" class="sidebar-action" onclick="setSettingsTab('integrations')">Integrations</button>
     </div>
@@ -2530,6 +2531,98 @@
       </div>
     </div>
 
+    <div id="settings-panel-agents" style="display:none;padding:14px 16px">
+      <div style="display:grid;grid-template-columns:0.9fr 1.1fr;gap:14px">
+        <div style="border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <div class="right-section-title">Configured Agents</div>
+            <button class="btn btn-sm" style="padding:4px 8px" onclick="agentFormNew()">+ New</button>
+          </div>
+          <div id="settings-agents-list" style="display:flex;flex-direction:column;gap:8px;max-height:520px;overflow:auto;font-size:12px;color:var(--muted)">Loading agents...</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div style="border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff">
+            <div class="right-section-title" style="margin-bottom:8px">Agent Details</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+              <div>
+                <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">ID</label>
+                <input id="agent-edit-id" type="text" placeholder="researcher" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;font-family:'IBM Plex Mono',monospace;box-sizing:border-box" />
+              </div>
+              <div>
+                <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">Name</label>
+                <input id="agent-edit-name" type="text" placeholder="Scout" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;box-sizing:border-box" />
+              </div>
+              <div>
+                <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">Emoji</label>
+                <input id="agent-edit-emoji" type="text" placeholder="🔍" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;box-sizing:border-box" />
+              </div>
+              <div>
+                <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">Tool Profile</label>
+                <select id="agent-edit-profile" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;box-sizing:border-box">
+                  <option value="">(inherit)</option>
+                  <option value="minimal">minimal</option>
+                  <option value="coding">coding</option>
+                  <option value="web">web</option>
+                  <option value="full">full</option>
+                </select>
+              </div>
+            </div>
+            <label style="display:block;font-size:11px;color:var(--muted);margin:8px 0 4px">Description</label>
+            <textarea id="agent-edit-description" rows="3" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;box-sizing:border-box;resize:vertical"></textarea>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">
+              <div>
+                <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">Workspace</label>
+                <input id="agent-edit-workspace" type="text" placeholder="D:/SmallClaw/agents/researcher/workspace" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;font-family:'IBM Plex Mono',monospace;box-sizing:border-box" />
+              </div>
+              <div>
+                <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">Model</label>
+                <input id="agent-edit-model" type="text" placeholder="ollama/qwen3:4b" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;font-family:'IBM Plex Mono',monospace;box-sizing:border-box" />
+              </div>
+              <div>
+                <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">Cron Schedule</label>
+                <input id="agent-edit-cron" type="text" placeholder="0 8 * * *" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;font-family:'IBM Plex Mono',monospace;box-sizing:border-box" />
+              </div>
+              <div>
+                <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">Max Steps</label>
+                <input id="agent-edit-max-steps" type="number" min="1" step="1" placeholder="8" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;box-sizing:border-box" />
+              </div>
+            </div>
+            <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;font-size:12px">
+              <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="agent-edit-default" /> default</label>
+              <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="agent-edit-minimal" /> minimalPrompt</label>
+              <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="agent-edit-can-spawn" /> canSpawn</label>
+            </div>
+            <label style="display:block;font-size:11px;color:var(--muted);margin:8px 0 4px">Spawn Allowlist (comma-separated IDs)</label>
+            <input id="agent-edit-spawn-allowlist" type="text" placeholder="researcher,writer" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;font-family:'IBM Plex Mono',monospace;box-sizing:border-box" />
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <button class="btn btn-sm" onclick="saveAgentFromForm()">Save Agent</button>
+              <button class="btn btn-sm" style="background:#fff;border:1px solid var(--line);color:var(--text)" onclick="deleteSelectedAgent()">Delete</button>
+            </div>
+          </div>
+          <div style="border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff">
+            <div class="right-section-title" style="margin-bottom:8px">AGENTS.md (CodeMirror)</div>
+            <div id="agent-md-editor-wrap" style="border:1px solid var(--line);border-radius:8px;overflow:hidden"></div>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <button class="btn btn-sm" style="background:#fff;border:1px solid var(--line);color:var(--text)" onclick="loadSelectedAgentMd()">Reload File</button>
+              <button class="btn btn-sm" onclick="saveSelectedAgentMd()">Save AGENTS.md</button>
+            </div>
+            <div id="agent-md-path" style="margin-top:6px;font-size:11px;color:var(--muted);font-family:'IBM Plex Mono',monospace"></div>
+          </div>
+          <div style="border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff">
+            <div class="right-section-title" style="margin-bottom:8px">Manual Spawn + Run History</div>
+            <label style="display:block;font-size:11px;color:var(--muted);margin-bottom:4px">Task</label>
+            <textarea id="agent-spawn-task" rows="3" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;box-sizing:border-box;resize:vertical" placeholder="Run a one-off task for this agent..."></textarea>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <button class="btn btn-sm" onclick="runSelectedAgentOnce()">Run Once</button>
+              <button class="btn btn-sm" style="background:#fff;border:1px solid var(--line);color:var(--text)" onclick="loadAgentRunHistory()">Refresh History</button>
+            </div>
+            <div id="agent-spawn-result" style="margin-top:8px;font-size:12px;color:var(--muted);white-space:pre-wrap;max-height:120px;overflow:auto"></div>
+            <div id="agent-run-history" style="margin-top:8px;display:flex;flex-direction:column;gap:6px;max-height:170px;overflow:auto;font-size:12px"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div id="settings-panel-integrations" style="display:none;padding:14px 16px">
       <!-- Sub-tab row -->
       <div style="display:flex;gap:8px;margin-bottom:14px">
@@ -2764,6 +2857,9 @@ let currentPreflightStatus = '';
 let currentProgressLines = [];
 let processLogAutoFollow = true;
 let rightColumnAutoFollow = true;
+let agentsConfigList = [];
+let selectedAgentId = '';
+let agentMdEditor = null;
 // (skills cache moved to skillsCache in v2 skills management section)
 let lastHeartbeat = {
   state: 'idle',
@@ -4239,11 +4335,17 @@ function connectWS() {
       }
       // Toast notification for completions and errors
       if (msg.type === 'task_complete') {
-        bgtToast(`? Task complete`, msg.summary ? msg.summary.slice(0,120) : '');
+        bgtToast(`✓ Task complete`, msg.summary ? msg.summary.slice(0,120) : '');
       } else if (msg.type === 'task_failed') {
-        bgtToast(`? Task failed`, msg.error ? msg.error.slice(0,120) : '');
+        bgtToast(`✕ Task failed`, msg.error ? msg.error.slice(0,120) : '');
       } else if (msg.type === 'task_needs_assistance') {
         bgtToast(`Task paused`, msg.reason ? String(msg.reason).slice(0, 120) : 'Needs assistance');
+      }
+    }
+    // Panel-only refresh (frequent tool_call updates — only refresh open panel, not full kanban)
+    if (msg.type === 'task_panel_update') {
+      if (bgtOpenTaskId && msg.taskId === bgtOpenTaskId) {
+        bgtRefreshOpenPanel();
       }
     }
     // Notification from task runner (status push to channel)
@@ -4365,7 +4467,7 @@ function setQuickThinkingEffort(level) {
 
 function setSettingsTab(tab) {
   settingsTab = tab;
-  const tabs = ['system', 'search', 'policy', 'security', 'models', 'channels', 'integrations'];
+  const tabs = ['system', 'search', 'policy', 'security', 'models', 'agents', 'channels', 'integrations'];
   tabs.forEach(t => {
     const btn = document.getElementById(`settings-tab-${t}`);
     const panel = document.getElementById(`settings-panel-${t}`);
@@ -4380,6 +4482,7 @@ function setSettingsTab(tab) {
         panel.style.display = gridTabs.includes(t) ? 'block' : 'block';
         if (t === 'channels') loadChannelsStatus();
         if (t === 'models') loadModelSettings();
+        if (t === 'agents') loadAgentsTab();
         if (t === 'integrations') loadIntegrationsTab();
       } else {
         panel.style.display = 'none';
@@ -4837,6 +4940,280 @@ async function openSettings(tab) {
 
 function closeSettings() {
   document.getElementById('settings-modal').style.display = 'none';
+}
+
+function ensureAgentMdEditor() {
+  if (agentMdEditor || typeof CodeMirror === 'undefined') return;
+  const wrap = document.getElementById('agent-md-editor-wrap');
+  if (!wrap) return;
+  agentMdEditor = CodeMirror(wrap, {
+    value: '',
+    mode: 'markdown',
+    lineNumbers: true,
+    lineWrapping: true,
+    tabSize: 2,
+    indentWithTabs: false,
+    theme: 'default',
+  });
+  agentMdEditor.setSize('100%', 240);
+}
+
+function getAgentFromForm() {
+  const profile = document.getElementById('agent-edit-profile').value.trim();
+  const maxStepsRaw = document.getElementById('agent-edit-max-steps').value;
+  const maxSteps = Number(maxStepsRaw);
+  const spawnAllowlist = (document.getElementById('agent-edit-spawn-allowlist').value || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const agent = {
+    id: document.getElementById('agent-edit-id').value.trim(),
+    name: document.getElementById('agent-edit-name').value.trim(),
+    emoji: document.getElementById('agent-edit-emoji').value.trim(),
+    description: document.getElementById('agent-edit-description').value.trim(),
+    workspace: document.getElementById('agent-edit-workspace').value.trim(),
+    model: document.getElementById('agent-edit-model').value.trim(),
+    cronSchedule: document.getElementById('agent-edit-cron').value.trim(),
+    minimalPrompt: document.getElementById('agent-edit-minimal').checked,
+    default: document.getElementById('agent-edit-default').checked,
+    canSpawn: document.getElementById('agent-edit-can-spawn').checked,
+    spawnAllowlist,
+    tools: {},
+  };
+  if (profile) agent.tools.profile = profile;
+  if (Number.isFinite(maxSteps) && maxSteps > 0) agent.maxSteps = Math.floor(maxSteps);
+  if (!agent.tools.profile) delete agent.tools;
+  if (!agent.spawnAllowlist.length) delete agent.spawnAllowlist;
+  return agent;
+}
+
+function setAgentForm(agent) {
+  const a = agent || {};
+  document.getElementById('agent-edit-id').value = a.id || '';
+  document.getElementById('agent-edit-name').value = a.name || '';
+  document.getElementById('agent-edit-emoji').value = a.emoji || '';
+  document.getElementById('agent-edit-description').value = a.description || '';
+  document.getElementById('agent-edit-workspace').value = a.workspace || '';
+  document.getElementById('agent-edit-model').value = a.model || '';
+  document.getElementById('agent-edit-cron').value = a.cronSchedule || '';
+  document.getElementById('agent-edit-max-steps').value = (a.maxSteps || '') + '';
+  document.getElementById('agent-edit-default').checked = a.default === true;
+  document.getElementById('agent-edit-minimal').checked = a.minimalPrompt === true;
+  document.getElementById('agent-edit-can-spawn').checked = a.canSpawn === true;
+  document.getElementById('agent-edit-spawn-allowlist').value = Array.isArray(a.spawnAllowlist) ? a.spawnAllowlist.join(',') : '';
+  document.getElementById('agent-edit-profile').value = a.tools?.profile || '';
+}
+
+function renderAgentsList() {
+  const el = document.getElementById('settings-agents-list');
+  if (!el) return;
+  if (!agentsConfigList.length) {
+    el.innerHTML = '<div style="color:var(--muted)">No agents found.</div>';
+    return;
+  }
+  el.innerHTML = agentsConfigList.map((a) => {
+    const selected = a.id === selectedAgentId;
+    const lastRun = a.lastRun?.finishedAt ? new Date(a.lastRun.finishedAt).toLocaleString() : 'never';
+    const heartbeat = a.lastHeartbeatAt ? new Date(a.lastHeartbeatAt).toLocaleString() : 'never';
+    const badge = a.default ? '<span style="font-size:10px;padding:2px 6px;border-radius:999px;background:#eaf2ff;color:#0d4faf;border:1px solid #bdd3f6">default</span>' : '';
+    return `
+      <button onclick="selectAgent('${escHtml(a.id)}')" style="text-align:left;border:1px solid ${selected ? '#bdd3f6' : 'var(--line)'};border-radius:10px;padding:8px;background:${selected ? '#f5f9ff' : '#fff'};cursor:pointer">
+        <div style="display:flex;align-items:center;gap:6px">
+          <div style="font-size:15px">${escHtml(a.emoji || '🤖')}</div>
+          <div style="font-weight:700;color:var(--text)">${escHtml(a.name || a.id)}</div>
+          ${badge}
+        </div>
+        <div style="margin-top:4px;font-family:'IBM Plex Mono',monospace;color:var(--muted)">${escHtml(a.id)}</div>
+        <div style="margin-top:4px;font-size:11px;color:var(--muted)">last run: ${escHtml(lastRun)}</div>
+        <div style="font-size:11px;color:var(--muted)">last heartbeat: ${escHtml(heartbeat)}</div>
+      </button>
+    `;
+  }).join('');
+}
+
+function findSelectedAgent() {
+  return agentsConfigList.find(a => a.id === selectedAgentId) || null;
+}
+
+function agentFormNew() {
+  selectedAgentId = '';
+  setAgentForm({
+    id: '',
+    name: '',
+    emoji: '',
+    description: '',
+    workspace: '',
+    model: '',
+    cronSchedule: '',
+    maxSteps: '',
+    default: false,
+    minimalPrompt: true,
+    canSpawn: false,
+    spawnAllowlist: [],
+    tools: {},
+  });
+  if (agentMdEditor) agentMdEditor.setValue('');
+  const mdPath = document.getElementById('agent-md-path');
+  if (mdPath) mdPath.textContent = 'Select or save an agent to load AGENTS.md';
+  const resultEl = document.getElementById('agent-spawn-result');
+  if (resultEl) resultEl.textContent = '';
+  renderAgentsList();
+}
+
+async function selectAgent(id) {
+  selectedAgentId = id;
+  const selected = findSelectedAgent();
+  setAgentForm(selected);
+  renderAgentsList();
+  await loadSelectedAgentMd();
+  await loadAgentRunHistory();
+}
+
+async function loadAgentsTab() {
+  ensureAgentMdEditor();
+  try {
+    const data = await api('/api/agents');
+    agentsConfigList = Array.isArray(data?.agents) ? data.agents : [];
+    if (!selectedAgentId || !agentsConfigList.some(a => a.id === selectedAgentId)) {
+      selectedAgentId = data?.defaultAgentId || agentsConfigList[0]?.id || '';
+    }
+    renderAgentsList();
+    const selected = findSelectedAgent();
+    setAgentForm(selected);
+    if (selected) {
+      await loadSelectedAgentMd();
+      await loadAgentRunHistory();
+    } else {
+      agentFormNew();
+    }
+  } catch (err) {
+    addProcessEntry('error', `Failed to load agents: ${err.message}`);
+  }
+}
+
+async function saveAgentFromForm() {
+  const agent = getAgentFromForm();
+  if (!agent.id) {
+    alert('Agent ID is required');
+    return;
+  }
+  if (!agent.name) {
+    alert('Agent name is required');
+    return;
+  }
+  try {
+    const exists = agentsConfigList.some(a => a.id === agent.id);
+    const endpoint = exists ? `/api/agents/${encodeURIComponent(agent.id)}` : '/api/agents';
+    const method = exists ? 'PUT' : 'POST';
+    const data = await api(endpoint, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent }),
+    });
+    if (!data?.success) throw new Error(data?.error || 'save failed');
+    selectedAgentId = data?.agent?.id || agent.id;
+    addProcessEntry('info', `Agent "${selectedAgentId}" saved.`);
+    await loadAgentsTab();
+  } catch (err) {
+    alert(`Failed to save agent: ${err.message}`);
+  }
+}
+
+async function deleteSelectedAgent() {
+  if (!selectedAgentId) return;
+  if (!confirm(`Delete agent "${selectedAgentId}"?`)) return;
+  try {
+    await api(`/api/agents/${encodeURIComponent(selectedAgentId)}`, { method: 'DELETE' });
+    addProcessEntry('info', `Agent "${selectedAgentId}" deleted.`);
+    selectedAgentId = '';
+    await loadAgentsTab();
+  } catch (err) {
+    alert(`Failed to delete agent: ${err.message}`);
+  }
+}
+
+async function loadSelectedAgentMd() {
+  ensureAgentMdEditor();
+  if (!selectedAgentId || !agentMdEditor) return;
+  try {
+    const data = await api(`/api/agents/${encodeURIComponent(selectedAgentId)}/agents-md`);
+    agentMdEditor.setValue(data?.content || '');
+    const pathEl = document.getElementById('agent-md-path');
+    if (pathEl) pathEl.textContent = data?.path || '';
+  } catch (err) {
+    addProcessEntry('error', `Failed to load AGENTS.md: ${err.message}`);
+  }
+}
+
+async function saveSelectedAgentMd() {
+  if (!selectedAgentId || !agentMdEditor) return;
+  try {
+    const content = agentMdEditor.getValue();
+    await api(`/api/agents/${encodeURIComponent(selectedAgentId)}/agents-md`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    });
+    addProcessEntry('final', `Saved AGENTS.md for "${selectedAgentId}".`);
+  } catch (err) {
+    alert(`Failed to save AGENTS.md: ${err.message}`);
+  }
+}
+
+async function runSelectedAgentOnce() {
+  if (!selectedAgentId) return;
+  const task = (document.getElementById('agent-spawn-task').value || '').trim();
+  if (!task) {
+    alert('Provide a task first.');
+    return;
+  }
+  const out = document.getElementById('agent-spawn-result');
+  if (out) out.textContent = 'Running...';
+  try {
+    const data = await api(`/api/agents/${encodeURIComponent(selectedAgentId)}/spawn`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task }),
+    });
+    const result = data?.result || {};
+    if (out) {
+      const head = result.success ? `Success (${result.durationMs || 0}ms)` : `Failed: ${result.error || 'unknown error'}`;
+      out.textContent = `${head}\n\n${String(result.result || '').slice(0, 2500)}`;
+    }
+    await loadAgentsTab();
+  } catch (err) {
+    if (out) out.textContent = `Run failed: ${err.message}`;
+  }
+}
+
+async function loadAgentRunHistory() {
+  const el = document.getElementById('agent-run-history');
+  if (!el) return;
+  if (!selectedAgentId) { el.innerHTML = ''; return; }
+  try {
+    const data = await api(`/api/agents/history?agentId=${encodeURIComponent(selectedAgentId)}&limit=12`);
+    const rows = Array.isArray(data?.history) ? data.history : [];
+    if (!rows.length) {
+      el.innerHTML = '<div style="color:var(--muted)">No runs yet.</div>';
+      return;
+    }
+    el.innerHTML = rows.map((r) => {
+      const color = r.success ? '#1a6e35' : '#9c1a1a';
+      const when = new Date(r.finishedAt || r.startedAt || Date.now()).toLocaleString();
+      const label = `${r.trigger || 'manual'} • ${r.durationMs || 0}ms`;
+      const preview = String(r.resultPreview || r.error || '').slice(0, 140);
+      return `<div style="border:1px solid var(--line);border-radius:8px;padding:6px 8px">
+        <div style="display:flex;justify-content:space-between;gap:8px">
+          <span style="font-weight:700;color:${color}">${r.success ? 'success' : 'failed'}</span>
+          <span style="font-size:11px;color:var(--muted)">${escHtml(when)}</span>
+        </div>
+        <div style="font-size:11px;color:var(--muted)">${escHtml(label)}</div>
+        <div style="font-size:11px;color:var(--text);margin-top:2px">${escHtml(preview)}</div>
+      </div>`;
+    }).join('');
+  } catch (err) {
+    el.innerHTML = `<div style="color:#9c1a1a">Failed to load history: ${escHtml(err.message)}</div>`;
+  }
 }
 
 // --- Channels Settings Functions ---------------------------------------
@@ -6468,23 +6845,23 @@ document.addEventListener('click', (e) => {
 
 // --- Columns config ---------------------------------------------------------
 const BGT_COLUMNS = [
-  { key: 'running',          label: '? In Progress', color: '#0d4faf', bg: '#eaf2ff' },
-  { key: 'queued',           label: '? Queued',      color: '#7c4d00', bg: '#fff8e1' },
-  { key: 'paused',           label: '? Paused',      color: '#555',    bg: '#f5f5f5' },
-  { key: 'stalled',          label: '? Stalled',     color: '#9c1a1a', bg: '#fff0f0' },
-  { key: 'needs_assistance', label: '🟣 Needs You',  color: '#6d2d9e', bg: '#f5eeff' },
-  { key: 'complete',         label: '? Complete',    color: '#1a6e35', bg: '#efffea' },
-  { key: 'failed',           label: '? Failed',     color: '#9c1a1a', bg: '#fff0f0' },
+  { key: 'running',          label: '● In Progress', color: '#0d4faf', bg: '#eaf2ff' },
+  { key: 'queued',           label: '◷ Queued',      color: '#7c4d00', bg: '#fff8e1' },
+  { key: 'paused',           label: '‖ Paused',      color: '#555',    bg: '#f5f5f5' },
+  { key: 'stalled',          label: '▲ Stalled',     color: '#9c1a1a', bg: '#fff0f0' },
+  { key: 'needs_assistance', label: '⚠️ Needs You',  color: '#6d2d9e', bg: '#f5eeff' },
+  { key: 'complete',         label: '✓ Complete',    color: '#1a6e35', bg: '#efffea' },
+  { key: 'failed',           label: '✕ Failed',      color: '#9c1a1a', bg: '#fff0f0' },
 ];
 
 const STATUS_ICON = {
-  running: '?',
-  queued: '?',
-  paused: '?',
-  stalled: '?',
-  needs_assistance: '??',
-  complete: '?',
-  failed: '?',
+  running: '●',
+  queued: '◷',
+  paused: '‖',
+  stalled: '▲',
+  needs_assistance: '⚠️',
+  complete: '✓',
+  failed: '✕',
 };
 
 // --- Fetch & Render ----------------------------------------------------------
@@ -6517,7 +6894,7 @@ function renderBgTasks() {
   if (hbLabel) {
     const mins = bgtHeartbeatConfig.interval_minutes || 10;
     const on = bgtHeartbeatConfig.enabled;
-    hbLabel.textContent = on ? `? heartbeat: ${mins}min` : '? heartbeat: off';
+    hbLabel.textContent = on ? `• heartbeat: ${mins}min` : '• heartbeat: off';
     hbLabel.style.color = on ? 'var(--brand)' : 'var(--muted)';
   }
 
@@ -6566,7 +6943,7 @@ function bgtCardHTML(t, col) {
   const totalSteps = (t.plan || []).length;
   const pct = totalSteps > 0 ? Math.round(stepsDone / totalSteps * 100) : 0;
   const currentStep = (t.plan || [])[t.currentStepIndex || 0];
-  const channel = t.channel === 'telegram' ? '??' : '??';
+  const channel = t.channel === 'telegram' ? 'Telegram' : 'Web UI';
 
   return `
   <div onclick="openBgtPanel('${escHtml(t.id)}')" data-bgt-id="${escHtml(t.id)}" style="
@@ -6581,7 +6958,7 @@ function bgtCardHTML(t, col) {
           onclick="event.stopPropagation(); bgtDeleteTask('${escHtml(t.id)}', '${escHtml(t.status)}')"
           title="Remove task"
           style="border:1px solid #fca5a5;background:#fff0f0;color:#9c1a1a;border-radius:7px;padding:1px 6px;font-size:11px;font-weight:700;cursor:pointer"
-        >??</button>
+        >✕</button>
         <span style="font-size:14px;flex-shrink:0">${STATUS_ICON[t.status] || '?'}</span>
       </div>
     </div>
@@ -6656,7 +7033,7 @@ async function bgtRefreshOpenPanel() {
 
   // Build plan steps HTML
   const stepsHTML = plan.map((step, i) => {
-    const icon = step.status === 'done' ? '?' : step.status === 'failed' ? '?' : step.status === 'skipped' ? '?' : i === (task.currentStepIndex || 0) && task.status === 'running' ? '?' : '?';
+    const icon = step.status === 'done' ? '✓' : step.status === 'failed' ? '✕' : step.status === 'skipped' ? '↷' : i === (task.currentStepIndex || 0) && task.status === 'running' ? '▶' : '○';
     const isCurrent = i === (task.currentStepIndex || 0) && task.status !== 'complete';
     return `<div style="display:flex;gap:10px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--line);${isCurrent?'background:#f0f5ff;margin:0 -8px;padding:7px 8px;border-radius:6px;':''}"
       title="${step.notes ? escHtml(step.notes) : ''}">
@@ -6681,6 +7058,29 @@ async function bgtRefreshOpenPanel() {
     </div>`;
   }).join('');
 
+  // Build assistance block outside template literal to avoid backtick nesting issues
+  let assistanceHTML = '';
+  const taskStatusNorm = String(task.status || '').trim().toLowerCase();
+  console.log('[BGT panel] task.status =', JSON.stringify(task.status), 'norm =', taskStatusNorm);
+  if (taskStatusNorm === 'needs_assistance' || taskStatusNorm === 'paused' || taskStatusNorm === 'stalled' || taskStatusNorm === 'failed') {
+    const lastPause = [...journal].reverse().find(e => e.type === 'pause' || e.type === 'error');
+    const lastStatusPush = [...journal].reverse().find(e => e.type === 'status_push' && e.content);
+    const pauseMsg = escHtml((lastPause?.content || lastStatusPush?.content || 'Task paused and waiting for input.').replace(/^Task paused for assistance:\s*/i, ''));
+    const pauseDetail = lastPause?.detail ? escHtml(lastPause.detail.slice(0, 300)) : '';
+    const tid = escHtml(task.id);
+    assistanceHTML = '<div style="background:#f5eeff;border:1px solid #cba8f5;border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.6;color:#6d2d9e">'
+      + '<div style="font-weight:800;margin-bottom:6px">⚠️ Task needs your input</div>'
+      + '<div style="color:#3d1a6e;margin-bottom:' + (pauseDetail ? '6px' : '0') + '">' + pauseMsg + '</div>'
+      + (pauseDetail ? '<div style="font-size:11px;color:#6d2d9e;opacity:0.8;margin-bottom:4px">' + pauseDetail + '</div>' : '')
+      + '</div>'
+      + '<div style="border:1px solid #cba8f5;border-radius:10px;overflow:hidden;background:#faf5ff;margin-top:8px">'
+      + '<div style="padding:8px 12px;font-size:11px;font-weight:700;color:#6d2d9e;border-bottom:1px solid #e9d8ff">💬 Reply to agent</div>'
+      + '<div style="display:flex;gap:8px;padding:8px">'
+      + '<textarea id="task-reply-input" rows="2" placeholder="Type your reply — the agent will see this and continue..." style="flex:1;resize:none;border:1px solid #cba8f5;border-radius:8px;padding:8px;font-size:12px;font-family:inherit;background:#fff;color:var(--text)"></textarea>'
+      + '<button id="task-reply-send" data-taskid="' + tid + '" style="background:#7c3aed;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:12px;font-weight:700;cursor:pointer;align-self:flex-end">Send</button>'
+      + '</div></div>';
+  }
+
   body.innerHTML = `
     <!-- Status row -->
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -6691,15 +7091,12 @@ async function bgtRefreshOpenPanel() {
 
     <!-- Summary if complete -->
     ${task.finalSummary ? `<div style="background:#efffea;border:1px solid #b2dfb2;border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.6;color:#1a6e35">
-      <div style="font-weight:800;margin-bottom:4px">? Summary</div>
+      <div style="font-weight:800;margin-bottom:4px">✓ Summary</div>
       ${escHtml(task.finalSummary)}
     </div>` : ''}
 
     <!-- Needs assistance -->
-    ${task.status === 'needs_assistance' ? `<div style="background:#f5eeff;border:1px solid #cba8f5;border-radius:10px;padding:12px 14px;font-size:12px;line-height:1.6;color:#6d2d9e">
-      <div style="font-weight:800;margin-bottom:4px">⚠️ Task needs your input</div>
-      <div>The task has paused and is waiting for guidance. Check the latest journal entries below for context, then use the chat to provide direction.</div>
-    </div>` : ''}
+    ${assistanceHTML}
 
     <!-- Stats row -->
     <div style="display:flex;gap:12px;flex-wrap:wrap">
@@ -6734,6 +7131,22 @@ async function bgtRefreshOpenPanel() {
     ${(task.status === 'complete' || task.status === 'failed') ? `
     <button onclick="bgtDeleteTask('${escHtml(task.id)}')" style="border:1px solid #fca5a5;background:#fff0f0;color:#9c1a1a;border-radius:8px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;align-self:flex-start">Remove</button>` : ''}
   `;
+
+  // Wire up the reply send button via JS (avoids inline onclick escaping issues)
+  const sendBtn = document.getElementById('task-reply-send');
+  if (sendBtn) {
+    sendBtn.addEventListener('click', () => bgtSendReply(sendBtn.dataset.taskid));
+  }
+  // Also allow Enter (without Shift) in the textarea to send
+  const replyInput = document.getElementById('task-reply-input');
+  if (replyInput) {
+    replyInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        bgtSendReply(sendBtn ? sendBtn.dataset.taskid : bgtOpenTaskId);
+      }
+    });
+  }
 }
 
 // --- Actions -----------------------------------------------------------------
@@ -6750,6 +7163,29 @@ async function bgtPauseResume() {
   }
   await refreshBgTasks();
   await bgtRefreshOpenPanel();
+}
+
+async function bgtSendReply(taskId) {
+  const input = document.getElementById('task-reply-input');
+  if (!input) return;
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = '';
+  input.disabled = true;
+  try {
+    const result = await api(`/api/bg-tasks/${taskId}/message`, { method: 'POST', body: JSON.stringify({ message }) });
+    if (result.success) {
+      // Refresh the panel after a short delay to show the journal update
+      setTimeout(() => bgtRefreshOpenPanel(), 800);
+    } else {
+      alert('Failed to send: ' + (result.error || 'unknown error'));
+    }
+  } catch (e) {
+    alert('Error sending message: ' + e.message);
+  } finally {
+    input.disabled = false;
+    input.focus();
+  }
 }
 
 async function bgtDeleteTask(taskId, status) {
@@ -7114,4 +7550,3 @@ function showIntegMsg(msg, color, bg) {
 </script>
 </body>
 </html>
-

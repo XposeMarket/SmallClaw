@@ -10,6 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { getConfig } from '../config/config';
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -20,7 +21,8 @@ export type TaskStatus =
   | 'stalled'
   | 'needs_assistance'
   | 'complete'
-  | 'failed';
+  | 'failed'
+  | 'waiting_subagent';   // parent is blocked waiting for child sub-agents to finish
 
 export type PauseReason =
   | 'preempted_by_chat'
@@ -66,7 +68,10 @@ export interface TaskResumeContext {
     owner: 'primary' | 'secondary';
     touchedFiles: string[];
   };
+  onResumeInstruction?: string;      // injected into parent context when all children complete
 }
+
+export type SubagentProfile = 'file_editor' | 'researcher' | 'shell_runner' | 'reader_only';
 
 export interface TaskRecord {
   id: string;
@@ -75,6 +80,11 @@ export interface TaskRecord {
   sessionId: string;                 // originating chat session
   channel: 'web' | 'telegram';
   telegramChatId?: number;
+
+  // ── Sub-agent fields ─────────────────────────────────────────────────────
+  parentTaskId?: string;             // set if this task was spawned by a parent
+  pendingSubagentIds?: string[];     // child task IDs the parent is waiting on
+  subagentProfile?: SubagentProfile; // restricts tool access for this child task
 
   status: TaskStatus;
   pauseReason?: PauseReason;
@@ -106,8 +116,16 @@ interface TaskIndex {
 
 const TASKS_DIR_NAME = 'tasks';
 
+function getStateBaseDir(): string {
+  try {
+    return getConfig().getConfigDir();
+  } catch {
+    return path.join(process.cwd(), '.smallclaw');
+  }
+}
+
 function getTasksDir(): string {
-  const base = path.join(process.cwd(), '.smallclaw', TASKS_DIR_NAME);
+  const base = path.join(getStateBaseDir(), TASKS_DIR_NAME);
   fs.mkdirSync(base, { recursive: true });
   return base;
 }
@@ -176,6 +194,10 @@ export function createTask(params: {
   channel: 'web' | 'telegram';
   telegramChatId?: number;
   plan: TaskPlanStep[];
+  // Sub-agent fields
+  parentTaskId?: string;
+  subagentProfile?: string;
+  onResumeInstruction?: string;
 }): TaskRecord {
   const id = crypto.randomUUID();
   const now = Date.now();
@@ -189,6 +211,11 @@ export function createTask(params: {
     telegramChatId: params.telegramChatId,
 
     status: 'queued',
+
+    // Sub-agent wiring
+    parentTaskId: params.parentTaskId,
+    pendingSubagentIds: [],
+    subagentProfile: params.subagentProfile as SubagentProfile | undefined,
 
     plan: params.plan,
     currentStepIndex: 0,
@@ -207,6 +234,7 @@ export function createTask(params: {
       browserSessionActive: false,
       round: 0,
       orchestrationLog: [],
+      onResumeInstruction: params.onResumeInstruction,
     },
   };
 
@@ -318,6 +346,60 @@ export function mutatePlan(
   return task;
 }
 
+// ── Sub-Agent Completion ────────────────────────────────────────────────────────────
+
+/**
+ * Called when a child task completes. Removes it from the parent's pending
+ * list and, if all children are done, re-queues the parent to resume.
+ * Returns the parent task (if found) and whether all children finished.
+ */
+export function resolveSubagentCompletion(
+  childTaskId: string,
+  childSummary: string,
+): { parentTask: TaskRecord | null; allChildrenDone: boolean } {
+  const child = loadTask(childTaskId);
+  if (!child?.parentTaskId) return { parentTask: null, allChildrenDone: false };
+
+  const parent = loadTask(child.parentTaskId);
+  if (!parent) return { parentTask: null, allChildrenDone: false };
+
+  // Remove this child from pending list
+  parent.pendingSubagentIds = (parent.pendingSubagentIds || [])
+    .filter(id => id !== childTaskId);
+
+  // Inject sub-agent result into parent's resume messages
+  const resultMessage = {
+    role: 'user',
+    content: `[SUBAGENT RESULT: ${child.title}]\n${childSummary.slice(0, 800)}\n[/SUBAGENT RESULT]`,
+    timestamp: Date.now(),
+  };
+  parent.resumeContext.messages = [
+    ...(parent.resumeContext.messages || []),
+    resultMessage,
+  ].slice(-10); // respect MAX_RESUME_MESSAGES
+
+  const allChildrenDone = (parent.pendingSubagentIds || []).length === 0;
+
+  if (allChildrenDone) {
+    parent.status = 'queued'; // ready to resume — runner will set to 'running'
+    parent.lastProgressAt = Date.now();
+    parent.journal.push({
+      t: Date.now(),
+      type: 'resume',
+      content: `All sub-agents complete. Re-queuing parent task.`,
+    });
+  } else {
+    parent.journal.push({
+      t: Date.now(),
+      type: 'status_push',
+      content: `Sub-agent "${child.title}" finished. Still waiting on ${parent.pendingSubagentIds!.length} child(ren).`,
+    });
+  }
+
+  saveTask(parent);
+  return { parentTask: parent, allChildrenDone };
+}
+
 export function listTasks(filter?: { status?: TaskStatus[] }): TaskRecord[] {
   const idx = loadIndex();
   const tasks: TaskRecord[] = [];
@@ -332,10 +414,44 @@ export function listTasks(filter?: { status?: TaskStatus[] }): TaskRecord[] {
 
 export function deleteTask(id: string): boolean {
   const p = taskFilePath(id);
-  if (!fs.existsSync(p)) return false;
-  fs.unlinkSync(p);
-  removeFromIndex(id);
-  return true;
+  const idx = loadIndex();
+  const inIndex = idx.ids.includes(id);
+  let removedAny = false;
+
+  if (fs.existsSync(p)) {
+    try {
+      fs.unlinkSync(p);
+      removedAny = true;
+    } catch {
+      // best effort; continue cleanup of related artifacts
+    }
+  }
+
+  // Always remove from index to prevent stale list entries.
+  if (inIndex) {
+    removeFromIndex(id);
+    removedAny = true;
+  }
+
+  // Remove related task artifacts created by background execution.
+  const base = getStateBaseDir();
+  const relatedFiles = [
+    path.join(base, 'sessions', `task_${id}.json`),
+    path.join(base, 'jobs', 'file-op-v2', `task_${id}.json`),
+    // Backward-compat for older/alternate checkpoint naming.
+    path.join(base, 'jobs', 'file-op-v2', `${id}.json`),
+  ];
+  for (const file of relatedFiles) {
+    if (!fs.existsSync(file)) continue;
+    try {
+      fs.unlinkSync(file);
+      removedAny = true;
+    } catch {
+      // best effort only
+    }
+  }
+
+  return removedAny;
 }
 
 // ─── Snapshot for heartbeat advisor ────────────────────────────────────────────

@@ -14,6 +14,8 @@ import path from 'path';
 import http from 'http';
 import crypto from 'crypto';
 import { exec } from 'child_process';
+import { getVault } from '../security/vault';
+import { log } from '../security/log-scrubber';
 
 // ─── Constants ──────────────────────────────────────────────────────────────────
 
@@ -107,28 +109,52 @@ function clearFlow(configDir: string) {
   activeFlows.delete(path.resolve(configDir));
 }
 
-// ─── Credential file ────────────────────────────────────────────────────────────
+// ─── Credential storage (vault-backed) ──────────────────────────────────────────
+// Tokens are stored AES-256-GCM encrypted via SecretVault.
+// The legacy plaintext oauth-openai.json is migrated on first load and removed.
 
-function getCredentialsPath(configDir: string): string {
-  const dir = path.join(configDir, 'credentials');
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return path.join(dir, 'oauth-openai.json');
+const VAULT_KEY = 'openai.oauth_tokens';
+
+/** Migrate legacy plaintext credentials file into vault, then delete it */
+function migrateLegacyCredentials(configDir: string): void {
+  const legacyPath = path.join(configDir, 'credentials', 'oauth-openai.json');
+  if (!fs.existsSync(legacyPath)) return;
+  try {
+    const raw  = fs.readFileSync(legacyPath, 'utf-8');
+    const data = JSON.parse(raw) as OAuthTokens;
+    // Validate it looks like tokens before migrating
+    if (!data.access_token || !data.refresh_token) return;
+    getVault(configDir).set(VAULT_KEY, JSON.stringify(data), 'migration:oauth');
+    fs.unlinkSync(legacyPath);
+    log.security('[oauth] Migrated plaintext credentials to vault and removed legacy file');
+  } catch (err) {
+    log.warn('[oauth] Legacy credential migration failed:', String(err));
+  }
 }
 
 export function loadTokens(configDir: string): OAuthTokens | null {
+  migrateLegacyCredentials(configDir);
+  const vault  = getVault(configDir);
+  const secret = vault.get(VAULT_KEY, 'oauth:load');
+  if (!secret) return null;
   try {
-    const p = getCredentialsPath(configDir);
-    if (!fs.existsSync(p)) return null;
-    return JSON.parse(fs.readFileSync(p, 'utf-8'));
-  } catch { return null; }
+    return JSON.parse(secret.expose()) as OAuthTokens;
+  } catch {
+    return null;
+  }
 }
 
 export function saveTokens(configDir: string, tokens: OAuthTokens): void {
-  fs.writeFileSync(getCredentialsPath(configDir), JSON.stringify(tokens, null, 2));
+  // access_token and refresh_token must NEVER appear in any log
+  const vault = getVault(configDir);
+  // 8-hour TTL on storage (tokens have their own expiry tracked inside)
+  vault.set(VAULT_KEY, JSON.stringify(tokens), 'oauth:save', 8 * 60 * 60 * 1000);
+  log.security('[oauth] Tokens saved to vault (account:', tokens.account_id ?? 'unknown', ')');
 }
 
 export function clearTokens(configDir: string): void {
-  try { fs.unlinkSync(getCredentialsPath(configDir)); } catch {}
+  getVault(configDir).delete(VAULT_KEY, 'oauth:clear');
+  log.security('[oauth] Tokens cleared from vault');
 }
 
 export function isConnected(configDir: string): boolean {

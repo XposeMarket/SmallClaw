@@ -1,9 +1,12 @@
 # BOOT.md - SmallClaw Startup Checklist
 
-Check for any background tasks with status paused, stalled, or needs_assistance and list their titles and current step.
+Run these steps in order:
 
-Check today's memory file in the memory/ folder if it exists and note any unresolved items or open loops from yesterday.
+**Step 1:** Call `task_control` to list all tasks:
+`task_control({"action":"list","status":"","include_all_sessions":true,"limit":20})`
 
-List any files in the workspace ending in _tmp or containing TODO in the first 5 lines.
+**Step 2:** Call `list_files` to find today's memory file, then read the most recent one in the `memory/` folder.
 
-Reply with a brief startup summary covering: active tasks needing attention, unresolved memory items, and any tmp files to clean up. Keep it under 5 sentences.
+**Step 3:** Reply in 2-3 sentences: any tasks needing attention, and one line on where things left off. Done.
+
+---

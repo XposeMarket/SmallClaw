@@ -22,13 +22,22 @@ function intEnv(name: string, fallback: number): number {
   return Math.floor(raw);
 }
 
-const PROMPT_BUDGET = {
-  totalChars: intEnv('LOCALCLAW_PROMPT_TOTAL_CHARS', 3600),
-  soulChars: intEnv('LOCALCLAW_PROMPT_SOUL_CHARS', 1400),
-  memoryChars: intEnv('LOCALCLAW_PROMPT_MEMORY_CHARS', 700),
-  skillsTotalChars: intEnv('LOCALCLAW_PROMPT_SKILLS_TOTAL_CHARS', 1400),
-  skillEachChars: intEnv('LOCALCLAW_PROMPT_SKILL_EACH_CHARS', 900),
-  extraChars: intEnv('LOCALCLAW_PROMPT_EXTRA_CHARS', 1000),
+const PROMPT_BUDGET_FULL = {
+  totalChars: intEnv('SMALLCLAW_PROMPT_TOTAL_CHARS', 3600),
+  soulChars: 1400,
+  memoryChars: 700,
+  skillsTotalChars: 1400,
+  skillEachChars: 900,
+  extraChars: 1000,
+};
+
+const PROMPT_BUDGET_MINIMAL = {
+  totalChars: intEnv('SMALLCLAW_SUBAGENT_PROMPT_TOTAL_CHARS', 2000),
+  soulChars: 0,
+  memoryChars: 0,
+  skillsTotalChars: 0,
+  skillEachChars: 0,
+  extraChars: 600,
 };
 
 function clampText(text: string, maxChars: number): string {
@@ -188,11 +197,84 @@ export function selectSkillSlugsForMessage(message: string, max = 2): string[] {
   return scored.slice(0, Math.max(1, Number(max) || 2)).map((x) => x.slug);
 }
 
-export function buildSystemPrompt(options?: {
+export interface BuildSystemPromptOptions {
   includeSkillSlugs?: string[];
   extraInstructions?: string;
   includeMemory?: boolean;
-}): string {
+  /** workspace directory to read bootstrap files from */
+  workspacePath?: string;
+  /**
+   * prompt mode
+   * "full"    = all files injected (main agent / user chat)
+   * "minimal" = only AGENTS.md + TOOLS.md injected (sub-agents)
+   * "none"    = only base identity line
+   */
+  promptMode?: 'full' | 'minimal' | 'none';
+}
+
+export function loadWorkspaceBootstrap(
+  workspacePath: string,
+  promptMode: 'full' | 'minimal' | 'none' = 'full',
+): string {
+  const read = (filename: string): string => {
+    const p = path.join(workspacePath, filename);
+    if (!fs.existsSync(p)) return '';
+    return fs.readFileSync(p, 'utf-8').trim();
+  };
+
+  if (promptMode === 'none') return '';
+
+  const sections: Array<{ label: string; content: string }> = [];
+
+  // AGENTS.md - always injected (defines the agent's job)
+  const agentsMd = read('AGENTS.md');
+  if (agentsMd) sections.push({ label: 'AGENTS.md', content: agentsMd });
+
+  // TOOLS.md - always injected (tool usage notes)
+  const toolsMd = read('TOOLS.md');
+  if (toolsMd) sections.push({ label: 'TOOLS.md', content: toolsMd });
+
+  if (promptMode === 'minimal') {
+    // Sub-agents get AGENTS.md + TOOLS.md only.
+    return sections
+      .map(s => `### ${s.label}\n${clampText(s.content, 4000)}`)
+      .join('\n\n');
+  }
+
+  // Full mode: inject all bootstrap files
+  const fullFiles = [
+    { label: 'SOUL.md', filename: 'SOUL.md' },
+    { label: 'IDENTITY.md', filename: 'IDENTITY.md' },
+    { label: 'USER.md', filename: 'USER.md' },
+    { label: 'MEMORY.md', filename: 'MEMORY.md' },
+    { label: 'HEARTBEAT.md', filename: 'HEARTBEAT.md' },
+  ];
+
+  for (const f of fullFiles) {
+    const content = read(f.filename);
+    if (content) sections.push({ label: f.label, content: clampText(content, 3000) });
+  }
+
+  // Daily memory file
+  const today = new Date().toISOString().slice(0, 10);
+  const dailyPath = path.join(workspacePath, 'memory', `${today}.md`);
+  if (fs.existsSync(dailyPath)) {
+    const daily = fs.readFileSync(dailyPath, 'utf-8').trim();
+    if (daily) sections.push({ label: `memory/${today}.md`, content: clampText(daily, 2000) });
+  }
+
+  if (!sections.length) return '';
+
+  return [
+    '## Project Context',
+    sections.map(s => `### ${s.label}\n${s.content}`).join('\n\n---\n\n'),
+  ].join('\n');
+}
+
+export function buildSystemPrompt(options?: BuildSystemPromptOptions): string {
+  const budget = (options?.promptMode === 'minimal' || options?.promptMode === 'none')
+    ? PROMPT_BUDGET_MINIMAL
+    : PROMPT_BUDGET_FULL;
   const soul = loadSoul();
   const memory = loadMemory();
   const allSkills = loadSkills();
@@ -210,29 +292,36 @@ export function buildSystemPrompt(options?: {
     if (!normalized) return;
     const sep = parts.length ? '\n\n---\n\n' : '';
     const candidate = `${sep}${normalized}`;
-    if (usedChars + candidate.length > PROMPT_BUDGET.totalChars) return;
+    if (usedChars + candidate.length > budget.totalChars) return;
     parts.push(normalized);
     usedChars += candidate.length;
   };
 
-  const soulCapped = clampText(soul, PROMPT_BUDGET.soulChars);
+  const soulCapped = clampText(soul, budget.soulChars);
   if (soulCapped) pushPart(soulCapped);
 
   const includeMemory = options?.includeMemory ?? true;
   if (includeMemory) {
-    const curated = clampText(loadCuratedMemoryProfile(PROMPT_BUDGET.memoryChars), PROMPT_BUDGET.memoryChars);
+    const curated = clampText(loadCuratedMemoryProfile(budget.memoryChars), budget.memoryChars);
     if (curated && !curated.includes('no facts stored')) {
       pushPart(`## Curated Profile Memory\n${curated}`);
     }
+  }
+
+  // If a workspacePath is provided, inject workspace bootstrap files.
+  if (options?.workspacePath) {
+    const mode = options.promptMode ?? 'full';
+    const bootstrap = loadWorkspaceBootstrap(options.workspacePath, mode);
+    if (bootstrap) pushPart(bootstrap);
   }
 
   if (skills.length > 0) {
     const skillDocs: string[] = [];
     let skillUsed = 0;
     for (const s of skills) {
-      const one = `### Skill: ${s.slug}\n${clampText(s.content, PROMPT_BUDGET.skillEachChars)}`.trim();
+      const one = `### Skill: ${s.slug}\n${clampText(s.content, budget.skillEachChars)}`.trim();
       if (!one) continue;
-      if (skillUsed + one.length > PROMPT_BUDGET.skillsTotalChars) break;
+      if (skillUsed + one.length > budget.skillsTotalChars) break;
       skillDocs.push(one);
       skillUsed += one.length;
     }
@@ -240,7 +329,7 @@ export function buildSystemPrompt(options?: {
   }
 
   if (options?.extraInstructions) {
-    pushPart(clampText(options.extraInstructions, PROMPT_BUDGET.extraChars));
+    pushPart(clampText(options.extraInstructions, budget.extraChars));
   }
 
   return parts.join('\n\n---\n\n');

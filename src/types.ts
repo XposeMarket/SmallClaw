@@ -142,6 +142,99 @@ export interface ToolPermissions {
   };
 }
 
+export interface AgentToolPolicy {
+  /** Tool names to explicitly allow (supports "group:fs" shorthands) */
+  allow?: string[];
+  /** Tool names to explicitly deny */
+  deny?: string[];
+  /** Profile shorthand: "minimal" | "coding" | "web" | "full" */
+  profile?: 'minimal' | 'coding' | 'web' | 'full';
+}
+
+export interface AgentDefinition {
+  /** Unique ID for this agent - used in bindings and spawn calls */
+  id: string;
+
+  /** Human-readable name shown in the UI */
+  name: string;
+
+  /** Short description - shown in UI, injected into orchestrator context */
+  description?: string;
+
+  /** Emoji shown in UI and in agent output prefix */
+  emoji?: string;
+
+  /**
+   * Absolute path to this agent's workspace directory.
+   * If omitted, defaults to: <configDir>/../agents/<id>/workspace
+   * The directory will be created automatically if it doesn't exist.
+   */
+  workspace?: string;
+
+  /**
+   * Model override for this agent.
+   * Format: "provider/model" e.g. "ollama/qwen3:4b" or "openai/gpt-4o"
+   * If omitted, uses the global llm.provider + model.
+   */
+  model?: string;
+
+  /** Tool policy for this agent - overrides global tool config */
+  tools?: AgentToolPolicy;
+
+  /**
+   * Whether this agent uses minimal prompt mode.
+   * Minimal = no SOUL.md, no USER.md, no memory, no heartbeat.
+   * Ideal for sub-agents and background specialists.
+   * Default: false for main, true for any agent spawned as a sub-agent.
+   */
+  minimalPrompt?: boolean;
+
+  /**
+   * If true, this agent is the default receiver for user chat sessions.
+   * Only one agent should have default: true.
+   * If none is set, the first agent in the list is used.
+   */
+  default?: boolean;
+
+  /**
+   * Channel bindings - which incoming messages route to this agent.
+   * Simplified version of OpenClaw bindings.
+   * Examples:
+   *   { channel: "telegram", accountId: "default" }
+   *   { channel: "telegram", peerId: "123456789" }
+   */
+  bindings?: Array<{
+    channel: 'telegram' | 'discord' | 'whatsapp';
+    accountId?: string;
+    peerId?: string;
+  }>;
+
+  /**
+   * Cron schedule for autonomous runs (POSIX cron syntax).
+   * e.g. "0 8 * * *" = every day at 8am
+   * Requires heartbeat.enabled = true in config.
+   */
+  cronSchedule?: string;
+
+  /**
+   * Maximum steps the reactor may take per run.
+   * Defaults to global orchestration.maxSteps (8) or 8.
+   */
+  maxSteps?: number;
+
+  /**
+   * Whether this agent can spawn other sub-agents.
+   * Default: false (only the orchestrator should spawn).
+   */
+  canSpawn?: boolean;
+
+  /**
+   * List of agent IDs this agent is allowed to spawn.
+   * If omitted and canSpawn is true, can spawn any agent.
+   */
+  spawnAllowlist?: string[];
+}
+
 // Config Types
 
 export interface SmallClawConfig {
@@ -197,6 +290,12 @@ export interface SmallClawConfig {
   workspace: {
     path: string;
   };
+  /**
+   * Named agent definitions. The first agent with default:true (or the first
+   * entry if none is marked) handles all unrouted user chat messages.
+   * Leave empty to use single-agent mode (original behavior).
+   */
+  agents?: AgentDefinition[];
   session?: {
     maxMessages?: number;
     compactionThreshold?: number;
@@ -292,6 +391,9 @@ export interface SmallClawConfig {
       watchdog_no_progress_cycles?: number;
       checkpointing_enabled?: boolean;
     };
+    // false = conservative 4B delegate_to_specialist (sequential)
+    // true  = full multi-agent subagent_spawn (parallel, Claude Cowork-style)
+    subagent_mode?: boolean;
   };
   hooks?: {
     enabled: boolean;

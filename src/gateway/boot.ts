@@ -1,8 +1,9 @@
 /**
  * boot.ts - Runs BOOT.md at gateway startup.
  *
- * Called by the gateway:startup hook. Reads BOOT.md from the workspace,
- * runs it as a handleChat() turn on an isolated session, and logs the result.
+ * Pre-executes task_control and reads the latest memory file server-side,
+ * then injects the results directly into the boot prompt so the LLM only
+ * needs to summarize — no tool calls required during boot.
  */
 
 import fs from 'fs';
@@ -19,76 +20,83 @@ type HandleChatFn = (
   sendSSE: (event: string, data: any) => void,
 ) => Promise<{ text: string }>;
 
-function buildBootPrompt(instructions: string, strict = false): string {
-  const header = strict
-    ? [
-        'BOOT STARTUP TASK (STRICT):',
-        'You MUST use tools before answering.',
-        'Allowed tools in BOOT mode: list_files, read_file only.',
-        'Required: call list_files once, then call read_file for relevant file(s).',
-        'NEVER call run_command, start_task, browser_*, or desktop_* tools.',
-        'Do not claim files are unavailable unless a tool returned that error.',
-        'After those calls, output the startup summary directly.',
-      ].join('\n')
-    : [
-        'BOOT STARTUP TASK:',
-        'Use tools to inspect workspace/task state before answering.',
-        'Allowed tools in BOOT mode: list_files, read_file only.',
-        'Do not call run_command/start_task/browser_*/desktop_*.',
-        'Prefer one list_files call and targeted read_file calls, then summarize.',
-      ].join('\n');
-  return `${header}\n\n${instructions}`.trim();
+type TaskControlFn = (args: Record<string, any>) => Promise<any>;
+
+/**
+ * Finds the most recent memory file in workspace/memory/
+ */
+function readLatestMemory(workspacePath: string): { filename: string; content: string } | null {
+  const memDir = path.join(workspacePath, 'memory');
+  if (!fs.existsSync(memDir)) return null;
+  const files = fs.readdirSync(memDir)
+    .filter(f => f.endsWith('.md'))
+    .sort()
+    .reverse();
+  if (!files.length) return null;
+  const filename = files[0];
+  const content = fs.readFileSync(path.join(memDir, filename), 'utf-8').trim();
+  return { filename, content: content.slice(-3000) }; // last 3000 chars is enough context
+}
+
+function buildBootPrompt(taskData: string, memoryData: string): string {
+  return [
+    'BOOT STARTUP SUMMARY:',
+    'The following data has already been fetched for you. Do not call any tools.',
+    'Read the data below and reply with a 2-3 sentence startup summary.',
+    '',
+    '## CURRENT TASKS:',
+    taskData || '(no tasks found)',
+    '',
+    '## LATEST MEMORY:',
+    memoryData || '(no memory file found)',
+    '',
+    'Summarize: any tasks needing attention, and one line on where things left off.',
+  ].join('\n').trim();
 }
 
 export async function runBootMd(
   workspacePath: string,
   handleChat: HandleChatFn,
+  taskControl?: TaskControlFn,
 ): Promise<BootResult> {
   const bootPath = path.join(workspacePath, 'BOOT.md');
   if (!fs.existsSync(bootPath)) return { status: 'skipped', reason: 'BOOT.md not found' };
 
-  const raw = fs.readFileSync(bootPath, 'utf-8').trim();
-  if (!raw) return { status: 'skipped', reason: 'BOOT.md is empty' };
-
-  // Strip YAML frontmatter if present.
-  const instructions = raw.replace(/^---[\s\S]*?---\n*/m, '').trim();
-  if (!instructions) return { status: 'skipped', reason: 'BOOT.md has only frontmatter' };
-
   console.log('[boot-md] Running BOOT.md...');
+
   try {
-    let toolCalls = 0;
-    const firstPrompt = buildBootPrompt(instructions, false);
+    // Pre-fetch tasks server-side
+    let taskData = '(task_control unavailable)';
+    if (taskControl) {
+      try {
+        const result = await taskControl({ action: 'list', status: '', include_all_sessions: true, limit: 20 });
+        taskData = JSON.stringify(result, null, 2).slice(0, 2000);
+      } catch (e: any) {
+        taskData = `(task_control error: ${e?.message || 'unknown'})`;
+      }
+    }
+
+    // Pre-fetch latest memory file server-side
+    let memoryData = '(no memory file found)';
+    const mem = readLatestMemory(workspacePath);
+    if (mem) {
+      memoryData = `File: ${mem.filename}\n\n${mem.content}`;
+    }
+
+    // Build prompt with data already injected — LLM just summarizes
+    const prompt = buildBootPrompt(taskData, memoryData);
+
     const result = await handleChat(
-      firstPrompt,
+      prompt,
       'boot-startup',
       (evt, data) => {
         if (evt === 'tool_call') {
-          toolCalls++;
-          console.log(`[boot-md]  -> ${String(data?.action || 'unknown')}`);
-        }
-        if (evt === 'tool_result' && data?.error) {
-          console.warn(`[boot-md]  x ${String(data?.action || 'unknown')}: ${String(data?.result || '').slice(0, 120)}`);
+          console.log(`[boot-md]  -> ${String(data?.action || 'unknown')} (unexpected during boot)`);
         }
       },
     );
 
-    let finalText = String(result.text || '');
-    if (toolCalls === 0) {
-      console.warn('[boot-md] No tool calls detected on first pass. Retrying with strict tool-use prompt...');
-      const strictPrompt = buildBootPrompt(instructions, true);
-      const retry = await handleChat(
-        strictPrompt,
-        'boot-startup',
-        (evt, data) => {
-          if (evt === 'tool_call') console.log(`[boot-md]  -> ${String(data?.action || 'unknown')}`);
-          if (evt === 'tool_result' && data?.error) {
-            console.warn(`[boot-md]  x ${String(data?.action || 'unknown')}: ${String(data?.result || '').slice(0, 120)}`);
-          }
-        },
-      );
-      finalText = String(retry.text || '');
-    }
-
+    const finalText = String(result.text || '');
     console.log(`[boot-md] Done: ${finalText.slice(0, 120)}`);
     return { status: 'ran', reply: finalText };
   } catch (err: any) {

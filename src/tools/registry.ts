@@ -6,6 +6,9 @@ import { memorySearchTool, memoryWriteTool } from './memory.js';
 import { skillListTool, skillSearchTool, skillInstallTool, skillRemoveTool, skillExecTool } from './skills.js';
 import { timeNowTool } from './time.js';
 import { selfUpdateTool } from './self-update.js';
+import { readSourceTool, listSourceTool } from './source-access.js';
+import { proposeRepairTool } from './self-repair.js';
+import { personaReadTool, personaUpdateTool } from './persona.js';
 
 export interface Tool {
   name: string;
@@ -53,6 +56,44 @@ function isToolProfile(value: string): value is ToolProfile {
   return value === 'minimal' || value === 'coding' || value === 'web' || value === 'full';
 }
 
+const spawnAgentTool: Tool = {
+  name: 'spawn_agent',
+  description: 'Spawn a sub-agent to handle a specific task. Returns the agent\'s result.',
+  schema: {
+    agentId: 'ID of the agent to spawn (from config)',
+    task: 'Task description to give the agent',
+    context: 'Optional extra context to inject',
+    maxSteps: 'Max reactor steps (default 8)',
+  },
+  jsonSchema: {
+    type: 'object',
+    properties: {
+      agentId: { type: 'string', description: 'ID of the agent to spawn (from config)' },
+      task: { type: 'string', description: 'Task description to give the agent' },
+      context: { type: 'string', description: 'Optional extra context to inject' },
+      maxSteps: { type: 'number', description: 'Max reactor steps (default 8)' },
+    },
+    required: ['agentId', 'task'],
+    additionalProperties: true,
+  },
+  execute: async (params: any): Promise<ToolResult> => {
+    const { spawnAgent } = await import('../agents/spawner.js');
+    const result = await spawnAgent({
+      agentId: params?.agentId,
+      task: params?.task,
+      context: params?.context,
+      maxSteps: params?.maxSteps,
+    });
+    return {
+      success: result.success,
+      stdout: result.success
+        ? `[${result.agentName}] ${result.result}`
+        : `[${result.agentName}] FAILED: ${result.error}`,
+      data: result,
+    };
+  },
+};
+
 class ToolRegistry {
   private tools: Map<string, Tool> = new Map();
 
@@ -97,6 +138,15 @@ class ToolRegistry {
     this.registerSafe(skillExecTool);
     // Self-update tool
     this.registerSafe(selfUpdateTool);
+    // Self-repair tools (source read + repair proposal)
+    this.registerSafe(readSourceTool);
+    this.registerSafe(listSourceTool);
+    this.registerSafe(proposeRepairTool);
+    // Persona / memory growth tools
+    this.registerSafe(personaReadTool);
+    this.registerSafe(personaUpdateTool);
+    // Multi-agent spawn tool
+    this.registerSafe(spawnAgentTool);
   }
 
   register(tool: Tool): void {
@@ -228,4 +278,3 @@ export function getToolRegistry(): ToolRegistry {
   }
   return registryInstance;
 }
-

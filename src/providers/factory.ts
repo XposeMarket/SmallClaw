@@ -15,6 +15,7 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 import { getConfig } from '../config/config';
+import { log } from '../security/log-scrubber';
 import type { LLMProvider, ProviderID } from './LLMProvider';
 import { OllamaAdapter } from './ollama-adapter';
 import { OpenAICompatAdapter } from './openai-compat-adapter';
@@ -146,7 +147,7 @@ function buildProvider(id: ProviderID, providers: any): LLMProvider {
     }
 
     default:
-      console.warn(`[Provider] Unknown provider "${id}", falling back to Ollama`);
+      log.warn(`[Provider] Unknown provider "${id}", falling back to Ollama`);
       return new OllamaAdapter('http://localhost:11434');
   }
 }

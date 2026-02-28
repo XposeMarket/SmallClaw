@@ -269,12 +269,24 @@ public static class SmallClawInputApi {
 async function focusWindowHandle(handle: number): Promise<boolean> {
   const h = Number(handle || 0);
   if (!Number.isFinite(h) || h === 0) return false;
+  // Windows restricts SetForegroundWindow from background processes.
+  // Workaround: simulate a key press to acquire foreground rights, then focus.
   const script = `
 ${PS_WINAPI_HEADER}
 $hWnd = [IntPtr]::new([Int64]${h})
+# Restore if minimized
 [void][SmallClawWinApi]::ShowWindowAsync($hWnd, 9)
-Start-Sleep -Milliseconds 120
+Start-Sleep -Milliseconds 150
+# Simulate Alt keypress to bypass foreground lock
+$wsh = New-Object -ComObject WScript.Shell
+$wsh.SendKeys('%')
+Start-Sleep -Milliseconds 80
 $ok = [SmallClawWinApi]::SetForegroundWindow($hWnd)
+if (-not $ok) {
+  # Fallback: use AppActivate by handle's PID
+  $procs = Get-Process | Where-Object { $_.MainWindowHandle -eq $hWnd }
+  if ($procs) { $wsh.AppActivate($procs[0].Id) | Out-Null; $ok = $true }
+}
 if ($ok) { Write-Output "OK" } else { Write-Output "FAIL" }
 `;
   const out = await runPowerShell(script, { timeoutMs: 9000 });

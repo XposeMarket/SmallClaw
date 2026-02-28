@@ -844,10 +844,13 @@ Authorization context:
 - Do NOT classify normal local browser automation requests as disallowed remote control.
 
 Routing policy — choose the FIRST that matches:
-- background_task: USE THIS for ANY request that requires tools, browser automation, file operations, code editing, running commands, or interacting with any external app or website. Also use for multi-turn AI conversations, overnight monitoring, or open-ended autonomous work. If in doubt and tools would be needed — background_task.
+- primary_direct: task management operations (delete/cancel/pause/resume/list tasks, check task status). These MUST NEVER be background_task — they are quick inline tool calls.
+- background_task: USE THIS for ANY request that requires tools, browser automation, file operations, code editing, running commands, or interacting with any external app or website. Also use for research, "look into", "find out", "while I'm away", "in the background", "go ahead and" requests. If in doubt and tools would be needed — background_task.
 - primary_direct: simple conversational message, no tools, no execution — pure text response only
 
 Critical rules:
+- NEVER create a background_task just to manage other tasks. delete/cancel/pause/resume/list → primary_direct ALWAYS.
+- ANY research, browsing, or multi-step work → ALWAYS background_task, even if the message is short.
 - If the task touches a file, a browser, a terminal, a desktop app, or another AI → ALWAYS background_task, no exceptions.
 - primary_with_plan is RETIRED — do not use it. Use background_task for all tool-requiring work.
 - secondary_chat is DISABLED in runtime for this session.
@@ -893,11 +896,14 @@ Authorization context:
 - Do NOT classify normal local browser automation requests as disallowed remote control.
 
 Routing policy — choose the FIRST that matches:
-- background_task: USE THIS for ANY request that requires tools, browser automation, file operations, code editing, running commands, or interacting with any external app or website. Also use for multi-turn AI conversations, overnight monitoring, or open-ended autonomous work. If in doubt and tools would be needed — background_task.
+- primary_direct: task management operations (delete/cancel/pause/resume/list tasks, check task status, "any tasks paused?", "what tasks are running?"). These MUST NEVER be background_task or secondary_chat — they require task_control tool calls that only the primary executor can make.
 - secondary_chat: greetings, small talk, simple factual questions, anything you can answer directly in 1-2 sentences with NO tools. Use this aggressively — it is the fastest route.
+- background_task: USE THIS for ANY request that requires tools, browser automation, file operations, code editing, running commands, or interacting with any external app or website. Also use for research, "look into", "find out", "while I'm away", "in the background", "go ahead and" requests. If in doubt and tools would be needed — background_task.
 - primary_direct: fallback for conversational messages that need primary model reasoning but NO tools
 
 Critical rules:
+- NEVER create a background_task just to manage other tasks. delete/cancel/pause/resume/list/check tasks → primary_direct ALWAYS. secondary_chat cannot call tools.
+- ANY research, browsing, or multi-step work → ALWAYS background_task, even if the message is short.
 - If the task touches a file, a browser, a terminal, a desktop app, or another AI → ALWAYS background_task, no exceptions.
 - Greetings ("hey", "hi", "hello", "what's up", "how are you") → ALWAYS secondary_chat. Fill secondary_response with a friendly 1-sentence reply.
 - primary_with_plan is RETIRED — do not use it. Use background_task for all tool-requiring work.
@@ -2210,5 +2216,130 @@ export function formatDesktopAdvisorHint(advice: DesktopAdvisorResult): string {
   }
   lines.push('[/DESKTOP ADVISOR]');
   return lines.join('\n');
+}
+
+// ─── Task Step Auditor ───────────────────────────────────────────────────────
+
+export interface TaskStepAuditResult {
+  /** Step indices (0-based) that are evidenced as complete by this round's tool calls. */
+  completed_steps: number[];
+  /** Per-step rationale keyed by step index. */
+  notes: Record<number, string>;
+  raw_response?: string;
+}
+
+const TASK_STEP_AUDITOR_SYSTEM = `You are a task step completion auditor.
+
+An autonomous agent just finished a round of work. You receive:
+- The full task plan (numbered steps)
+- Every tool call the agent made this round, and the data each tool returned
+- The agent's final summary text
+
+Your job: decide which plan steps are NOW COMPLETE based solely on what the tool calls actually DID and RETURNED.
+Do NOT mark a step complete just because the agent mentioned it in text — only mark it complete if the tool call evidence directly proves it.
+
+Return ONLY JSON:
+{
+  "completed_steps": [0, 2],
+  "notes": {
+    "0": "browser_open returned page title 'X / Twitter' confirming browser opened",
+    "2": "browser_snapshot showed login wall — step asks to check login state, confirmed not logged in"
+  }
+}
+
+Rules:
+- completed_steps: array of 0-based step indices that are proven complete
+- notes: one short sentence per completed step explaining which tool call/result proved it
+- Be conservative — if there is any doubt, do NOT include the step
+- An empty completed_steps array is a valid and sometimes correct answer
+- Return JSON only`;
+
+/**
+ * Calls the secondary model to audit which plan steps were completed during
+ * a background task round, based on actual tool call evidence — not guesses.
+ *
+ * @param input.pendingSteps  Steps still pending at the start of the round (index + description)
+ * @param input.toolCallLog   Tool calls + results captured during the round
+ * @param input.resultText    The agent's final answer/summary text from the round
+ */
+export async function callSecondaryTaskStepAuditor(input: {
+  pendingSteps: Array<{ index: number; description: string }>;
+  toolCallLog: Array<{ tool: string; args: any; result: string; error: boolean }>;
+  resultText: string;
+}): Promise<TaskStepAuditResult | null> {
+  const built = await buildSecondaryProvider();
+  if (!built) return null;
+  const { provider, config } = built;
+
+  if (!input.pendingSteps.length) return { completed_steps: [], notes: {} };
+
+  const stepsText = input.pendingSteps
+    .map(s => `Step ${s.index} (0-based): ${String(s.description || '').slice(0, 300)}`)
+    .join('\n');
+
+  const toolCallText = input.toolCallLog
+    .slice(0, 30)
+    .map((t, i) => {
+      let argsText = '';
+      try { argsText = JSON.stringify(t.args ?? {}).slice(0, 300); } catch { argsText = '{}'; }
+      const resultText = String(t.result || '').replace(/\r/g, '').trim().slice(0, 800);
+      const status = t.error ? 'FAIL' : 'OK';
+      return `${i + 1}. [${status}] ${String(t.tool || 'unknown')}(${argsText})\nResult: ${resultText || '(empty)'}`;
+    })
+    .join('\n\n');
+
+  const prompt = `PENDING PLAN STEPS (0-based indices):
+${stepsText}
+
+TOOL CALLS MADE THIS ROUND:
+${toolCallText || '(none)'}
+
+AGENT FINAL SUMMARY:
+${String(input.resultText || '').slice(0, 800)}
+
+Return step audit JSON now.`;
+
+  try {
+    const result = await provider.chat(
+      [
+        { role: 'system', content: TASK_STEP_AUDITOR_SYSTEM },
+        { role: 'user', content: prompt },
+      ],
+      config.secondary.model,
+      { max_tokens: 600 },
+    );
+
+    const rawResponse = contentToString(result.message.content).trim();
+    const parsed = parseJsonObject(rawResponse);
+    if (!parsed) return null;
+
+    // Parse and validate completed_steps — only accept indices that are actually pending
+    const pendingIndices = new Set(input.pendingSteps.map(s => s.index));
+    const completed_steps: number[] = [];
+    if (Array.isArray(parsed.completed_steps)) {
+      for (const v of parsed.completed_steps) {
+        const idx = Number(v);
+        if (Number.isFinite(idx) && pendingIndices.has(Math.floor(idx))) {
+          completed_steps.push(Math.floor(idx));
+        }
+      }
+    }
+
+    // Parse per-step notes
+    const notes: Record<number, string> = {};
+    if (parsed.notes && typeof parsed.notes === 'object') {
+      for (const [k, v] of Object.entries(parsed.notes)) {
+        const idx = Number(k);
+        if (Number.isFinite(idx) && pendingIndices.has(Math.floor(idx))) {
+          notes[Math.floor(idx)] = String(v || '').slice(0, 300);
+        }
+      }
+    }
+
+    return { completed_steps, notes, raw_response: rawResponse.slice(0, 3000) };
+  } catch (err: any) {
+    console.error('[Orchestrator] Task step auditor failed:', err.message);
+    return null;
+  }
 }
 

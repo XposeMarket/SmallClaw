@@ -9,7 +9,7 @@ import { stdin as input, stdout as output } from 'process';
 import { getConfig } from '../config/config';
 import { getDatabase } from '../db/database';
 import { getOllamaClient } from '../agents/ollama-client';
-import { AgentOrchestrator } from '../gateway/orchestrator';
+// AgentOrchestrator removed — legacy pipeline superseded by reactor + multi-agent orchestration
 
 const program = new Command();
 
@@ -373,20 +373,20 @@ program
   .command('onboard')
   .description('Setup SmallClaw for first-time use')
   .action(async () => {
-    console.log('ðŸ¦ž Welcome to SmallClaw!\n');
+    console.log('Welcome to SmallClaw!\n');
     const config = getConfig();
     config.ensureDirectories();
     config.saveConfig();
-    console.log('âœ” Created configuration directories');
+    console.log('Created configuration directories');
     console.log(`  Config:    ${config.getConfigDir()}`);
     console.log(`  Workspace: ${config.getWorkspacePath()}`);
     getDatabase();
-    console.log('âœ” Initialized job database\n');
-    console.log('âœ¨ SmallClaw is ready!');
+    console.log('Initialized job database\n');
+    console.log('SmallClaw is ready!');
     console.log('\nNext steps:');
     console.log('  1. Start the gateway:  smallclaw gateway start');
     console.log('  2. Open browser:       http://localhost:18789');
-    console.log('  3. Go to Settings â†’ Models to configure your LLM provider');
+    console.log('  3. Go to Settings -> Models to configure your LLM provider');
   });
 
 // ---- GATEWAY ----
@@ -396,7 +396,7 @@ gateway
   .command('start')
   .description('Start the gateway + web UI server')
   .action(async () => {
-    console.log('ðŸ¦ž SmallClaw Gateway starting...\n');
+    console.log('SmallClaw Gateway starting...\n');
     maybeNotifyUpdate();
     try {
       const res = await fetch('http://127.0.0.1:18789/api/status', {
@@ -431,45 +431,15 @@ gateway
 // ---- AGENT ----
 program
   .command('agent <mission>')
-  .description('Execute a mission directly from CLI')
+  .description('Run a mission via the gateway (starts gateway if needed)')
   .option('-p, --priority <number>', 'Job priority', '0')
-  .action(async (mission: string, options: any) => {
-    console.log('ðŸ¦ž SmallClaw Agent');
+  .action(async (mission: string) => {
+    console.log('SmallClaw Agent');
     console.log(`Mission: ${mission}\n`);
-
-    const orchestrator = new AgentOrchestrator();
-    const jobId = await orchestrator.executeJob(mission, {
-      priority: parseInt(options.priority)
-    });
-
-    console.log(`Job ID: ${jobId}`);
-    console.log('Running... (Ctrl+C to stop monitoring, job continues in background)\n');
-
-    let lastStatus = '';
-    const interval = setInterval(() => {
-      const job = orchestrator.getJobStatus(jobId);
-      if (!job) return;
-
-      if (job.status !== lastStatus) {
-        lastStatus = job.status;
-        const icons: Record<string, string> = {
-          planning: 'ðŸ“‹', executing: 'âš™ï¸', verifying: 'ðŸ”',
-          completed: 'âœ…', failed: 'âŒ', needs_approval: 'âš ï¸'
-        };
-        console.log(`${icons[job.status] || 'â†’'} Status: ${job.status}`);
-      }
-
-      if (job.status === 'completed' || job.status === 'failed') {
-        clearInterval(interval);
-        const tasks = orchestrator.getJobTasks(jobId);
-        const done = tasks.filter(t => t.status === 'completed').length;
-        console.log(`\nFinished: ${done}/${tasks.length} tasks completed`);
-        if (job.status === 'completed') {
-          console.log(`\nWorkspace: ${getConfig().getWorkspacePath()}`);
-        }
-        process.exit(job.status === 'completed' ? 0 : 1);
-      }
-    }, 1500);
+    console.log('The CLI agent command now routes through the gateway.');
+    console.log('Start the gateway and send your mission via the web UI or Telegram.');
+    console.log('\n  smallclaw gateway start');
+    console.log('  http://localhost:18789');
   });
 
 // ---- JOBS ----
@@ -499,7 +469,7 @@ jobs
     console.log(`Status: ${job.status}`);
     const tasks = db.listTasksForJob(id);
     console.log(`\nTasks (${tasks.length}):`);
-    tasks.forEach(t => console.log(`  [${t.status}] ${t.title}`));
+    tasks.forEach((t: any) => console.log(`  [${t.status}] ${t.title}`));
   });
 
 // ---- MODEL ----
@@ -519,31 +489,31 @@ model.command('set <n>').action((name: string) => {
   const cfg = getConfig();
   const c = cfg.getConfig();
   cfg.updateConfig({ ...c, models: { ...c.models, primary: name, roles: { manager: name, executor: name, verifier: name } } });
-  console.log(`âœ” Model set to: ${name}`);
+  console.log(`Model set to: ${name}`);
 });
 
 // ---- DOCTOR ----
 program.command('doctor').action(async () => {
-  console.log('ðŸ©º SmallClaw Health Check\n');
+  console.log('SmallClaw Health Check\n');
   const cfg = getConfig().getConfig() as any;
   const provider = cfg.llm?.provider || 'ollama';
   console.log(`Provider:  ${provider}`);
   const ollama = getOllamaClient();
   const connected = await ollama.testConnection();
-  console.log(`Backend:   ${connected ? 'âœ” Online' : 'âœ— Offline'}`);
+  console.log(`Backend:   ${connected ? 'Online' : 'Offline'}`);
   if (connected) {
     const models = await ollama.listModels();
     console.log(`Models:    ${models.length} available`);
   }
   const db = getDatabase();
   const jobCount = db.listJobs().length;
-  console.log(`Database:  âœ” ${jobCount} jobs stored`);
+  console.log(`Database:  ${jobCount} jobs stored`);
   console.log(`Workspace: ${getConfig().getWorkspacePath()}`);
   try {
     await fetch('http://localhost:18789/api/status');
-    console.log(`Gateway:   âœ” Online â†’ http://localhost:18789`);
+    console.log(`Gateway:   Online -> http://localhost:18789`);
   } catch {
-    console.log(`Gateway:   âœ— Offline (run: smallclaw gateway start)`);
+    console.log(`Gateway:   Offline (run: smallclaw gateway start)`);
   }
 });
 
@@ -602,4 +572,3 @@ program
   });
 
 program.parse();
-

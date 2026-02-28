@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { SmallClawConfig } from '../types.js';
+import { AgentDefinition, SmallClawConfig } from '../types.js';
+import { getVault, scrubSecrets } from '../security/vault.js';
 
 function migrateLegacyDir(legacyDir: string, targetDir: string): void {
   try {
@@ -162,6 +163,7 @@ export const DEFAULT_CONFIG: SmallClawConfig = {
   workspace: {
     path: WORKSPACE_DIR
   },
+  agents: [] as AgentDefinition[],
   session: {
     maxMessages: 120,
     compactionThreshold: 0.7,
@@ -219,7 +221,7 @@ export const DEFAULT_CONFIG: SmallClawConfig = {
     browser: {
       max_advisor_calls_per_turn: 5,
       max_collected_items: 80,
-      max_forced_retries: 2,
+      max_forced_retries: 0,
       min_feed_items_before_answer: 12,
     },
     preempt: {
@@ -242,6 +244,9 @@ export const DEFAULT_CONFIG: SmallClawConfig = {
       watchdog_no_progress_cycles: 3,
       checkpointing_enabled: true,
     },
+    // Sub-agent mode: false = conservative 4B specialist delegates (sequential)
+    // true = full Claude Cowork-style free-form parallel spawn
+    subagent_mode: false,
   },
   hooks: {
     enabled: false,
@@ -264,6 +269,66 @@ function normalizeLegacyPathsInConfig(loaded: any): any {
   }
 
   return out;
+}
+
+// ─── Secret fields that must never live in config.json plaintext ─────────────
+// Format: [ dotted.path.in.config, vault key name ]
+// On saveConfig(), any of these found as plain strings are moved to the vault
+// and replaced with a "vault:<key>" reference.
+const SECRET_FIELD_MAP: Array<[string[], string]> = [
+  [['gateway', 'auth', 'token'],                  'gateway.auth_token'],
+  [['channels', 'telegram', 'botToken'],          'channels.telegram.botToken'],
+  [['channels', 'discord', 'botToken'],           'channels.discord.botToken'],
+  [['channels', 'whatsapp', 'accessToken'],       'channels.whatsapp.accessToken'],
+  [['channels', 'whatsapp', 'webhookSecret'],     'channels.whatsapp.webhookSecret'],
+  [['search', 'tavily_api_key'],                  'search.tavily_api_key'],
+  [['search', 'google_api_key'],                  'search.google_api_key'],
+  [['search', 'brave_api_key'],                   'search.brave_api_key'],
+  [['llm', 'providers', 'openai', 'api_key'],     'llm.openai.api_key'],
+  [['llm', 'providers', 'lm_studio', 'api_key'],  'llm.lm_studio.api_key'],
+  [['hooks', 'token'],                             'hooks.token'],
+];
+
+function deepGet(obj: any, keys: string[]): string | undefined {
+  let cur = obj;
+  for (const k of keys) {
+    if (cur == null || typeof cur !== 'object') return undefined;
+    cur = cur[k];
+  }
+  return typeof cur === 'string' ? cur : undefined;
+}
+
+function deepSet(obj: any, keys: string[], value: string): void {
+  let cur = obj;
+  for (let i = 0; i < keys.length - 1; i++) {
+    if (cur[keys[i]] == null) cur[keys[i]] = {};
+    cur = cur[keys[i]];
+  }
+  cur[keys[keys.length - 1]] = value;
+}
+
+/**
+ * Scan the config object for plaintext secrets.
+ * Any found are stored in the vault and replaced with a "vault:<key>" reference.
+ * Returns a safe copy of the config suitable for writing to disk.
+ */
+function migrateSecretsToVault(config: any, configDir: string): any {
+  const copy = JSON.parse(JSON.stringify(config)); // deep clone
+  const vault = getVault(configDir);
+
+  for (const [fieldPath, vaultKey] of SECRET_FIELD_MAP) {
+    const value = deepGet(copy, fieldPath);
+    if (!value) continue;
+    // Skip if already a vault reference or env: reference
+    if (value.startsWith('vault:') || value.startsWith('env:')) continue;
+    // Skip masked placeholder from UI
+    if (value === '••••••••') continue;
+    // It's a real plaintext secret — move it to vault
+    vault.set(vaultKey, value, 'config:migrate');
+    deepSet(copy, fieldPath, `vault:${vaultKey}`);
+  }
+
+  return copy;
 }
 
 export class ConfigManager {
@@ -328,16 +393,32 @@ export class ConfigManager {
 
   public saveConfig(): void {
     try {
-      // Ensure config directory exists
       if (!fs.existsSync(CONFIG_DIR)) {
         fs.mkdirSync(CONFIG_DIR, { recursive: true });
       }
-      
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(this.config, null, 2));
+      // Before writing, migrate any plaintext secrets to the vault
+      // so they are never stored in config.json going forward.
+      const sanitized = migrateSecretsToVault(this.config, CONFIG_DIR);
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(sanitized, null, 2));
     } catch (error) {
       console.error('Failed to save config:', error);
       throw error;
     }
+  }
+
+  /**
+   * Resolve a config value that may be a vault reference.
+   * Values stored as "vault:<key>" are decrypted on demand.
+   * Plain strings are returned as-is.
+   */
+  public resolveSecret(value: string | undefined): string | undefined {
+    if (!value) return value;
+    if (value.startsWith('vault:')) {
+      const vaultKey = value.slice(6);
+      const secret = getVault(CONFIG_DIR).get(vaultKey, 'config:resolve');
+      return secret ? secret.expose() : undefined;
+    }
+    return value;
   }
 
   public ensureDirectories(): void {
@@ -378,4 +459,99 @@ export function getConfig(): ConfigManager {
     configInstance = new ConfigManager();
   }
   return configInstance;
+}
+
+/**
+ * Returns the resolved workspace path for a given agent definition.
+ * If the agent has an explicit workspace, use it.
+ * Otherwise derive from configDir/agents/<id>/workspace.
+ */
+export function resolveAgentWorkspace(agent: AgentDefinition): string {
+  if (agent.workspace) return agent.workspace;
+  return path.join(CONFIG_DIR, 'agents', agent.id, 'workspace');
+}
+
+/**
+ * Returns all configured agents. If none are defined, returns a synthetic
+ * "main" agent using the global workspace path - backward-compatible.
+ */
+export function getAgents(): AgentDefinition[] {
+  const cfg = getConfig().getConfig();
+  const defined = Array.isArray(cfg.agents) ? cfg.agents : [];
+  if (defined.length > 0) return defined;
+  // Fallback: single main agent using legacy workspace
+  return [{
+    id: 'main',
+    name: 'Main',
+    description: 'Default assistant',
+    default: true,
+    workspace: cfg.workspace.path,
+  }];
+}
+
+/**
+ * Returns the default agent (the one that handles user chat).
+ */
+export function getDefaultAgent(): AgentDefinition {
+  const agents = getAgents();
+  return agents.find(a => a.default) ?? agents[0];
+}
+
+/**
+ * Returns a specific agent by ID, or null if not found.
+ */
+export function getAgentById(id: string): AgentDefinition | null {
+  return getAgents().find(a => a.id === id) ?? null;
+}
+
+/**
+ * Ensures the workspace directory exists for an agent.
+ * Also bootstraps missing AGENTS.md with a blank template if the
+ * workspace is brand new.
+ */
+export function ensureAgentWorkspace(agent: AgentDefinition): string {
+  const ws = resolveAgentWorkspace(agent);
+  if (!fs.existsSync(ws)) {
+    fs.mkdirSync(ws, { recursive: true });
+    // Bootstrap blank AGENTS.md so the agent has instructions to follow
+    const agentsMd = path.join(ws, 'AGENTS.md');
+    if (!fs.existsSync(agentsMd)) {
+      fs.writeFileSync(agentsMd, [
+        `# AGENTS.md - ${agent.name}`,
+        '',
+        '## Role',
+        agent.description ?? 'No description set. Update this file to define your role.',
+        '',
+        '## Instructions',
+        '- Describe what this agent should do here.',
+        '- Be specific about output format expected by the orchestrator.',
+        '- List tools this agent is allowed to use.',
+        '',
+        '## Output Format',
+        'Return a concise summary of what was accomplished.',
+      ].join('\n'), 'utf-8');
+    }
+
+    const heartbeatMd = path.join(ws, 'HEARTBEAT.md');
+    if (!fs.existsSync(heartbeatMd)) {
+      fs.writeFileSync(heartbeatMd, [
+        `# HEARTBEAT.md - ${agent.name}`,
+        '',
+        '## What to do when woken by the scheduler',
+        '',
+        'Edit this file to define autonomous tasks for this agent.',
+        '',
+        '## Example Tasks',
+        '- Check for new trends in [topic] and write a brief to workspace/reports/',
+        '- Post a draft to workspace/drafts/ for human review',
+        '- Update MEMORY.md with anything new learned',
+        '',
+        '## Rules',
+        '- Always write outputs to files, never just respond in chat',
+        '- If nothing to do, write a short journal entry to memory/YYYY-MM-DD.md',
+        '- Keep runs under 5 minutes',
+      ].join('\n'), 'utf-8');
+    }
+  }
+  return ws;
 }

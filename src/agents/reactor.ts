@@ -46,6 +46,8 @@ export interface ReactOptions {
   formatViolationFuse?: number;
   nativeOnly?: boolean; // kept for API compat, ignored — node_call is always primary now
   toolProfile?: ToolProfile;
+  promptMode?: 'full' | 'minimal' | 'none';
+  workspacePath?: string;
 }
 
 // Detect FINAL: in model response
@@ -372,8 +374,10 @@ function buildNodeCallSystemPrompt(
     : selectSkillSlugsForMessage(userMessage, 2);
   const soul = buildSystemPrompt({
     includeSkillSlugs: selectedSkillSlugs,
-    includeMemory: false,
+    includeMemory: options.promptMode !== 'minimal',
     extraInstructions: options.extraInstructions,
+    workspacePath: workspacePath,
+    promptMode: options.promptMode ?? 'full',
   });
   const toolProfileBlock = toolSchemas.trim()
     ? `TOOL PROFILE: ${toolProfile}\nAVAILABLE TOOLS:\n${toolSchemas}\n`
@@ -591,9 +595,9 @@ export class Reactor {
       // Dynamic import to avoid circular dep issues at module load time
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { getConfig } = require('../config/config.js');
-      workspacePath = String(getConfig().getConfig()?.workspace?.path || process.cwd());
+      workspacePath = String(options.workspacePath || getConfig().getConfig()?.workspace?.path || process.cwd());
     } catch {
-      workspacePath = process.cwd();
+      workspacePath = String(options.workspacePath || process.cwd());
     }
 
     const primaryUserMessage = extractPrimaryUserMessage(userMessage);

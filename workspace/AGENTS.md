@@ -4,13 +4,11 @@ This folder is home. Treat it that way.
 
 ## Every Session
 
-Before doing anything else:
-1. Read `SOUL.md` — this is who you are
-2. Read `USER.md` — this is who you're helping
-3. Read today's `memory/YYYY-MM-DD.md` for recent context
-4. Check `MEMORY.md` for long-term context
+For regular chat sessions, read these before responding:
+1. Read `USER.md` — this is who you're helping
+2. Read today's `memory/YYYY-MM-DD.md` for recent context
 
-Don't ask permission. Just do it.
+Do NOT do this during boot-startup — BOOT.md handles that separately. Do NOT call list_files as part of startup.
 
 ## Memory
 

@@ -12,9 +12,17 @@ import cors from 'cors';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import { getConfig } from '../config/config';
+import {
+  getConfig,
+  getAgents,
+  getAgentById,
+  ensureAgentWorkspace,
+  resolveAgentWorkspace,
+} from '../config/config';
 import { getOllamaClient } from '../agents/ollama-client';
+import { spawnAgent } from '../agents/spawner';
 import { getSession, addMessage, getHistory, getHistoryForApiCall, getWorkspace, setWorkspace, clearHistory, cleanupSessions } from './session';
 import { hookBus } from './hooks';
 import { loadWorkspaceHooks } from './hook-loader';
@@ -50,6 +58,14 @@ import {
 } from './desktop-tools';
 import { CronScheduler } from './cron-scheduler';
 import { HeartbeatRunner } from './heartbeat-runner';
+import {
+  initializeAgentSchedules,
+  reloadAgentSchedules,
+  stopAgentSchedules,
+  getAgentRunHistory,
+  getAgentLastRun,
+  recordAgentRun,
+} from '../scheduler';
 import { TelegramChannel } from './telegram-channel';
 import {
   OrchestrationTriggerState,
@@ -118,14 +134,38 @@ const config = getConfig().getConfig();
 const CONFIG_DIR_PATH = getConfig().getConfigDir();
 const PORT = config.gateway.port || 18789;
 const HOST = config.gateway.host || '127.0.0.1';
-const MAX_TOOL_ROUNDS = 12;
+const MAX_TOOL_ROUNDS = 20;
 type ExecutionMode = 'interactive' | 'background_task' | 'heartbeat' | 'cron';
+
+function repairLegacyTaskChannelMetadata(): void {
+  try {
+    const tasks = listTasks();
+    let repaired = 0;
+    for (const task of tasks) {
+      if (!String(task.sessionId || '').startsWith('telegram_')) continue;
+      if (task.channel === 'telegram' && task.telegramChatId) continue;
+      task.channel = 'telegram';
+      if (!task.telegramChatId) {
+        const parsed = Number(String(task.sessionId || '').replace(/^telegram_/, ''));
+        if (Number.isFinite(parsed) && parsed > 0) task.telegramChatId = parsed;
+      }
+      saveTask(task);
+      repaired++;
+    }
+    if (repaired > 0) {
+      console.log(`[TaskStore] Repaired ${repaired} legacy task(s) with telegram metadata.`);
+    }
+  } catch (err: any) {
+    console.warn('[TaskStore] Legacy task metadata repair skipped:', err?.message || err);
+  }
+}
 
 {
   const cleaned = cleanupSessions();
   if (cleaned.deleted > 0) {
     console.log(`[session] Cleaned up ${cleaned.deleted} stale automated session file(s).`);
   }
+  repairLegacyTaskChannelMetadata();
 }
 
 // Search config is now read dynamically from config on each request
@@ -249,7 +289,20 @@ function buildBrowserLaunchCommand(app: string, url: string): string {
   return `${appCmd} ${quoteShellArg(url)}`;
 }
 
+function hasUriScheme(value: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:/i.test(String(value || '').trim());
+}
+
 const BLOCKED_PATTERNS = ['del ', 'rm ', 'format', 'shutdown', 'restart', 'rmdir', 'rd ', 'taskkill', 'reg '];
+
+// ── Sub-Agent Tool Profiles ────────────────────────────────────────────────────────────
+type SubagentProfile = 'file_editor' | 'researcher' | 'shell_runner' | 'reader_only';
+const TOOL_PROFILES: Record<SubagentProfile, Set<string>> = {
+  file_editor:  new Set(['read_file', 'create_file', 'replace_lines', 'insert_after', 'delete_lines', 'find_replace', 'list_files']),
+  researcher:   new Set(['read_file', 'list_files', 'web_search', 'web_fetch']),
+  shell_runner: new Set(['run_command', 'read_file', 'list_files']),
+  reader_only:  new Set(['read_file', 'list_files']),
+};
 
 // Track last-used filename per session for when model forgets to pass it
 const lastFilenameUsed: Map<string, string> = new Map();
@@ -438,10 +491,18 @@ type ChannelsConfig = {
   whatsapp: WhatsAppChannelConfig;
 };
 
+// HIGH-01 fix: resolve vault references when normalizing channel configs.
+// Tokens stored as "vault:<key>" are decrypted here at point-of-use,
+// so they never have to be plaintext in config.json.
+function resolveToken(raw: string | undefined): string {
+  if (!raw) return '';
+  return getConfig().resolveSecret(raw) || '';
+}
+
 function normalizeTelegramConfig(raw: any): TelegramChannelConfig {
   return {
     enabled: raw?.enabled === true,
-    botToken: String(raw?.botToken || ''),
+    botToken: resolveToken(raw?.botToken),
     allowedUserIds: Array.isArray(raw?.allowedUserIds) ? raw.allowedUserIds.map(Number).filter((n: number) => Number.isFinite(n) && n > 0) : [],
     streamMode: raw?.streamMode === 'partial' ? 'partial' : 'full',
   };
@@ -450,22 +511,22 @@ function normalizeTelegramConfig(raw: any): TelegramChannelConfig {
 function normalizeDiscordConfig(raw: any): DiscordChannelConfig {
   return {
     enabled: raw?.enabled === true,
-    botToken: String(raw?.botToken || ''),
+    botToken: resolveToken(raw?.botToken),
     applicationId: String(raw?.applicationId || ''),
     guildId: String(raw?.guildId || ''),
     channelId: String(raw?.channelId || ''),
-    webhookUrl: String(raw?.webhookUrl || ''),
+    webhookUrl: resolveToken(raw?.webhookUrl) || String(raw?.webhookUrl || ''),
   };
 }
 
 function normalizeWhatsAppConfig(raw: any): WhatsAppChannelConfig {
   return {
     enabled: raw?.enabled === true,
-    accessToken: String(raw?.accessToken || ''),
+    accessToken: resolveToken(raw?.accessToken),
     phoneNumberId: String(raw?.phoneNumberId || ''),
     businessAccountId: String(raw?.businessAccountId || ''),
-    verifyToken: String(raw?.verifyToken || ''),
-    webhookSecret: String(raw?.webhookSecret || ''),
+    verifyToken: resolveToken(raw?.verifyToken) || String(raw?.verifyToken || ''),
+    webhookSecret: resolveToken(raw?.webhookSecret) || String(raw?.webhookSecret || ''),
     testRecipient: String(raw?.testRecipient || ''),
   };
 }
@@ -547,7 +608,7 @@ function buildBootStartupSnapshot(workspacePath: string): string {
       for (const t of blocked) {
         const total = Math.max(1, Number(t.plan?.length || 0));
         const step = Math.min(total, Math.max(1, Number(t.currentStepIndex || 0) + 1));
-        lines.push(`- [${t.status}] ${t.title} (step ${step}/${total})`);
+        lines.push(`- [${t.id}] [${t.status}] ${t.title} (step ${step}/${total})`);
       }
     }
   } catch (err: any) {
@@ -561,8 +622,21 @@ function buildBootStartupSnapshot(workspacePath: string): string {
   const memDir = path.join(workspacePath, 'memory');
   const todayMem = path.join(memDir, `${today}.md`);
   const yesterdayMem = path.join(memDir, `${yesterday}.md`);
-  lines.push(`today_memory_file: ${fs.existsSync(todayMem) ? `${today}.md` : 'missing'}`);
-  lines.push(`yesterday_memory_file: ${fs.existsSync(yesterdayMem) ? `${yesterday}.md` : 'missing'}`);
+
+  // Inject actual memory content so LLM doesn't need to read files during boot
+  const memFileToRead = fs.existsSync(todayMem) ? todayMem : fs.existsSync(yesterdayMem) ? yesterdayMem : null;
+  if (memFileToRead) {
+    try {
+      const memContent = fs.readFileSync(memFileToRead, 'utf-8').trim();
+      const memFilename = path.basename(memFileToRead);
+      lines.push(`memory_content (${memFilename} — last 3000 chars):`);
+      lines.push(memContent.slice(-3000));
+    } catch {
+      lines.push('memory_content: unreadable');
+    }
+  } else {
+    lines.push('memory_content: no memory file found for today or yesterday');
+  }
 
   try {
     const dirents = fs.readdirSync(workspacePath, { withFileTypes: true });
@@ -600,11 +674,10 @@ hookBus.register('gateway:startup', async ({ workspacePath }) => {
   const startupSnapshot = buildBootStartupSnapshot(workspacePath);
   await runBootMd(workspacePath, async (message, sessionId, sendSSE) => {
     const bootContext = [
-      'CONTEXT: Internal startup BOOT.md turn. Execute tools to inspect workspace before summarizing.',
-      'BOOT TOOL RESTRICTION: use only list_files and read_file. Do not use run_command/start_task/browser_*/desktop_*.',
-      '[BOOT STARTUP SNAPSHOT - trusted runtime data]',
+      'CONTEXT: Internal startup BOOT.md turn. All data has been pre-fetched and is in the snapshot below.',
+      'Do NOT call any tools. Read the snapshot and write a 2-3 sentence startup summary.',
+      '[BOOT STARTUP SNAPSHOT - pre-fetched runtime data, no tools needed]',
       startupSnapshot,
-      'Use this snapshot as source of truth for task status. Use tools for file inspection.',
       '[/BOOT STARTUP SNAPSHOT]',
     ].join('\n\n');
     const effectiveSessionId = sessionId || bootSessionId;
@@ -676,6 +749,7 @@ async function buildPersonalityContext(sessionId: string, workspacePath: string)
   const soul = loadWorkspaceFile(workspacePath, 'SOUL.md', 500);
   const user = loadWorkspaceFile(workspacePath, 'USER.md', 300);
   const memory = loadWorkspaceFile(workspacePath, 'MEMORY.md', 600);
+  const self = loadWorkspaceFile(workspacePath, 'SELF.md', 600);
 
   const bootstrapFiles = [
     { path: path.join(workspacePath, 'IDENTITY.md'), content: identity, label: 'IDENTITY' },
@@ -683,6 +757,7 @@ async function buildPersonalityContext(sessionId: string, workspacePath: string)
     { path: path.join(workspacePath, 'SOUL.md'), content: soul, label: 'SOUL' },
     { path: path.join(workspacePath, 'USER.md'), content: user, label: 'USER' },
     { path: path.join(workspacePath, 'MEMORY.md'), content: memory, label: 'MEMORY' },
+    { path: path.join(workspacePath, 'SELF.md'), content: self, label: 'SELF' },
   ];
 
   await hookBus.fire({
@@ -855,11 +930,11 @@ function buildTools() {
       type: 'function',
       function: {
         name: 'run_command',
-        description: 'Open apps for the USER to see. Use browser_* tools for webpage interaction and desktop_* tools for desktop app interaction.',
+        description: 'Open apps for the USER to see on their screen. NEVER use this to open Chrome or Edge for web automation — those windows have no debug port and are invisible to browser_open/snapshot/click. For any web browsing, always use browser_open instead. Use run_command only for: launching GUI apps like notepad or VS Code.',
         parameters: {
           type: 'object', required: ['command'],
           properties: {
-            command: { type: 'string', description: 'Examples: "chrome", "chrome youtube.com", "youtube.com", "notepad", "code D:\\project"' },
+            command: { type: 'string', description: 'Examples: "notepad", "code D:\\project". Do NOT use "chrome" or "msedge" here — use browser_open instead.' },
           },
         },
       },
@@ -874,6 +949,62 @@ function buildTools() {
           properties: {
             goal: { type: 'string', description: 'What the task should accomplish (be specific)' },
             max_steps: { type: 'number', description: 'Maximum steps (default 25)' },
+          },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'task_control',
+        description: 'Query and control background tasks. Use this instead of reading files to discover task status.',
+        parameters: {
+          type: 'object',
+          required: ['action'],
+          properties: {
+            action: { type: 'string', description: 'One of: list, latest, get, resume, rerun, pause, cancel, delete' },
+            task_id: { type: 'string', description: 'Task ID (required for get/pause/cancel/delete; optional for resume/rerun)' },
+            status: { type: 'string', description: 'Optional filter: queued|running|paused|stalled|needs_assistance|failed|complete|waiting_subagent' },
+            include_all_sessions: { type: 'boolean', description: 'If true, list across all sessions/channels; default false (scoped)' },
+            limit: { type: 'number', description: 'Max tasks to return (default 20, max 100)' },
+            note: { type: 'string', description: 'Optional operator note to append when resuming/rerunning' },
+            confirm: { type: 'boolean', description: 'Required true for destructive actions cancel/delete' },
+          },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'schedule_job',
+        description: 'Manage scheduled jobs (list/create/update/pause/resume/delete/run_now). Use for recurring or time-based automation.',
+        parameters: {
+          type: 'object',
+          required: ['action'],
+          properties: {
+            action: { type: 'string', description: 'One of: list, create, update, pause, resume, delete, run_now' },
+            job_id: { type: 'string', description: 'Required for update/pause/resume/delete/run_now' },
+            name: { type: 'string', description: 'Job name (create/update)' },
+            instruction_prompt: { type: 'string', description: 'What the scheduled run should do (create/update)' },
+            schedule: {
+              type: 'object',
+              properties: {
+                kind: { type: 'string', description: 'recurring or one_shot' },
+                cron: { type: 'string', description: 'Cron expression for recurring jobs' },
+                run_at: { type: 'string', description: 'ISO timestamp for one-shot jobs' },
+              },
+            },
+            timezone: { type: 'string', description: 'IANA timezone (e.g. America/New_York)' },
+            delivery: {
+              type: 'object',
+              properties: {
+                channel: { type: 'string', description: 'web, telegram, discord, whatsapp' },
+                session_target: { type: 'string', description: 'main or isolated' },
+              },
+            },
+            model_override: { type: 'string', description: 'Optional model override for this scheduled job' },
+            confirm: { type: 'boolean', description: 'Must be true for create/update/delete actions' },
+            limit: { type: 'number', description: 'Optional max jobs returned for list' },
           },
         },
       },
@@ -896,6 +1027,63 @@ function buildTools() {
             properties: {
               reason: { type: 'string', description: 'Why you need help: planning, stuck, repeated failures, risky edit, etc.' },
               mode:   { type: 'string', enum: ['planner', 'rescue'], description: 'planner = need upfront strategy; rescue = stuck or failing' },
+            },
+          },
+        },
+      }];
+    })(),
+    // ── Sub-agent tools ── shown based on subagent_mode toggle ────────────────────────────────────
+    ...(() => {
+      const subagentMode = (getConfig().getConfig() as any).orchestration?.subagent_mode === true;
+      if (subagentMode) {
+        // Full Claude Cowork–style: free-form arbitrary spawn (multi-agent ON)
+        return [{
+          type: 'function' as const,
+          function: {
+            name: 'subagent_spawn',
+            description:
+              'Spawn a child agent in an isolated session to handle a parallel subtask. ' +
+              'The current task pauses until ALL spawned children complete. ' +
+              'Do NOT call this recursively from inside a child task.',
+            parameters: {
+              type: 'object',
+              required: ['task_title', 'task_prompt'],
+              properties: {
+                task_title:      { type: 'string', description: 'Short title for the sub-agent task' },
+                task_prompt:     { type: 'string', description: 'Full instruction for the sub-agent (be precise)' },
+                context_snippet: { type: 'string', description: 'Relevant context pre-extracted for the sub-agent (file contents, URLs, etc.)' },
+                expected_output: { type: 'string', description: 'What the sub-agent should return when done' },
+                profile: {
+                  type: 'string',
+                  enum: ['file_editor', 'researcher', 'shell_runner', 'reader_only'],
+                  description: 'Tool access profile: file_editor=read/write files, researcher=read+web, shell_runner=run_command, reader_only=read only',
+                },
+              },
+            },
+          },
+        }];
+      }
+      // Conservative 4B-safe mode: fixed specialist templates (multi-agent OFF)
+      return [{
+        type: 'function' as const,
+        function: {
+          name: 'delegate_to_specialist',
+          description:
+            'Delegate a focused, self-contained subtask to a specialist sub-agent. ' +
+            'Use for file edits, research lookups, or shell commands that are narrow and well-scoped. ' +
+            'The current task pauses until the specialist completes.',
+          parameters: {
+            type: 'object',
+            required: ['type', 'input'],
+            properties: {
+              type: {
+                type: 'string',
+                enum: ['file_editor', 'researcher', 'shell_runner', 'reader_only'],
+                description: 'Specialist role',
+              },
+              input: { type: 'string', description: 'Precise instruction for the specialist' },
+              context_snippet: { type: 'string', description: 'Relevant context the specialist needs (file content, URL, etc.)' },
+              target_file: { type: 'string', description: 'File to operate on (for file_editor)' },
             },
           },
         },
@@ -1097,6 +1285,60 @@ interface ToolResult {
   error: boolean;
 }
 
+interface TaskControlResponse {
+  success: boolean;
+  action: string;
+  code?: string;
+  message?: string;
+  scope?: string;
+  task?: Record<string, any> | null;
+  tasks?: Array<Record<string, any>>;
+  candidates?: Array<Record<string, any>>;
+}
+
+type ScheduleJobAction =
+  | 'list'
+  | 'create'
+  | 'update'
+  | 'pause'
+  | 'resume'
+  | 'delete'
+  | 'run_now';
+
+function normalizeScheduleJobAction(raw: any): ScheduleJobAction | null {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return null;
+  if (v === 'run-now') return 'run_now';
+  if (['list', 'create', 'update', 'pause', 'resume', 'delete', 'run_now'].includes(v)) {
+    return v as ScheduleJobAction;
+  }
+  return null;
+}
+
+function summarizeCronJob(job: any): Record<string, any> {
+  return {
+    id: String(job?.id || ''),
+    name: String(job?.name || ''),
+    type: String(job?.type || 'recurring'),
+    status: String(job?.status || 'scheduled'),
+    enabled: job?.enabled !== false,
+    schedule: job?.schedule || null,
+    runAt: job?.runAt || null,
+    tz: job?.tz || null,
+    nextRun: job?.nextRun || null,
+    lastRun: job?.lastRun || null,
+    lastResult: job?.lastResult || null,
+    sessionTarget: job?.sessionTarget || 'isolated',
+    model: job?.model || null,
+  };
+}
+
+function normalizeDeliveryChannel(raw: any): 'web' | 'telegram' | 'discord' | 'whatsapp' {
+  const v = String(raw || 'web').trim().toLowerCase();
+  if (v === 'telegram' || v === 'discord' || v === 'whatsapp') return v;
+  return 'web';
+}
+
 function normalizeToolArgs(rawArgs: any): any {
   if (rawArgs == null) return {};
   if (typeof rawArgs === 'string') {
@@ -1249,12 +1491,13 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
           const parts = rawCmd.split(/\s+/);
           const app = parts[0].toLowerCase();
           let url = parts.slice(1).join(' ');
-          // Add https:// if missing
-          if (url && !url.startsWith('http')) url = 'https://' + url;
+          // Add https:// only when no URI scheme is present.
+          // This preserves file://, chrome://, about:, etc.
+          if (url && !hasUriScheme(url)) url = 'https://' + url;
           execCmd = buildBrowserLaunchCommand(app, url);
         }
-        // 3. Plain URL → open in default browser
-        else if (/^(https?:\/\/|www\.)/.test(cmd)) {
+        // 3. URL/URI → open in default browser
+        else if (/^(https?:\/\/|file:\/\/|chrome:\/\/|about:|www\.)/.test(cmd)) {
           const url = cmd.startsWith('www.') ? 'https://' + rawCmd : rawCmd;
           execCmd = buildUrlOpenCommand(url);
         }
@@ -1295,6 +1538,232 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
       case 'start_task': {
         // This is handled specially in handleChat — shouldn't reach here
         return { name, args, result: 'Task system ready. Use the task endpoint.', error: false };
+      }
+
+      case 'task_control': {
+        const out = await handleTaskControlAction(sessionId, args);
+        return {
+          name,
+          args,
+          result: JSON.stringify(out, null, 2),
+          error: out.success !== true,
+        };
+      }
+
+      case 'schedule_job': {
+        const action = normalizeScheduleJobAction(args.action);
+        if (!action) {
+          return {
+            name,
+            args,
+            result: 'schedule_job requires a valid action: list, create, update, pause, resume, delete, run_now',
+            error: true,
+          };
+        }
+
+        const requiresConfirm = action === 'create' || action === 'update' || action === 'delete';
+        if (requiresConfirm && args.confirm !== true) {
+          return {
+            name,
+            args,
+            result: JSON.stringify({
+              success: false,
+              needs_confirmation: true,
+              action,
+              message: `Action "${action}" requires explicit confirmation. Re-run with confirm=true after user says yes.`,
+            }, null, 2),
+            error: true,
+          };
+        }
+
+        if (action === 'list') {
+          const limitRaw = Number(args.limit);
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.floor(limitRaw)) : 50;
+          const jobs = cronScheduler.getJobs().map(summarizeCronJob).slice(0, limit);
+          return {
+            name,
+            args,
+            result: JSON.stringify({ success: true, count: jobs.length, jobs }, null, 2),
+            error: false,
+          };
+        }
+
+        const jobId = String(args.job_id || args.jobId || '').trim();
+
+        if (action === 'create') {
+          const instructionPrompt = String(args.instruction_prompt || args.prompt || '').trim();
+          if (!instructionPrompt) {
+            return { name, args, result: 'schedule_job(create) requires instruction_prompt', error: true };
+          }
+
+          const schedule = (args.schedule && typeof args.schedule === 'object') ? args.schedule : {};
+          const rawKind = String(schedule.kind || args.kind || 'recurring').trim().toLowerCase();
+          const kind: 'recurring' | 'one-shot' = (rawKind === 'one_shot' || rawKind === 'one-shot') ? 'one-shot' : 'recurring';
+          const cron = String(schedule.cron || args.cron || '').trim();
+          const runAtRaw = String(schedule.run_at || args.run_at || '').trim();
+          const timezone = String(args.timezone || args.tz || '').trim() || undefined;
+          const delivery = (args.delivery && typeof args.delivery === 'object') ? args.delivery : {};
+          const channel = normalizeDeliveryChannel(delivery.channel || args.channel);
+          const sessionTarget = String(delivery.session_target || args.session_target || 'isolated').toLowerCase() === 'main'
+            ? 'main'
+            : 'isolated';
+          const modelOverride = String(args.model_override || args.model || '').trim() || undefined;
+          const nameValue = String(args.name || '').trim() || `Scheduled task ${new Date().toLocaleString()}`;
+
+          if (channel !== 'web') {
+            return {
+              name,
+              args,
+              result: `Delivery channel "${channel}" is not enabled for scheduler jobs yet. Use channel "web" for now.`,
+              error: true,
+            };
+          }
+
+          if (kind === 'one-shot') {
+            if (!runAtRaw) return { name, args, result: 'schedule.kind=one_shot requires schedule.run_at (ISO datetime)', error: true };
+            const parsed = new Date(runAtRaw);
+            if (!Number.isFinite(parsed.getTime())) {
+              return { name, args, result: `Invalid run_at value: "${runAtRaw}"`, error: true };
+            }
+          } else if (!cron) {
+            return { name, args, result: 'schedule.kind=recurring requires schedule.cron', error: true };
+          }
+
+          const created = cronScheduler.createJob({
+            name: nameValue,
+            prompt: instructionPrompt,
+            type: kind,
+            schedule: kind === 'recurring' ? cron : undefined,
+            runAt: kind === 'one-shot' ? new Date(runAtRaw).toISOString() : undefined,
+            tz: timezone,
+            sessionTarget,
+            model: modelOverride,
+          } as any);
+
+          return {
+            name,
+            args,
+            result: JSON.stringify({
+              success: true,
+              action: 'create',
+              job: summarizeCronJob(created),
+              message: `Scheduled job "${created.name}" created.`,
+            }, null, 2),
+            error: false,
+          };
+        }
+
+        if (!jobId) {
+          return { name, args, result: `schedule_job(${action}) requires job_id`, error: true };
+        }
+
+        if (action === 'pause') {
+          const updated = cronScheduler.updateJob(jobId, { status: 'paused', enabled: false } as any);
+          if (!updated) return { name, args, result: `Job not found: ${jobId}`, error: true };
+          return { name, args, result: JSON.stringify({ success: true, action: 'pause', job: summarizeCronJob(updated) }, null, 2), error: false };
+        }
+
+        if (action === 'resume') {
+          const updated = cronScheduler.updateJob(jobId, { status: 'scheduled', enabled: true } as any);
+          if (!updated) return { name, args, result: `Job not found: ${jobId}`, error: true };
+          return { name, args, result: JSON.stringify({ success: true, action: 'resume', job: summarizeCronJob(updated) }, null, 2), error: false };
+        }
+
+        if (action === 'run_now') {
+          const exists = cronScheduler.getJobs().some(j => j.id === jobId);
+          if (!exists) return { name, args, result: `Job not found: ${jobId}`, error: true };
+          cronScheduler.runJobNow(jobId, { respectActiveHours: false }).catch(err =>
+            console.error(`[schedule_job] run_now failed for ${jobId}:`, err?.message || err)
+          );
+          return {
+            name,
+            args,
+            result: JSON.stringify({ success: true, action: 'run_now', job_id: jobId, message: 'Job queued for immediate run.' }, null, 2),
+            error: false,
+          };
+        }
+
+        if (action === 'delete') {
+          const ok = cronScheduler.deleteJob(jobId);
+          if (!ok) return { name, args, result: `Job not found: ${jobId}`, error: true };
+          return {
+            name,
+            args,
+            result: JSON.stringify({ success: true, action: 'delete', job_id: jobId, message: 'Job deleted.' }, null, 2),
+            error: false,
+          };
+        }
+
+        if (action === 'update') {
+          const schedule = (args.schedule && typeof args.schedule === 'object') ? args.schedule : {};
+          const patch: Record<string, any> = {};
+
+          if (args.name !== undefined) patch.name = String(args.name || '').trim();
+          if (args.instruction_prompt !== undefined || args.prompt !== undefined) {
+            patch.prompt = String(args.instruction_prompt || args.prompt || '').trim();
+          }
+          if (args.timezone !== undefined || args.tz !== undefined) {
+            patch.tz = String(args.timezone || args.tz || '').trim();
+          }
+          if (args.model_override !== undefined || args.model !== undefined) {
+            const mv = String(args.model_override || args.model || '').trim();
+            patch.model = mv || undefined;
+          }
+          if (args.delivery !== undefined || args.channel !== undefined) {
+            const delivery = (args.delivery && typeof args.delivery === 'object') ? args.delivery : {};
+            const channel = normalizeDeliveryChannel(delivery.channel || args.channel);
+            if (channel !== 'web') {
+              return {
+                name,
+                args,
+                result: `Delivery channel "${channel}" is not enabled for scheduler jobs yet. Use channel "web" for now.`,
+                error: true,
+              };
+            }
+            const sessionTarget = String(delivery.session_target || args.session_target || '').toLowerCase();
+            if (sessionTarget === 'main' || sessionTarget === 'isolated') patch.sessionTarget = sessionTarget;
+          }
+
+          const rawKind = String(schedule.kind || args.kind || '').trim().toLowerCase();
+          if (rawKind === 'one_shot' || rawKind === 'one-shot') patch.type = 'one-shot';
+          if (rawKind === 'recurring') patch.type = 'recurring';
+          if (schedule.cron !== undefined || args.cron !== undefined) patch.schedule = String(schedule.cron || args.cron || '').trim();
+          if (schedule.run_at !== undefined || args.run_at !== undefined) patch.runAt = String(schedule.run_at || args.run_at || '').trim();
+
+          if (Object.keys(patch).length === 0) {
+            return { name, args, result: 'No update fields provided for schedule_job(update).', error: true };
+          }
+
+          if (patch.type === 'one-shot' && !patch.runAt) {
+            return { name, args, result: 'Updating to one_shot requires schedule.run_at', error: true };
+          }
+          if (patch.type === 'recurring' && patch.schedule === '') {
+            return { name, args, result: 'Updating to recurring requires schedule.cron', error: true };
+          }
+          if (patch.runAt) {
+            const parsed = new Date(String(patch.runAt));
+            if (!Number.isFinite(parsed.getTime())) {
+              return { name, args, result: `Invalid run_at value: "${patch.runAt}"`, error: true };
+            }
+            patch.runAt = parsed.toISOString();
+          }
+
+          const updated = cronScheduler.updateJob(jobId, patch as any);
+          if (!updated) return { name, args, result: `Job not found: ${jobId}`, error: true };
+          return {
+            name,
+            args,
+            result: JSON.stringify({
+              success: true,
+              action: 'update',
+              job: summarizeCronJob(updated),
+              message: `Scheduled job "${updated.name}" updated.`,
+            }, null, 2),
+            error: false,
+          };
+        }
+
+        return { name, args, result: `Unsupported schedule_job action: ${action}`, error: true };
       }
 
       // Browser automation tools
@@ -1799,7 +2268,7 @@ function goalLikelyNeedsTextInput(goal: string): boolean {
 
 function parseSnapshotDiagnostics(snapshot: string): SnapshotDiagnostics | null {
   const m = String(snapshot || '').match(
-    /Snapshot diagnostics:\s*scanned=(\d+)\s+included=(\d+)\s+hidden=(\d+)\s+unlabeled_non_input=(\d+)\s+unnamed_input_included=(\d+)/i,
+    /Snapshot diagnostics:\s*scanned=([0-9]*)\s+included=([0-9]*)\s+hidden=([0-9]*)\s+unlabeled_non_input=([0-9]*)\s+unnamed_input_included=([0-9]*)/i,
   );
   if (!m) return null;
   const toInt = (x: string) => {
@@ -2011,15 +2480,28 @@ async function handleChat(
       };
     }
   }
-  const browserMaxForcedRetries = orchRuntimeCfg?.browser?.max_forced_retries ?? 2;
+  // User preference: no automatic browser retries/snapshots.
+  // Let the model explicitly decide when to call browser_snapshot.
+  const browserAutoSnapshotRetriesEnabled = false;
+  const browserMaxForcedRetries = browserAutoSnapshotRetriesEnabled
+    ? (orchRuntimeCfg?.browser?.max_forced_retries ?? 2)
+    : 0;
   const browserMaxAdvisorCallsPerTurn = orchRuntimeCfg?.browser?.max_advisor_calls_per_turn ?? 5;
   const desktopMaxAdvisorCallsPerTurn = 4;
   const browserMaxCollectedItems = orchRuntimeCfg?.browser?.max_collected_items ?? 80;
   const browserMinFeedItemsBeforeAnswer = orchRuntimeCfg?.browser?.min_feed_items_before_answer ?? 12;
-  const browserStabilizeMaxWaitRetries = 2;
-  const browserStabilizeMaxTabProbes = 2;
+  const browserStabilizeMaxWaitRetries = browserAutoSnapshotRetriesEnabled ? 2 : 0;
+  const browserStabilizeMaxTabProbes = browserAutoSnapshotRetriesEnabled ? 2 : 0;
   const browserPacketMaxItems = Math.max(12, Math.min(60, Math.min(browserMaxCollectedItems, 40)));
   const seenToolCalls = new Set<string>();
+  const cachedReadOnlyToolResults = new Map<string, ToolResult>();
+  const canReplayReadOnlyCall = (toolName: string): boolean =>
+    toolName === 'list_files' || toolName === 'read_file';
+  const loopDetectionEnabled = orchRuntimeCfg?.triggers?.loop_detection !== false;
+  const loopWarningThreshold = 3;
+  const loopCriticalThreshold = 5;
+  const loopWarnNudged = new Set<string>();
+  const loopBlockNudged = new Set<string>();
   const recentToolCalls: Array<{ name: string; argsHash: string }> = [];
   const hashArgs = (args: any): string => {
     try {
@@ -2038,12 +2520,15 @@ async function handleChat(
     }
   };
   const checkLoopDetection = (toolName: string, args: any): { state: 'ok' | 'warn' | 'block'; repeats: number } => {
+    if (!loopDetectionEnabled) return { state: 'ok', repeats: 1 };
     const argsHash = hashArgs(args);
-    const repeats = recentToolCalls.filter((t) => t.name === toolName && t.argsHash === argsHash).length;
+    // Count includes this current attempt so thresholds are exact:
+    // warning at 3rd identical call, block at 5th.
+    const repeats = recentToolCalls.filter((t) => t.name === toolName && t.argsHash === argsHash).length + 1;
     recentToolCalls.push({ name: toolName, argsHash });
     if (recentToolCalls.length > 20) recentToolCalls.shift();
-    if (repeats >= 5) return { state: 'block', repeats };
-    if (repeats >= 3) return { state: 'warn', repeats };
+    if (repeats >= loopCriticalThreshold) return { state: 'block', repeats };
+    if (repeats >= loopWarningThreshold) return { state: 'warn', repeats };
     return { state: 'ok', repeats };
   };
   const orchestrationState = new OrchestrationTriggerState();
@@ -2262,7 +2747,9 @@ TOOLS:
 - web_fetch: Fetch full text content from a URL. Use after web_search to read the actual page.
 - run_command: Open apps for the USER to see (chrome, notepad, vscode). Use desktop_* tools to interact with desktop apps afterward.
 - start_task: Launch a multi-step task (for complex operations needing many steps)
-- browser_open: Navigate to a URL in a browser YOU control (can click, fill, snapshot after)
+- task_control: List/get/resume/rerun/pause/delete existing background tasks and statuses
+- schedule_job: Manage scheduled automation jobs (list/create/update/pause/resume/delete/run_now)
+- browser_open: Navigate to a URL in a browser YOU control via Playwright (a persistent Chrome profile saved at C:\Users\rafel\.smallclaw\chrome-debug-profile — you stay logged into sites after the first login, no re-auth needed). You can click, fill, snapshot after.
 - browser_snapshot: Refresh visible elements. If element count looks low, call browser_wait first
 - browser_click: Click by @ref. ALWAYS take browser_snapshot after to confirm the click worked
 - browser_fill: Type into an [INPUT] element by @ref, then press Enter or click submit
@@ -2289,8 +2776,10 @@ TOOL ROUTING - web_fetch vs browser:
 - Combined pattern: use browser to discover and collect links from a feed, then use web_fetch on specific linked URLs to read their full content.
 
 BROWSER RULES:
+0. YOU control the browser via Playwright — it is NOT the user's browser. The user is separate. The Chrome profile is persistent so you are already logged into sites the user has signed into before.
 1. run_command launches apps/windows. Use browser_* for web pages and desktop_* for native app/screen control.
 2. If you already have a browser open, DO NOT call browser_open again. Use browser_snapshot to see the current page, then browser_click to navigate.
+3. If you land on a login page and see a one-click sign-in button (e.g. "Sign in as [name]", "Continue as [name]", Google/Apple sign-in), click it immediately — do not snapshot repeatedly. The Chrome profile preserves the OAuth session so it will complete without a password.
 3. browser_open RETURNS a snapshot — read it immediately. Find the correct link by @ref, then call browser_click to follow it.
 4. After EVERY click, read the snapshot returned in the tool result to confirm what changed.
 5. Prefer direct search URLs over clicking search boxes.
@@ -2300,6 +2789,16 @@ DESKTOP RULES (Windows):
 2. Use desktop_focus_window before desktop_click or desktop_type when the target app is not focused.
 3. desktop_screenshot includes OCR preview text when available; use that evidence for status checks.
 4. For status checks like "is VS Code done?", capture a fresh desktop_screenshot before answering.
+
+SCHEDULER RULES:
+1. If the user asks for recurring or time-based automation ("every day", "at 9am", "tomorrow"), use schedule_job.
+2. Always ask for explicit yes/no confirmation before create/update/delete schedule actions.
+3. Keep schedule details (when) separate from instruction_prompt (what to do).
+
+TASK MANAGEMENT RULES:
+1. If the user asks about existing background tasks (status/list/rerun/resume), call task_control first.
+2. Do NOT use list_files/read_file to discover task state.
+3. Use start_task only for creating a new task, not for resuming/rerunning an existing one.
 
 AUTOMATION AUTHORIZATION:
 - This app runs on the user's own machine; user requests here are explicit authorization for local browser and desktop automation.
@@ -2499,12 +2998,19 @@ RESPONSE RULES:
           description: desc,
           status: 'pending' as const,
         }));
-        const isTelegram = callerContext?.includes('[TELEGRAM]');
+        const taskChannel = inferTaskChannelFromSession(sessionId);
+        const parsedTelegramChatId = taskChannel === 'telegram'
+          ? Number(String(sessionId || '').replace(/^telegram_/, ''))
+          : NaN;
+        const telegramChatId = Number.isFinite(parsedTelegramChatId) && parsedTelegramChatId > 0
+          ? parsedTelegramChatId
+          : undefined;
         const task = createTask({
           title: taskTitle,
           prompt: message,
           sessionId,
-          channel: isTelegram ? 'telegram' : 'web',
+          channel: taskChannel,
+          telegramChatId,
           plan: taskPlan.length > 0 ? taskPlan : [{ index: 0, description: 'Execute task', status: 'pending' }],
         });
         appendJournal(task.id, { type: 'status_push', content: `Task queued: ${taskTitle}` });
@@ -2546,12 +3052,19 @@ RESPONSE RULES:
           const taskPlan = (preflight.task_plan || preflight.quick_plan || []).map((desc: string, i: number) => ({
             index: i, description: desc, status: 'pending' as const,
           }));
-          const isTelegram = callerContext?.includes('[TELEGRAM]');
+          const taskChannel = inferTaskChannelFromSession(sessionId);
+          const parsedTelegramChatId = taskChannel === 'telegram'
+            ? Number(String(sessionId || '').replace(/^telegram_/, ''))
+            : NaN;
+          const telegramChatId = Number.isFinite(parsedTelegramChatId) && parsedTelegramChatId > 0
+            ? parsedTelegramChatId
+            : undefined;
           const task = createTask({
             title: taskTitle,
             prompt: message,
             sessionId,
-            channel: isTelegram ? 'telegram' : 'web',
+            channel: taskChannel,
+            telegramChatId,
             plan: taskPlan.length > 0 ? taskPlan : [{ index: 0, description: 'Execute task', status: 'pending' }],
           });
           appendJournal(task.id, { type: 'status_push', content: `Task queued (upgraded from primary_with_plan): ${taskTitle}` });
@@ -2799,7 +3312,7 @@ RESPONSE RULES:
       : (packet.extractedFeed as Array<Record<string, any>>);
 
     // ── Change 5: chat_interface generation-wait — skip advisor, inject synthetic wait ──
-    if (packet.page.pageType === 'chat_interface' && packet.isGenerating) {
+    if (browserAutoSnapshotRetriesEnabled && packet.page.pageType === 'chat_interface' && packet.isGenerating) {
       sendSSE('info', { message: 'Browser: chat interface still generating — waiting for response before advising.' });
       pendingSyntheticToolCalls = [
         { function: { name: 'browser_wait', arguments: { ms: 3000 } } },
@@ -2933,7 +3446,7 @@ RESPONSE RULES:
       && isFeedCollectionPage
       && advisor.next_tool?.tool === 'browser_wait';
 
-    if (isCollectMoreScroll || isCollectMoreWait) {
+    if (browserAutoSnapshotRetriesEnabled && (isCollectMoreScroll || isCollectMoreWait)) {
       // Queue synthetic tool calls: scroll + wait + snapshot (all deterministic)
       const scrollParams = advisor.next_tool!.params || { key: 'PageDown' };
       pendingSyntheticToolCalls = [
@@ -3676,6 +4189,7 @@ RULES:
       const lastToolFailed = allToolResults.length > 0 && allToolResults[allToolResults.length - 1].error;
       const shouldContinueInsteadOfFinalizing =
         orchestrationSkillEnabled
+        && executionMode !== 'background_task'
         && isExecutionTurn
         && continuationNudges < MAX_CONTINUATION_NUDGES
         && (
@@ -4006,22 +4520,25 @@ RULES:
       const toolCallId = String((call as any)?.id || '').trim();
       const toolName = call.function?.name || 'unknown';
       const toolArgs = normalizeToolArgs(call.function?.arguments);
+      const loopSig = `${toolName}:${hashArgs(toolArgs)}`;
+      const loopPivotNudge = 'Loop detector: you are looping on this tool, try a different approach or ask the user.';
       const loopCheck = checkLoopDetection(toolName, toolArgs);
       if (loopCheck.state === 'block') {
-        const blockMsg = `Loop guard: ${toolName} with the same arguments has already run ${loopCheck.repeats} times. Stop repeating this call and try a different approach.`;
+        const blockMsg = `${loopPivotNudge} Repeated call blocked: ${toolName} with identical arguments has run ${loopCheck.repeats} times (critical threshold ${loopCriticalThreshold}).`;
         console.warn(`[v2] LOOP BLOCK: ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)}) x${loopCheck.repeats}`);
         const blockedResult: ToolResult = {
           name: toolName,
           args: toolArgs,
           result: blockMsg,
-          error: false,
+          error: true,
         };
         allToolResults.push(blockedResult);
-        roundHadProgress = true;
+        logToolCall(workspacePath, toolName, toolArgs, blockMsg, true);
+        sendSSE('info', { message: blockMsg });
         sendSSE('tool_result', {
           action: toolName,
           result: blockMsg,
-          error: false,
+          error: true,
           stepNum: allToolResults.length,
         });
         messages.push({
@@ -4030,12 +4547,26 @@ RULES:
           tool_call_id: toolCallId || undefined,
           content: blockMsg,
         });
+        if (!loopBlockNudged.has(loopSig)) {
+          loopBlockNudged.add(loopSig);
+          messages.push({
+            role: 'user',
+            content: `${loopPivotNudge} Do not call ${toolName} with the same arguments again this turn.`,
+          });
+        }
         continue;
       }
       if (loopCheck.state === 'warn') {
-        const warnMsg = `Loop warning: ${toolName} with same arguments repeated ${loopCheck.repeats} times.`;
+        const warnMsg = `${loopPivotNudge} Warning: ${toolName} with identical arguments repeated ${loopCheck.repeats} times (warning threshold ${loopWarningThreshold}).`;
         console.warn(`[v2] LOOP WARN: ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)}) x${loopCheck.repeats}`);
         sendSSE('info', { message: warnMsg });
+        if (!loopWarnNudged.has(loopSig)) {
+          loopWarnNudged.add(loopSig);
+          messages.push({
+            role: 'user',
+            content: warnMsg,
+          });
+        }
       }
 
       if (isBootStartupTurn && !bootAllowedTools.has(toolName)) {
@@ -4086,6 +4617,32 @@ RULES:
       const allowRepeatedTool = toolName.startsWith('browser_');
       const callKey = `${toolName}:${JSON.stringify(toolArgs)}`;
       if (!allowRepeatedTool && seenToolCalls.has(callKey)) {
+        const cachedResult = canReplayReadOnlyCall(toolName)
+          ? cachedReadOnlyToolResults.get(callKey)
+          : undefined;
+        if (cachedResult) {
+          const replayedResult: ToolResult = {
+            ...cachedResult,
+            args: toolArgs,
+          };
+          allToolResults.push(replayedResult);
+          if (!replayedResult.error) roundHadProgress = true;
+          logToolCall(workspacePath, toolName, toolArgs, replayedResult.result, replayedResult.error);
+          console.log(`[v2] REPLAY: duplicate ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)})`);
+          sendSSE('tool_result', {
+            action: toolName,
+            result: replayedResult.result.slice(0, 500),
+            error: replayedResult.error,
+            stepNum: allToolResults.length,
+          });
+          messages.push({
+            role: 'tool',
+            tool_name: toolName,
+            tool_call_id: toolCallId || undefined,
+            content: replayedResult.result,
+          });
+          continue;
+        }
         console.log(`[v2] SKIP: duplicate tool call ${toolName}(${JSON.stringify(toolArgs).slice(0, 80)})`);
         messages.push({
           role: 'tool',
@@ -4253,6 +4810,100 @@ RULES:
         };
       }
 
+      // ── Sub-agent spawn / specialist delegate ──────────────────────────────────────────────
+      if (toolName === 'delegate_to_specialist' || toolName === 'subagent_spawn') {
+        const isTaskSession = sessionId.startsWith('task_');
+
+        // Determine profile and build child prompt
+        const profile = ((toolArgs.profile || toolArgs.type || 'reader_only') as SubagentProfile);
+        const subTitle  = String(toolArgs.task_title || `${profile} specialist task`).slice(0, 120);
+        const subPrompt = [
+          toolArgs.context_snippet ? `[CONTEXT]\n${String(toolArgs.context_snippet).slice(0, 1200)}\n[/CONTEXT]\n\n` : '',
+          String(toolArgs.input || toolArgs.task_prompt || '').trim(),
+          toolArgs.target_file ? `\n\nTarget file: ${toolArgs.target_file}` : '',
+        ].join('').trim();
+
+        if (!subPrompt) {
+          messages.push({
+            role: 'tool',
+            tool_name: toolName,
+            tool_call_id: toolCallId || undefined,
+            content: 'Sub-agent spawn failed: no task_prompt or input provided.',
+          });
+          continue;
+        }
+
+        // Guard: do not allow sub-agents to spawn more sub-agents (prevent recursion)
+        const parentTaskId = isTaskSession ? sessionId.replace(/^task_/, '') : undefined;
+        if (parentTaskId) {
+          const parentTask = loadTask(parentTaskId);
+          if (parentTask?.parentTaskId) {
+            messages.push({
+              role: 'tool',
+              tool_name: toolName,
+              tool_call_id: toolCallId || undefined,
+              content: 'Sub-agent recursion blocked: sub-agents cannot spawn further sub-agents.',
+            });
+            continue;
+          }
+        }
+
+        const onResumeInstruction =
+          `Sub-agent "${subTitle}" has completed. Review the [SUBAGENT RESULT] injected above and continue the parent task.`;
+        const parentTask = parentTaskId ? loadTask(parentTaskId) : null;
+        const childChannel = parentTask?.channel || inferTaskChannelFromSession(sessionId);
+
+        // Create the child TaskRecord
+        const childTask = createTask({
+          title: subTitle,
+          prompt: subPrompt,
+          sessionId: `task_${crypto.randomUUID()}`,
+          channel: childChannel,
+          plan: [{ index: 0, description: subPrompt.slice(0, 120), status: 'pending' as const }],
+          parentTaskId,
+          subagentProfile: profile,
+          onResumeInstruction,
+        });
+
+        // Register child in parent and flip parent to waiting_subagent
+        if (parentTaskId) {
+          if (parentTask) {
+            parentTask.pendingSubagentIds = [...(parentTask.pendingSubagentIds || []), childTask.id];
+            parentTask.status = 'waiting_subagent';
+            saveTask(parentTask);
+          }
+        }
+
+        // Spawn the child BackgroundTaskRunner
+        const childRunner = new BackgroundTaskRunner(
+          childTask.id,
+          handleChat,
+          makeBroadcastForTask(childTask.id),
+          telegramChannel,
+        );
+        childRunner.start().catch((err: Error) =>
+          console.error(`[SubagentSpawn] Child ${childTask.id} error:`, err.message)
+        );
+
+        const ackMsg = toolName === 'subagent_spawn'
+          ? `Spawned sub-agent "${subTitle}" (ID: ${childTask.id}, profile: ${profile}). Parent task is paused pending completion.`
+          : `Delegated to ${profile} specialist (ID: ${childTask.id}). Parent task is paused until specialist completes.`;
+
+        console.log(`[SubagentSpawn] ${ackMsg}`);
+        appendJournal(parentTaskId || childTask.id, { type: 'status_push', content: ackMsg });
+        broadcastWS({ type: 'task_subagent_spawned', parentTaskId, childTaskId: childTask.id, subTitle, profile });
+
+        messages.push({
+          role: 'tool',
+          tool_name: toolName,
+          tool_call_id: toolCallId || undefined,
+          content: ackMsg,
+        });
+        // Break out of the tool loop — parent task status is now waiting_subagent,
+        // which the BackgroundTaskRunner will detect on its next iteration.
+        break;
+      }
+
       // ── Orchestration: explicit request from primary
       if (toolName === 'request_secondary_assist') {
         const orchCfg = getOrchestrationConfig();
@@ -4324,6 +4975,7 @@ RULES:
       }
 
       const toolResult = await executeTool(toolName, toolArgs, workspacePath, sessionId);
+      if (canReplayReadOnlyCall(toolName)) cachedReadOnlyToolResults.set(callKey, toolResult);
       allToolResults.push(toolResult);
       logToolCall(workspacePath, toolName, toolArgs, toolResult.result, toolResult.error);
       trackFileOpMutation(toolName, toolArgs, toolResult, 'primary');
@@ -4431,6 +5083,20 @@ function createSSESender(res: express.Response): (event: string, data: any) => v
   return (type: string, data: any) => { try { res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`); } catch {} };
 }
 
+const ACTIVE_TASK_STATUSES: TaskStatus[] = [
+  'queued',
+  'running',
+  'paused',
+  'stalled',
+  'needs_assistance',
+  'failed',
+  'waiting_subagent',
+];
+
+function inferTaskChannelFromSession(sessionId: string): 'web' | 'telegram' {
+  return String(sessionId || '').startsWith('telegram_') ? 'telegram' : 'web';
+}
+
 function latestTaskForSession(sessionId: string, statuses: TaskStatus[]): TaskRecord | null {
   const tasks = listTasks({ status: statuses })
     .filter(t => t.sessionId === sessionId)
@@ -4439,11 +5105,12 @@ function latestTaskForSession(sessionId: string, statuses: TaskStatus[]): TaskRe
 }
 
 function findBlockedTaskForSession(sessionId: string): TaskRecord | null {
-  const blocked = listTasks({ status: ['needs_assistance', 'stalled', 'paused'] })
+  const blocked = listTasks({ status: ['needs_assistance', 'stalled', 'paused', 'failed'] })
     .filter(t => t.sessionId === sessionId)
     .filter(t =>
       t.status === 'needs_assistance'
       || t.status === 'stalled'
+      || t.status === 'failed'
       || (t.status === 'paused' && t.pauseReason !== 'user_pause'),
     )
     .sort((a, b) => b.lastProgressAt - a.lastProgressAt);
@@ -4451,7 +5118,18 @@ function findBlockedTaskForSession(sessionId: string): TaskRecord | null {
 }
 
 function isResumeIntent(message: string): boolean {
-  return /\b(resume|continue|go ahead|proceed|restart|start again|run it|do it now|apply and continue)\b/i.test(message);
+  const text = message.trim();
+  // Must explicitly reference resuming/continuing a task — not just a casual "go ahead"
+  // which people often say when starting a NEW task ("go ahead and open chatgpt").
+  // Require task context, or an explicit resume/rerun keyword standalone.
+  if (/\b(resume|rerun|re-run|run again|retry|restart)\b/i.test(text)) return true;
+  if (/\b(continue|proceed)\b.*\b(task|it|that|this)\b/i.test(text)) return true;
+  if (/\b(go ahead|do it|apply)\b.*\b(task|resume|rerun)\b/i.test(text)) return true;
+  return false;
+}
+
+function isRerunIntent(message: string): boolean {
+  return /\b(rerun|re-run|run again|retry|restart|start again)\b/i.test(message);
 }
 
 function isCancelIntent(message: string): boolean {
@@ -4461,6 +5139,11 @@ function isCancelIntent(message: string): boolean {
 function isStatusQuestion(message: string): boolean {
   return /\?|^\s*(what|why|how|status|did|where|when)\b/i.test(message)
     || /\b(what happened|why did|status|stuck|failed|error|progress|what went wrong)\b/i.test(message);
+}
+
+function isTaskListIntent(message: string): boolean {
+  return /\b(what|which|show|list)\b.*\b(background\s+)?tasks?\b/i.test(message)
+    || /\b(background\s+)?tasks?\b.*\b(do we have|running|active|current)\b/i.test(message);
 }
 
 function isAdjustmentIntent(message: string): boolean {
@@ -4478,21 +5161,316 @@ function getLatestPauseContext(task: TaskRecord): { reason: string; detail: stri
   return { reason: task.pauseReason || 'paused', detail: '' };
 }
 
-function buildBlockedTaskStatusMessage(task: TaskRecord): string {
+function summarizeTaskRecord(task: TaskRecord): Record<string, any> {
   const total = Array.isArray(task.plan) ? task.plan.length : 0;
   const step = Math.min((task.currentStepIndex || 0) + 1, Math.max(1, total));
   const done = (task.plan || []).filter((s) => s.status === 'done' || s.status === 'skipped').length;
-  const pause = getLatestPauseContext(task);
+  const latestPause = getLatestPauseContext(task);
+  return {
+    task_id: task.id,
+    title: task.title,
+    status: task.status,
+    pause_reason: task.pauseReason || null,
+    step,
+    total_steps: Math.max(1, total),
+    completed_steps: done,
+    last_issue: latestPause.reason || null,
+    last_issue_detail: latestPause.detail || null,
+    channel: task.channel,
+    session_id: task.sessionId,
+    last_progress_at: task.lastProgressAt,
+    last_progress_iso: new Date(task.lastProgressAt).toISOString(),
+    started_at: task.startedAt,
+    started_at_iso: new Date(task.startedAt).toISOString(),
+    completed_at: task.completedAt || null,
+    completed_at_iso: task.completedAt ? new Date(task.completedAt).toISOString() : null,
+  };
+}
+
+function buildBlockedTaskStatusMessage(task: TaskRecord): string {
+  const summary = summarizeTaskRecord(task);
   const lines = [
-    `Task status: ${task.title}`,
-    `Status: ${task.status}`,
-    `Step: ${step}/${Math.max(1, total)} (${done} completed)`,
-    `Last issue: ${pause.reason || 'n/a'}`,
-    pause.detail ? `Details: ${pause.detail}` : '',
-    `Task ID: ${task.id}`,
-    `Reply with "resume" to continue, or send an adjustment (for example: "only delete *_tmp.html").`,
+    `Task status: ${summary.title}`,
+    `Status: ${summary.status}`,
+    `Step: ${summary.step}/${summary.total_steps} (${summary.completed_steps} completed)`,
+    summary.last_issue ? `Last issue: ${summary.last_issue}` : '',
+    summary.last_issue_detail ? `Details: ${summary.last_issue_detail}` : '',
+    `Task ID: ${summary.task_id}`,
+    `You can say: "resume task ${summary.task_id}" or "rerun task ${summary.task_id}".`,
   ];
   return lines.filter(Boolean).join('\n');
+}
+
+function parseTaskStatusFilter(raw: any): TaskStatus[] | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const valid = new Set<TaskStatus>([
+    'queued',
+    'running',
+    'paused',
+    'stalled',
+    'needs_assistance',
+    'failed',
+    'complete',
+    'waiting_subagent',
+  ]);
+  const values = String(raw)
+    .split(/[,\s]+/)
+    .map(v => v.trim())
+    .filter(Boolean) as TaskStatus[];
+  const filtered = values.filter(v => valid.has(v));
+  return filtered.length > 0 ? filtered : undefined;
+}
+
+function getTaskScopeBuckets(sessionId: string, statuses?: TaskStatus[]) {
+  const all = listTasks(statuses ? { status: statuses } : undefined).sort((a, b) => b.lastProgressAt - a.lastProgressAt);
+  const sessionTasks = all.filter(t => t.sessionId === sessionId);
+  const channel = inferTaskChannelFromSession(sessionId);
+  const channelTasks = all.filter(t => t.channel === channel && t.sessionId !== sessionId);
+  return { all, sessionTasks, channelTasks, channel };
+}
+
+function parseTaskIdFromText(text: string): string | null {
+  const m = String(text || '').match(/\b([a-f0-9]{8}-[a-f0-9-]{27,})\b/i);
+  return m ? m[1] : null;
+}
+
+function launchBackgroundTaskRunner(taskId: string): void {
+  const runner = new BackgroundTaskRunner(taskId, handleChat, makeBroadcastForTask(taskId), telegramChannel);
+  runner.start().catch(err => console.error(`[BackgroundTaskRunner] task_control start ${taskId} error:`, err.message));
+}
+
+async function handleTaskControlAction(sessionId: string, args: any): Promise<TaskControlResponse> {
+  const action = String(args?.action || '').trim().toLowerCase();
+  const taskId = String(args?.task_id || args?.id || '').trim();
+  const includeAllSessions = args?.include_all_sessions === true;
+  const note = String(args?.note || '').trim();
+  const limitRaw = Number(args?.limit);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(100, Math.floor(limitRaw)) : 20;
+  const statusFilter = parseTaskStatusFilter(args?.status);
+
+  if (!action) {
+    return { success: false, action: 'unknown', code: 'invalid_action', message: 'task_control requires action.' };
+  }
+
+  if (action === 'list' || action === 'latest') {
+    const statuses = statusFilter || (action === 'list' ? ACTIVE_TASK_STATUSES : undefined);
+    const scope = getTaskScopeBuckets(sessionId, statuses);
+    const tasks = includeAllSessions
+      ? scope.all
+      : [...scope.sessionTasks, ...scope.channelTasks];
+    if (action === 'latest') {
+      const latest = tasks[0] || null;
+      return {
+        success: true,
+        action,
+        scope: includeAllSessions ? 'all_sessions' : `session+${scope.channel}`,
+        task: latest ? summarizeTaskRecord(latest) : null,
+        message: latest ? `Latest task is "${latest.title}" (${latest.status}).` : 'No tasks found.',
+      };
+    }
+    const summarized = tasks.slice(0, limit).map(summarizeTaskRecord);
+    return {
+      success: true,
+      action,
+      scope: includeAllSessions ? 'all_sessions' : `session+${scope.channel}`,
+      tasks: summarized,
+      message: summarized.length > 0 ? `Found ${summarized.length} task(s).` : 'No tasks found.',
+    };
+  }
+
+  if (action === 'get') {
+    if (!taskId) return { success: false, action, code: 'missing_task_id', message: 'task_control(get) requires task_id.' };
+    const task = loadTask(taskId);
+    if (!task) return { success: false, action, code: 'not_found', message: `Task not found: ${taskId}` };
+    return { success: true, action, task: summarizeTaskRecord(task), message: `Loaded task "${task.title}".` };
+  }
+
+  const resolveCandidateForAction = (candidateAction: 'resume' | 'rerun' | 'pause' | 'cancel' | 'delete') => {
+    if (taskId) {
+      const exact = loadTask(taskId);
+      if (!exact) return { task: null as TaskRecord | null, err: `Task not found: ${taskId}` };
+      return { task: exact, err: '' };
+    }
+
+    const preferredStatuses: TaskStatus[] =
+      candidateAction === 'rerun'
+        ? ['needs_assistance', 'stalled', 'paused', 'failed', 'complete']
+        : candidateAction === 'delete'
+          ? ['needs_assistance', 'stalled', 'paused', 'failed', 'queued', 'complete', 'waiting_subagent']
+          : ['needs_assistance', 'stalled', 'paused', 'failed', 'queued'];
+    const scope = getTaskScopeBuckets(sessionId, preferredStatuses);
+    let preferred = [...scope.sessionTasks, ...scope.channelTasks];
+    if (preferred.length === 0) {
+      preferred = scope.all;
+    }
+    if (preferred.length === 0) {
+      return { task: null as TaskRecord | null, err: 'No matching task found in current scope.' };
+    }
+    if (preferred.length === 1) {
+      return { task: preferred[0], err: '' };
+    }
+    return { task: null as TaskRecord | null, err: 'AMBIGUOUS', candidates: preferred.slice(0, 3) };
+  };
+
+  if (action === 'resume' || action === 'rerun') {
+    const resolved = resolveCandidateForAction(action);
+    if (!resolved.task) {
+      if (resolved.err === 'AMBIGUOUS') {
+        return {
+          success: false,
+          action,
+          code: 'ambiguous',
+          message: 'Multiple tasks match. Provide task_id.',
+          candidates: (resolved.candidates || []).map(summarizeTaskRecord),
+        };
+      }
+      return { success: false, action, code: 'no_candidate', message: resolved.err };
+    }
+    const task = loadTask(resolved.task.id);
+    if (!task) return { success: false, action, code: 'not_found', message: `Task not found: ${resolved.task.id}` };
+    if (BackgroundTaskRunner.isRunning(task.id)) {
+      return {
+        success: true,
+        action,
+        task: summarizeTaskRecord(task),
+        message: `Task "${task.title}" is already running.`,
+      };
+    }
+
+    if (action === 'resume') {
+      if (task.status === 'complete') {
+        return { success: false, action, code: 'already_complete', message: `Task "${task.title}" is complete. Use rerun to restart.` };
+      }
+      updateTaskStatus(task.id, 'queued');
+      appendJournal(task.id, { type: 'resume', content: `task_control resume${note ? `: ${note.slice(0, 220)}` : ''}` });
+      if (note) {
+        const resumeMessages = Array.isArray(task.resumeContext?.messages) ? task.resumeContext.messages : [];
+        updateResumeContext(task.id, {
+          messages: [
+            ...resumeMessages,
+            { role: 'user', content: `[TASK USER FOLLOW-UP]\n${note}`, timestamp: Date.now() },
+          ].slice(-80),
+        });
+      }
+      launchBackgroundTaskRunner(task.id);
+      const refreshed = loadTask(task.id) || task;
+      return {
+        success: true,
+        action,
+        task: summarizeTaskRecord(refreshed),
+        message: `Resumed task "${refreshed.title}" at step ${refreshed.currentStepIndex + 1}/${Math.max(1, refreshed.plan.length)}.`,
+      };
+    }
+
+    // rerun
+    task.status = 'queued';
+    task.pauseReason = undefined;
+    task.currentStepIndex = 0;
+    task.completedAt = undefined;
+    task.finalSummary = undefined;
+    task.lastToolCall = undefined;
+    task.lastToolCallAt = undefined;
+    task.lastProgressAt = Date.now();
+    task.plan = (task.plan || []).map((step, idx) => ({
+      ...step,
+      index: idx,
+      status: 'pending',
+      completedAt: undefined,
+      notes: undefined,
+    }));
+    task.resumeContext = {
+      ...(task.resumeContext || {
+        messages: [],
+        browserSessionActive: false,
+        round: 0,
+        orchestrationLog: [],
+      }),
+      messages: [],
+      browserSessionActive: false,
+      browserUrl: undefined,
+      round: 0,
+      orchestrationLog: [],
+      fileOpState: undefined,
+    };
+    saveTask(task);
+    appendJournal(task.id, { type: 'status_push', content: `task_control rerun${note ? `: ${note.slice(0, 220)}` : ''}` });
+    launchBackgroundTaskRunner(task.id);
+    const refreshed = loadTask(task.id) || task;
+    return {
+      success: true,
+      action,
+      task: summarizeTaskRecord(refreshed),
+      message: `Rerunning task "${refreshed.title}" from step 1/${Math.max(1, refreshed.plan.length)}.`,
+    };
+  }
+
+  if (action === 'pause' || action === 'cancel') {
+    const resolved = resolveCandidateForAction(action as any);
+    if (!resolved.task) {
+      if (resolved.err === 'AMBIGUOUS') {
+        return {
+          success: false,
+          action,
+          code: 'ambiguous',
+          message: 'Multiple tasks match. Provide task_id.',
+          candidates: (resolved.candidates || []).map(summarizeTaskRecord),
+        };
+      }
+      return { success: false, action, code: 'no_candidate', message: resolved.err };
+    }
+    if (action === 'cancel' && args?.confirm !== true) {
+      return { success: false, action, code: 'needs_confirmation', message: 'cancel requires confirm=true.' };
+    }
+    const task = loadTask(resolved.task.id);
+    if (!task) return { success: false, action, code: 'not_found', message: `Task not found: ${resolved.task.id}` };
+    if (BackgroundTaskRunner.isRunning(task.id)) {
+      BackgroundTaskRunner.requestPause(task.id);
+    }
+    updateTaskStatus(task.id, 'paused', { pauseReason: 'user_pause' });
+    appendJournal(task.id, { type: 'pause', content: `task_control ${action}${note ? `: ${note.slice(0, 220)}` : ''}` });
+    const refreshed = loadTask(task.id) || task;
+    return {
+      success: true,
+      action,
+      task: summarizeTaskRecord(refreshed),
+      message: `${action === 'cancel' ? 'Cancelled' : 'Paused'} task "${refreshed.title}".`,
+    };
+  }
+
+  if (action === 'delete') {
+    if (args?.confirm !== true) {
+      return { success: false, action, code: 'needs_confirmation', message: 'delete requires confirm=true.' };
+    }
+    const resolved = resolveCandidateForAction('delete');
+    if (!resolved.task) {
+      if (resolved.err === 'AMBIGUOUS') {
+        return {
+          success: false,
+          action,
+          code: 'ambiguous',
+          message: 'Multiple tasks match. Provide task_id.',
+          candidates: (resolved.candidates || []).map(summarizeTaskRecord),
+        };
+      }
+      return { success: false, action, code: 'no_candidate', message: resolved.err };
+    }
+    if (BackgroundTaskRunner.isRunning(resolved.task.id)) {
+      return { success: false, action, code: 'running', message: `Task "${resolved.task.title}" is running. Pause it before delete.` };
+    }
+    const ok = deleteTask(resolved.task.id);
+    if (!ok) return { success: false, action, code: 'not_found', message: `Task not found: ${resolved.task.id}` };
+    return { success: true, action, message: `Deleted task "${resolved.task.title}" (${resolved.task.id}).` };
+  }
+
+  return { success: false, action, code: 'invalid_action', message: `Unsupported task_control action: ${action}` };
+}
+
+function renderTaskCandidatesForHuman(candidates: Array<Record<string, any>>): string {
+  if (!Array.isArray(candidates) || candidates.length === 0) return 'No candidates found.';
+  return candidates
+    .slice(0, 3)
+    .map((c, i) => `${i + 1}. ${c.title} [${c.status}] — Task ID: ${c.task_id}`)
+    .join('\n');
 }
 
 async function tryHandleBlockedTaskFollowup(sessionId: string, rawMessage: string): Promise<string | null> {
@@ -4500,72 +5478,25 @@ async function tryHandleBlockedTaskFollowup(sessionId: string, rawMessage: strin
   const message = String(rawMessage || '').trim();
   if (!message) return null;
 
+  // Only intercept when there is an explicit task ID in the message AND a clear control verb.
+  // Everything else — including greetings, new requests, ambiguous messages — falls through
+  // to the AI so the LLM can decide what to do. No hardcoded fake responses.
+  const explicitTaskId = parseTaskIdFromText(message);
+  if (!explicitTaskId) return null;
+
+  const rerunRequested = isRerunIntent(message);
   const resumeRequested = isResumeIntent(message);
-  const statusQuestion = isStatusQuestion(message);
-  const adjustmentRequested = isAdjustmentIntent(message);
-  let task = findBlockedTaskForSession(sessionId);
-  if (!task && resumeRequested) {
-    task = latestTaskForSession(sessionId, ['paused']);
-  }
-  if (!task) return null;
-
   const cancelRequested = isCancelIntent(message);
-  if (cancelRequested) {
-    updateTaskStatus(task.id, 'paused', { pauseReason: 'user_pause' });
-    appendJournal(task.id, { type: 'pause', content: `User requested stop: ${message.slice(0, 220)}` });
-    const ws = getWorkspace(sessionId) || (getConfig().getConfig() as any).workspace?.path || '';
-    if (ws) {
-      await hookBus.fire({
-        type: 'command:stop',
-        sessionId,
-        workspacePath: ws,
-        timestamp: Date.now(),
-      });
-    }
-    return `Paused task \"${task.title}\".`;
-  }
 
-  if (statusQuestion && !resumeRequested) {
-    appendJournal(task.id, { type: 'status_push', content: `User requested status while blocked: ${message.slice(0, 220)}` });
-    return buildBlockedTaskStatusMessage(task);
-  }
+  if (!rerunRequested && !resumeRequested && !cancelRequested) return null;
 
-  if (!resumeRequested && !adjustmentRequested) {
-    appendJournal(task.id, { type: 'status_push', content: `Ignored non-resume follow-up while blocked: ${message.slice(0, 220)}` });
-    return [
-      `Task \"${task.title}\" is still paused.`,
-      `I did not resume it yet.`,
-      `Reply "resume" to continue, or send an explicit adjustment.`,
-      `Task ID: ${task.id}`,
-    ].join('\n');
-  }
-
-  const liveTask = loadTask(task.id);
-  if (!liveTask) return null;
-
-  appendJournal(task.id, { type: 'resume', content: `User follow-up: ${message.slice(0, 220)}` });
-  const resumeMessages = Array.isArray(liveTask.resumeContext?.messages)
-    ? liveTask.resumeContext.messages
-    : [];
-  const nextMessages = [
-    ...resumeMessages,
-    { role: 'user', content: `[TASK USER FOLLOW-UP]\n${message}`, timestamp: Date.now() },
-  ].slice(-80);
-  updateResumeContext(task.id, { messages: nextMessages });
-
-  if (BackgroundTaskRunner.isRunning(task.id)) {
-    return `Task \"${task.title}\" is already running. I added your instruction and it will apply on the next step.`;
-  }
-
-  updateTaskStatus(task.id, 'queued');
-  const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
-  runner.start().catch(err => console.error(`[BackgroundTaskRunner] Follow-up resume ${task.id} error:`, err.message));
-
-  const refreshed = loadTask(task.id) || liveTask;
-  if (resumeRequested) {
-    return `Resumed task \"${task.title}\" at step ${refreshed.currentStepIndex + 1}/${refreshed.plan.length}.`;
-  }
-  return `Queued your adjustment and resumed task \"${task.title}\" at step ${refreshed.currentStepIndex + 1}/${refreshed.plan.length}.`;
+  const action = rerunRequested ? 'rerun' : cancelRequested ? 'pause' : 'resume';
+  const ctl = await handleTaskControlAction(sessionId, {
+    action,
+    task_id: explicitTaskId,
+    note: message,
+  });
+  return ctl.success ? (ctl.message || null) : null;
 }
 
 const app = express();
@@ -4851,6 +5782,7 @@ function getOrchestrationConfigForApi() {
     },
     ...clamped,
     preempt,
+    subagent_mode: raw.subagent_mode === true,
   };
 }
 
@@ -4932,8 +5864,16 @@ app.post('/api/orchestration/config', (req, res) => {
     },
   };
 
-  getConfig().updateConfig({ orchestration: merged } as any);
-  res.json({ success: true, config: merged });
+  // Persist subagent_mode separately (not inside clampOrchestrationConfig)
+  const finalMerged = {
+    ...merged,
+    subagent_mode: typeof incoming.subagent_mode === 'boolean'
+      ? incoming.subagent_mode
+      : (current as any).subagent_mode ?? false,
+  };
+
+  getConfig().updateConfig({ orchestration: finalMerged } as any);
+  res.json({ success: true, config: finalMerged });
 });
 
 app.get('/api/orchestration/eligible', async (_req, res) => {
@@ -5088,6 +6028,30 @@ app.post('/api/bg-tasks/:id/resume', (req, res) => {
   } else {
     res.json({ success: false, error: `Task status is ${task.status}, cannot resume` });
   }
+});
+
+// Inject a user message into the task's session — lets the web UI chat directly with the task agent.
+// If the task is paused/needs_assistance, it also resumes it so the agent sees and responds to the message.
+app.post('/api/bg-tasks/:id/message', async (req: any, res: any) => {
+  const task = loadTask(req.params.id);
+  if (!task) { res.status(404).json({ success: false, error: 'Task not found' }); return; }
+  const userMessage = String(req.body?.message || '').trim();
+  if (!userMessage) { res.status(400).json({ success: false, error: 'message is required' }); return; }
+
+  // Inject the message into the task session so the agent sees it on the next round.
+  const sessionId = `task_${task.id}`;
+  addMessage(sessionId, { role: 'user', content: userMessage, timestamp: Date.now() });
+  appendJournal(task.id, { type: 'status_push', content: `User replied via task panel: ${userMessage.slice(0, 200)}` });
+
+  // If the task is waiting for guidance, resume it so it processes the message.
+  const needsResume = task.status === 'needs_assistance' || task.status === 'paused' || task.status === 'stalled';
+  if (needsResume) {
+    updateTaskStatus(task.id, 'queued');
+    const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
+    runner.start().catch((err: any) => console.error(`[BackgroundTaskRunner] MessageResume ${task.id} error:`, err.message));
+  }
+
+  res.json({ success: true, resumed: needsResume });
 });
 
 // SSE stream for live task updates
@@ -5582,6 +6546,244 @@ app.post('/api/telegram/send-test', async (req, res) => {
   }
 });
 
+type AgentToolProfile = 'minimal' | 'coding' | 'web' | 'full';
+
+function sanitizeAgentId(value: any): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function normalizeAgentDefinition(raw: any, fallbackId?: string): any {
+  const id = sanitizeAgentId(raw?.id || fallbackId || '');
+  const profile = String(raw?.tools?.profile || '').trim();
+  const normalized: any = {
+    id,
+    name: String(raw?.name || id || 'Agent').trim() || 'Agent',
+  };
+  if (raw?.description !== undefined) normalized.description = String(raw.description || '').trim();
+  if (raw?.emoji !== undefined) normalized.emoji = String(raw.emoji || '').trim();
+  if (raw?.workspace !== undefined) normalized.workspace = String(raw.workspace || '').trim();
+  if (raw?.model !== undefined) normalized.model = String(raw.model || '').trim();
+  if (typeof raw?.minimalPrompt === 'boolean') normalized.minimalPrompt = raw.minimalPrompt;
+  if (typeof raw?.default === 'boolean') normalized.default = raw.default;
+  if (typeof raw?.canSpawn === 'boolean') normalized.canSpawn = raw.canSpawn;
+  if (raw?.cronSchedule !== undefined) normalized.cronSchedule = String(raw.cronSchedule || '').trim();
+  if (raw?.maxSteps !== undefined) {
+    const n = Number(raw.maxSteps);
+    if (Number.isFinite(n) && n > 0) normalized.maxSteps = Math.floor(n);
+  }
+  if (Array.isArray(raw?.spawnAllowlist)) {
+    normalized.spawnAllowlist = raw.spawnAllowlist
+      .map((v: any) => sanitizeAgentId(v))
+      .filter((v: string) => !!v);
+  }
+  if (raw?.tools && typeof raw.tools === 'object') {
+    normalized.tools = {};
+    if (Array.isArray(raw.tools.allow)) normalized.tools.allow = raw.tools.allow.map((s: any) => String(s || '').trim()).filter(Boolean);
+    if (Array.isArray(raw.tools.deny)) normalized.tools.deny = raw.tools.deny.map((s: any) => String(s || '').trim()).filter(Boolean);
+    if (['minimal', 'coding', 'web', 'full'].includes(profile)) normalized.tools.profile = profile as AgentToolProfile;
+    if (!normalized.tools.allow && !normalized.tools.deny && !normalized.tools.profile) delete normalized.tools;
+  }
+  if (Array.isArray(raw?.bindings)) {
+    normalized.bindings = raw.bindings
+      .filter((b: any) => b && ['telegram', 'discord', 'whatsapp'].includes(String(b.channel || '')))
+      .map((b: any) => ({
+        channel: String(b.channel),
+        ...(b.accountId ? { accountId: String(b.accountId) } : {}),
+        ...(b.peerId ? { peerId: String(b.peerId) } : {}),
+      }));
+  }
+  return normalized;
+}
+
+function normalizeAgentsForSave(incomingAgents: any[]): any[] {
+  const out: any[] = [];
+  const seen = new Set<string>();
+  for (const raw of incomingAgents || []) {
+    const n = normalizeAgentDefinition(raw);
+    if (!n.id || seen.has(n.id)) continue;
+    seen.add(n.id);
+    out.push(n);
+  }
+  if (out.length > 0 && !out.some(a => a.default === true)) out[0].default = true;
+  if (out.filter(a => a.default === true).length > 1) {
+    let found = false;
+    for (const a of out) {
+      if (a.default === true && !found) { found = true; continue; }
+      if (a.default === true) a.default = false;
+    }
+  }
+  return out;
+}
+
+function findLastCronRunAt(agentId: string): number | null {
+  const entries = getAgentRunHistory(agentId, 100);
+  const hit = entries.find((e) => e.trigger === 'cron');
+  return hit ? hit.finishedAt : null;
+}
+
+app.get('/api/agents', (_req, res) => {
+  const cfg = getConfig().getConfig() as any;
+  const explicitAgents = Array.isArray(cfg.agents) ? cfg.agents : [];
+  const agents = getAgents().map((agent) => {
+    const workspace = resolveAgentWorkspace(agent as any);
+    const lastRun = getAgentLastRun(agent.id);
+    return {
+      ...agent,
+      workspaceResolved: workspace,
+      workspaceExists: fs.existsSync(workspace),
+      isSynthetic: explicitAgents.length === 0 && agent.id === 'main',
+      lastRun: lastRun || null,
+      lastHeartbeatAt: findLastCronRunAt(agent.id),
+    };
+  });
+  const defaultAgent = agents.find((a) => a.default) || agents[0] || null;
+  res.json({ success: true, agents, defaultAgentId: defaultAgent?.id || null });
+});
+
+app.get('/api/agents/history', (req, res) => {
+  const agentId = String(req.query.agentId || '').trim() || undefined;
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
+  res.json({ success: true, history: getAgentRunHistory(agentId, limit) });
+});
+
+app.post('/api/agents', (req, res) => {
+  const incoming = req.body?.agent || req.body || {};
+  const normalized = normalizeAgentDefinition(incoming);
+  if (!normalized.id) {
+    res.status(400).json({ success: false, error: 'agent.id is required' });
+    return;
+  }
+  const cm = getConfig();
+  const current = cm.getConfig() as any;
+  const explicitAgents = Array.isArray(current.agents) ? current.agents : [];
+  const idx = explicitAgents.findIndex((a: any) => sanitizeAgentId(a.id) === normalized.id);
+  const next = idx >= 0
+    ? explicitAgents.map((a: any, i: number) => (i === idx ? { ...a, ...normalized } : a))
+    : [...explicitAgents, normalized];
+  const finalAgents = normalizeAgentsForSave(next);
+  cm.updateConfig({ agents: finalAgents } as any);
+  const saved = finalAgents.find(a => a.id === normalized.id);
+  if (saved) ensureAgentWorkspace(saved as any);
+  reloadAgentSchedules();
+  res.json({ success: true, agent: saved || normalized, created: idx < 0 });
+});
+
+app.put('/api/agents/:id', (req, res) => {
+  const targetId = sanitizeAgentId(req.params.id);
+  if (!targetId) {
+    res.status(400).json({ success: false, error: 'Invalid agent id' });
+    return;
+  }
+  const cm = getConfig();
+  const current = cm.getConfig() as any;
+  const explicitAgents = Array.isArray(current.agents) ? current.agents : [];
+  const idx = explicitAgents.findIndex((a: any) => sanitizeAgentId(a.id) === targetId);
+  if (idx < 0) {
+    res.status(404).json({ success: false, error: `Agent "${targetId}" not found in config` });
+    return;
+  }
+  const merged = normalizeAgentDefinition({ ...explicitAgents[idx], ...(req.body?.agent || req.body || {}), id: targetId }, targetId);
+  const next = explicitAgents.map((a: any, i: number) => (i === idx ? merged : a));
+  const finalAgents = normalizeAgentsForSave(next);
+  cm.updateConfig({ agents: finalAgents } as any);
+  ensureAgentWorkspace(merged as any);
+  reloadAgentSchedules();
+  res.json({ success: true, agent: merged });
+});
+
+app.delete('/api/agents/:id', (req, res) => {
+  const targetId = sanitizeAgentId(req.params.id);
+  const cm = getConfig();
+  const current = cm.getConfig() as any;
+  const explicitAgents = Array.isArray(current.agents) ? current.agents : [];
+  const next = explicitAgents.filter((a: any) => sanitizeAgentId(a.id) !== targetId);
+  if (next.length === explicitAgents.length) {
+    res.status(404).json({ success: false, error: `Agent "${targetId}" not found` });
+    return;
+  }
+  const finalAgents = normalizeAgentsForSave(next);
+  cm.updateConfig({ agents: finalAgents } as any);
+  reloadAgentSchedules();
+  res.json({ success: true });
+});
+
+app.get('/api/agents/:id/agents-md', (req, res) => {
+  const agentId = sanitizeAgentId(req.params.id);
+  const agent = getAgentById(agentId);
+  if (!agent) {
+    res.status(404).json({ success: false, error: `Agent "${agentId}" not found` });
+    return;
+  }
+  const workspace = ensureAgentWorkspace(agent as any);
+  const filePath = path.join(workspace, 'AGENTS.md');
+  const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+  res.json({ success: true, agentId, path: filePath, content });
+});
+
+app.put('/api/agents/:id/agents-md', (req, res) => {
+  const agentId = sanitizeAgentId(req.params.id);
+  const agent = getAgentById(agentId);
+  if (!agent) {
+    res.status(404).json({ success: false, error: `Agent "${agentId}" not found` });
+    return;
+  }
+  const content = String(req.body?.content || '');
+  const workspace = ensureAgentWorkspace(agent as any);
+  const filePath = path.join(workspace, 'AGENTS.md');
+  fs.writeFileSync(filePath, content, 'utf-8');
+  res.json({ success: true, path: filePath });
+});
+
+app.post('/api/agents/:id/spawn', async (req, res) => {
+  const agentId = sanitizeAgentId(req.params.id);
+  const agent = getAgentById(agentId);
+  if (!agent) {
+    res.status(404).json({ success: false, error: `Agent "${agentId}" not found` });
+    return;
+  }
+  const task = String(req.body?.task || '').trim();
+  if (!task) {
+    res.status(400).json({ success: false, error: 'task is required' });
+    return;
+  }
+  const context = req.body?.context !== undefined ? String(req.body.context) : undefined;
+  const maxStepsRaw = req.body?.maxSteps;
+  const maxSteps = Number.isFinite(Number(maxStepsRaw)) && Number(maxStepsRaw) > 0
+    ? Math.floor(Number(maxStepsRaw))
+    : undefined;
+  const timeoutRaw = req.body?.timeoutMs;
+  const timeoutMs = Number.isFinite(Number(timeoutRaw)) && Number(timeoutRaw) > 0
+    ? Math.floor(Number(timeoutRaw))
+    : 120000;
+
+  const startedAt = Date.now();
+  const result = await spawnAgent({
+    agentId,
+    task,
+    context,
+    maxSteps,
+    timeoutMs,
+  });
+  const finishedAt = Date.now();
+  const historyEntry = recordAgentRun({
+    agentId: result.agentId,
+    agentName: result.agentName,
+    trigger: 'manual',
+    success: result.success,
+    startedAt,
+    finishedAt,
+    durationMs: result.durationMs,
+    stepCount: result.stepCount,
+    error: result.error,
+    resultPreview: result.success ? String(result.result || '').slice(0, 400) : undefined,
+  });
+  res.json({ success: result.success, result, historyEntry });
+});
+
 // ─── Settings API ────────────────────────────────────────────────────────────────
 
 app.get('/api/settings/search', (_req, res) => {
@@ -5852,36 +7054,136 @@ app.get('/api/agent/session/:id', (req, res) => {
 // Track agent mode per-session (simplified)
 let useAgentMode = false;
 
-// ─── Approvals API (stub — full approval workflow in enterprise builds) ───
+// ─── Approvals API ───────────────────────────────────────────────────────────
+// SECURITY: All approval endpoints require gateway auth. Approvals are the
+// confirmation gate before the agent executes irreversible actions — an
+// unauthenticated bypass here is a critical vulnerability.
+
+// ─── Gateway Auth Middleware ──────────────────────────────────────────────────
+// CRIT-03 / CRIT-01 fix: protects approval, memory-confirm, and open-path
+// endpoints from unauthenticated access.
+//
+// Auth strategy (in priority order):
+//   1. Bearer token in Authorization header  →  Authorization: Bearer <token>
+//   2. X-Gateway-Token header                →  X-Gateway-Token: <token>
+//   3. Localhost bypass (127.0.0.1 / ::1)    →  always trusted when no token configured
+//
+// Token is read from config at request time so it takes effect immediately
+// after a config save without requiring a gateway restart.
+
+function requireGatewayAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+): void {
+  const cfg = getConfig().getConfig() as any;
+  const configuredToken = String(cfg?.gateway?.auth_token || '').trim();
+
+  // If no token is configured, fall back to localhost-only access.
+  if (!configuredToken) {
+    const remoteIp = String(
+      req.ip ||
+      req.socket?.remoteAddress ||
+      (req.connection as any)?.remoteAddress ||
+      ''
+    );
+    const isLocalhost =
+      remoteIp === '127.0.0.1' ||
+      remoteIp === '::1' ||
+      remoteIp === '::ffff:127.0.0.1';
+    if (isLocalhost) {
+      next();
+      return;
+    }
+    res.status(401).json({ error: 'Unauthorized: configure gateway.auth_token to enable remote access to this endpoint.' });
+    return;
+  }
+
+  // Extract token from Authorization header or X-Gateway-Token header.
+  const authHeader = String(req.headers['authorization'] || '');
+  const xGatewayToken = String(req.headers['x-gateway-token'] || '');
+  let providedToken = '';
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    providedToken = authHeader.slice('bearer '.length).trim();
+  } else if (xGatewayToken) {
+    providedToken = xGatewayToken.trim();
+  }
+
+  if (!providedToken || providedToken !== configuredToken) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  next();
+}
 
 const pendingApprovals: Map<string, { id: string; action: string; reason: string }> = new Map();
 
-app.get('/api/approvals', (_req, res) => {
+app.get('/api/approvals', requireGatewayAuth, (_req, res) => {
   res.json(Array.from(pendingApprovals.values()));
 });
 
-app.post('/api/approvals/:id', (req, res) => {
+app.post('/api/approvals/:id', requireGatewayAuth, (req, res) => {
   const { decision } = req.body;
+  const VALID_DECISIONS = ['approved', 'rejected'];
+  if (!decision || !VALID_DECISIONS.includes(decision)) {
+    res.status(400).json({ success: false, error: `decision must be one of: ${VALID_DECISIONS.join(', ')}` });
+    return;
+  }
+  const approval = pendingApprovals.get(req.params.id);
+  if (!approval) {
+    res.status(404).json({ success: false, error: 'Approval not found' });
+    return;
+  }
   pendingApprovals.delete(req.params.id);
+  // Security audit: log every approval action (action name only, no payload)
+  import('../security/log-scrubber').then(({ log }) => {
+    log.security('[approvals]', decision.toUpperCase(), 'approval-id:', req.params.id, 'action:', approval.action);
+  }).catch(() => {});
   res.json({ success: true, decision });
 });
 
 // ─── Memory API (stub) ───────────────────────────────────────────────────────────
 
-app.post('/api/memory/confirm', (req, res) => {
+app.post('/api/memory/confirm', requireGatewayAuth, (req, res) => {
   // Memory persistence stub — can be wired to ChromaDB/vector store
-  console.log('[Memory] Confirmation request:', JSON.stringify(req.body).slice(0, 200));
+  // SECURITY: req.body is user/agent-supplied content — never log it raw.
+  // scrubSecrets runs inside sanitizeToolLog before any write.
+  import('../security/log-scrubber').then(({ log, sanitizeToolLog }) => {
+    log.info('[Memory]', sanitizeToolLog('confirm', req.body));
+  }).catch(() => {});
   res.json({ ok: true });
 });
 
 // Open a file path in the OS file explorer
-app.post('/api/open-path', async (req, res) => {
+// SECURITY: This endpoint uses execFile() (not exec()) so the path is passed
+// as an argument, not interpolated into a shell string. The path is also
+// validated to be inside the workspace before execution.
+app.post('/api/open-path', requireGatewayAuth, async (req, res) => {
   const fp = (req.body?.path || '') as string;
   if (!fp) { res.status(400).json({ ok: false, error: 'Path required' }); return; }
+
+  // Resolve and validate — must be inside workspace or config dir
+  const resolvedFp = path.resolve(fp);
+  const workspacePath = getConfig().getWorkspacePath();
+  const configDirPath = getConfig().getConfigDir();
+  const isInWorkspace = resolvedFp.startsWith(path.resolve(workspacePath));
+  const isInConfigDir = resolvedFp.startsWith(path.resolve(configDirPath));
+  if (!isInWorkspace && !isInConfigDir) {
+    res.status(403).json({ ok: false, error: 'Path is outside allowed directories' });
+    return;
+  }
+
   try {
-    const { exec } = await import('child_process');
-    const cmd = process.platform === 'win32' ? `explorer "${fp}"` : process.platform === 'darwin' ? `open "${fp}"` : `xdg-open "${fp}"`;
-    exec(cmd);
+    const { execFile } = await import('child_process');
+    // execFile passes args as a list — no shell interpolation possible
+    if (process.platform === 'win32') {
+      execFile('explorer.exe', [resolvedFp]);
+    } else if (process.platform === 'darwin') {
+      execFile('open', [resolvedFp]);
+    } else {
+      execFile('xdg-open', [resolvedFp]);
+    }
     res.json({ ok: true });
   } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
 });
@@ -5905,14 +7207,33 @@ function sanitizeLLMConfig(llm: any): any {
   return copy;
 }
 
-// GET /api/settings/provider  — return active provider config
+// HIGH-02 fix: redact all api_key / token fields before sending to the UI.
+// Vault references ("vault:...") and env references ("env:...") are also masked
+// so neither the vault key name nor the env var name leaks to the browser.
+const SENSITIVE_KEY_PATTERNS = /api[_-]?key|apikey|token|secret|password|passwd|credential/i;
+
+function redactConfigForUI(obj: any, depth = 0): any {
+  if (depth > 8 || obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(v => redactConfigForUI(v, depth + 1));
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (SENSITIVE_KEY_PATTERNS.test(k) && typeof v === 'string' && v.length > 0) {
+      out[k] = '••••••••';
+    } else {
+      out[k] = redactConfigForUI(v, depth + 1);
+    }
+  }
+  return out;
+}
+
+// GET /api/settings/provider  — return active provider config (keys redacted)
 app.get('/api/settings/provider', (_req, res) => {
   const raw = getConfig().getConfig() as any;
   const llmRaw = raw.llm || {
     provider: 'ollama',
     providers: { ollama: { endpoint: raw.ollama?.endpoint || 'http://localhost:11434', model: raw.models?.primary || 'qwen3:4b' } },
   };
-  const llm = sanitizeLLMConfig(llmRaw);
+  const llm = redactConfigForUI(sanitizeLLMConfig(llmRaw));
   res.json({ success: true, llm });
 });
 
@@ -6168,8 +7489,11 @@ server.listen(PORT, HOST, () => {
 
   const liveConfig = getConfig().getConfig();
   const searchCfg = (liveConfig as any).search || {};
-  const searchProvider = searchCfg.preferred_provider || 'none';
-  const hasSearch = searchCfg.tavily_api_key ? '✓ Tavily' : searchCfg.google_api_key ? '✓ Google' : '✗ None (configure in Settings → Search)';
+  // HIGH-03: resolve vault references before checking presence — never log the key value itself
+  const cm = getConfig();
+  const tavilyKey = cm.resolveSecret(searchCfg.tavily_api_key);
+  const googleKey = cm.resolveSecret(searchCfg.google_api_key);
+  const hasSearch = tavilyKey ? '✓ Tavily' : googleKey ? '✓ Google' : '✗ None (configure in Settings → Search)';
   console.log(`
 ╔════════════════════════════════════════════════════════════════╗
 ║              SmallClaw v2 Gateway (Native Tools)              ║
@@ -6189,6 +7513,8 @@ server.listen(PORT, HOST, () => {
 
   cronScheduler.start();
   console.log('[CronScheduler] Tick loop started — heartbeat:', cronScheduler.getConfig().enabled ? 'ON' : 'OFF');
+  initializeAgentSchedules();
+  console.log('[Scheduler] Agent cron schedules initialized.');
   heartbeatRunner.start();
   console.log('[HeartbeatRunner] Started — interval:', heartbeatRunner.getConfig().intervalMinutes, 'min');
   telegramChannel.start().then(() => {
@@ -6237,6 +7563,7 @@ function gracefulShutdown(signal: 'SIGINT' | 'SIGTERM'): void {
   try { telegramChannel.stop(); } catch {}
   try { getMCPManager().disconnectAll(); } catch {}
   try { cronScheduler.stop(); } catch {}
+  try { stopAgentSchedules(); } catch {}
   try { heartbeatRunner.stop(); } catch {}
   try { if (wss) wss.close(); } catch {}
   try {

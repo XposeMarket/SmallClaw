@@ -56,9 +56,14 @@ const AUTH_RATE_LIMIT_LOCKOUT_MS = 15 * 60 * 1000; // 15 minute lockout
 
 export function resolveHookConfig(): HookConfig {
   const raw = (getConfig().getConfig() as any).hooks || {};
+  // HIGH-01 fix: resolve vault reference before returning token
+  const rawToken = String(raw.token || '').trim();
+  const token = rawToken.startsWith('vault:')
+    ? (getConfig().resolveSecret(rawToken) || '')
+    : rawToken;
   return {
     enabled: raw.enabled === true,
-    token: String(raw.token || '').trim(),
+    token,
     path: String(raw.path || '/hooks').replace(/\/+$/, '') || '/hooks',
   };
 }

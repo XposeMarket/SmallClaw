@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Claw Creative Landing</title>
+    <style>
+      body {
+        font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+        margin: 0;
+        background: #0a0f1a;
+        color: #f5f5f5;
+        line-height: 1.6;
+      }
+
+      .page {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      header {
+        padding: 3rem 6vw;
+        background: linear-gradient(135deg, #1f3dff, #521ecf);
+      }
+
+      h1 {
+        font-size: clamp(2.5rem, 4vw, 4rem);
+        margin: 0;
+        letter-spacing: 1px;
+      }
+
+      p {
+        margin: 1rem 0 0;
+        max-width: 640px;
+        color: #d9ddff;
+      }
+
+      .cta {
+        margin-top: 2rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.95rem 2rem;
+        border-radius: 999px;
+        background: #f3f3f3;
+        color: #0b0c12;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      main {
+        flex: 1;
+        padding: 4rem 6vw 6rem;
+        display: grid;
+        gap: 2rem;
+      }
+
+      .panel-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 1.5rem;
+      }
+
+      .panel {
+        background: #11152b;
+        border-radius: 1.25rem;
+        padding: 1.75rem;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 20px 40px rgba(4, 12, 35, 0.5);
+      }
+
+      .panel h3 {
+        margin-top: 0;
+        font-size: 1.25rem;
+      }
+
+      .badge {
+        display: inline-flex;
+        padding: 0.35rem 0.9rem;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        font-size: 0.8rem;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+      }
+
+      .hero-pill {
+        margin-top: 1rem;
+        padding: 0.5rem 1rem;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        display: inline-flex;
+        font-size: 0.9rem;
+      }
+
+      .stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+      }
+
+      .stat {
+        flex: 1;
+        min-width: 120px;
+        padding: 1.5rem;
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 1rem;
+        border: 1px solid rgba(255, 255, 255, 0.05);
+      }
+
+      footer {
+        padding: 2rem 6vw;
+        background: #05070f;
+        text-align: center;
+        font-size: 0.9rem;
+        color: #8c92b0;
+      }
+
+      @media (max-width: 620px) {
+        header {
+          padding: 2.5rem 5vw;
+        }
+
+        main {
+          padding: 3rem 5vw 4rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <div class="badge">beta build</div>
+        <h1>Landing experiences for curious creators.</h1>
+        <p>
+          A quick playground landing that demonstrates structure, contrast, and rhythm across
+          hero, columns, and callouts.
+        </p>
+        <a class="cta" href="#sections">Explore the layout</a>
+      </header>
+
+      <main id="sections">
+        <div class="panel">
+          <div class="hero-pill">Design System</div>
+          <h3>Harmonized sections for fast iteration.</h3>
+          <p>
+            Modular panels and gradients make it easy to swap messaging while maintaining a
+            cohesive aesthetic.
+          </p>
+          <div class="stats">
+            <div class="stat">
+              <strong>6</strong>
+              <p>adaptive blocks</p>
+            </div>
+            <div class="stat">
+              <strong>24hr</strong>
+              <p>build cycle</p>
+            </div>
+            <div class="stat">
+              <strong>99%</strong>
+              <p>visual polish</p>
+            </div>
+          </div>
+        </div>
+
+        <section class="panel-grid">
+          <article class="panel">
+            <h3>Interactive panels</h3>
+            <p>
+              Each card responds to viewport changes, keeping content crisp from desktop right down to
+              pocket-sized phones.
+            </p>
+          </article>
+          <article class="panel">
+            <h3>Strategic storytelling</h3>
+            <p>
+              Every panel leads with a value statement followed by supporting detail, inviting the eye
+              to read further without overwhelm.
+            </p>
+          </article>
+          <article class="panel">
+            <h3>Accessible contrast</h3>
+            <p>
+              Deep gradients and light text keep contrast high while neon accents guide the call to
+              action.
+            </p>
+          </article>
+        </section>
+
+        <section class="panel">
+          <h3>Testimonials</h3>
+          <p>
+            “The landing prototype became our rallying point. With a grid this flexible, we can demo
+            more concepts before any code review happens.” — Product Ops, Trailhead Labs
+          </p>
+        </section>
+      </main>
+
+      <footer>
+        <p>© 2026 Claw Creative. Built as a test of capabilities—ready for whatever you throw next.</p>
+      </footer>
+    </div>
+  </body>
+</html>

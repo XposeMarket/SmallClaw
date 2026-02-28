@@ -61,6 +61,8 @@ export class OpenAICodexAdapter implements LLMProvider {
   private buildInput(messages: ChatMessage[]): any[] {
     const input: any[] = [];
     const pendingCallIds: string[] = [];
+    const knownCallIds = new Set<string>();
+    const consumedCallIds = new Set<string>();
     let fallbackSeq = 0;
     const nextFallbackCallId = () => `autocall_${Date.now()}_${++fallbackSeq}`;
     const asJsonArgumentString = (value: any): string => {
@@ -78,8 +80,9 @@ export class OpenAICodexAdapter implements LLMProvider {
 
       if (m.role === 'assistant' && m.tool_calls?.length) {
         for (const tc of m.tool_calls) {
-          const callId = String(tc?.id || '').trim() || nextFallbackCallId();
+          const callId = String(tc?.id || (tc as any)?.call_id || '').trim() || nextFallbackCallId();
           pendingCallIds.push(callId);
+          knownCallIds.add(callId);
           input.push({
             type: 'function_call',
             call_id: callId,
@@ -95,6 +98,11 @@ export class OpenAICodexAdapter implements LLMProvider {
         if (!callId && pendingCallIds.length > 0) {
           callId = pendingCallIds.shift()!;
         }
+        if (callId) {
+          // Keep the pending queue in sync even when tool_call_id is explicitly provided.
+          const idx = pendingCallIds.indexOf(callId);
+          if (idx !== -1) pendingCallIds.splice(idx, 1);
+        }
         if (!callId) {
           // Some internal orchestration paths emit informational "tool" messages
           // that are not outputs for a real function_call. Codex rejects those as
@@ -108,6 +116,18 @@ export class OpenAICodexAdapter implements LLMProvider {
           });
           continue;
         }
+        if (!knownCallIds.has(callId) || consumedCallIds.has(callId)) {
+          // Guard against desync: never send function_call_output for unknown/duplicate IDs.
+          // Preserve context as assistant text instead of hard-failing the whole request.
+          const toolName = String((m as any).tool_name || m.name || 'tool').slice(0, 80);
+          const content = typeof m.content === 'string' ? m.content : '';
+          input.push({
+            role: 'assistant',
+            content: `[tool-note:${toolName}] ${content}`.slice(0, 12000),
+          });
+          continue;
+        }
+        consumedCallIds.add(callId);
         input.push({
           type: 'function_call_output',
           call_id: callId,
