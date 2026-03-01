@@ -40,7 +40,7 @@
 
 **Local AI agent framework with local + cloud provider support** — an open source alternative to cloud AI assistants that runs on your machine with free local models.
 
-**Current release:** `v1.0.3`
+**Current release:** `v1.0.4`
 
 ---
 
