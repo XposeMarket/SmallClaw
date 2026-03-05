@@ -13,6 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import { Cron } from 'croner';
+import { BackgroundTaskRunner } from './background-task-runner';
 import { clearHistory } from './session';
 import { getConfig } from '../config/config';
 
@@ -40,6 +41,7 @@ export interface CronJob {
   deleteAfterRun?: boolean;
   nextRun: string | null;
   status: 'scheduled' | 'queued' | 'running' | 'completed' | 'paused';
+  pausedReason?: 'manual' | 'interrupted_by_schedule';
   lastOutputSessionId: string | null;  // last auto-created session containing output
   createdAt: string;
 }
@@ -165,6 +167,9 @@ interface SchedulerDeps {
   deliverTelegram?: (text: string) => Promise<void>; // optional telegram delivery
   getMainSessionId?: () => string;
   injectSystemEvent?: (sessionId: string, text: string, job: CronJob) => void;
+  // NEW: spawn a proper BackgroundTask instead of raw handleChat
+  // Returns a Promise so the caller can await the task creation (including preflight plan generation)
+  spawnBackgroundTask?: (job: CronJob) => Promise<{ taskId: string; sessionId: string } | null>;
 }
 
 export class CronScheduler {
@@ -173,6 +178,7 @@ export class CronScheduler {
   private deps: SchedulerDeps;
   private tickInterval: NodeJS.Timeout | null = null;
   private runningJobId: string | null = null;
+  private interruptedTasksBySchedule: Map<string, string[]> = new Map(); // scheduleId -> [taskIds]
 
   private defaultStore(): CronStore {
     return {
@@ -381,9 +387,10 @@ export class CronScheduler {
 
   start(): void {
     if (this.tickInterval) return;
-    // Tick every 60 seconds — resolution is fine for minute-level cron
-    this.tickInterval = setInterval(() => this.tick(), 60 * 1000);
-    console.log('[CronScheduler] Started — ticking every 60s');
+    // Tick every 10 seconds for better cron accuracy
+    // 60s intervals could miss a 1-minute cron window; 10s ensures we catch every due job
+    this.tickInterval = setInterval(() => this.tick(), 10 * 1000);
+    console.log('[CronScheduler] Started — ticking every 10s for accurate cron execution');
   }
 
   stop(): void {
@@ -404,14 +411,30 @@ export class CronScheduler {
   }
 
   private tick(): void {
-    if (!this.store.heartbeat.enabled) return;
+    // CRITICAL: Check if ANY cron jobs are enabled, not just heartbeat!
+    // Heartbeat is a separate feature — regular cron jobs should execute independent of it.
+    const hasEnabledJobs = this.store.jobs.some(j => j.enabled && j.type !== 'heartbeat');
+    if (!hasEnabledJobs && !this.store.heartbeat.enabled) return;
+    
     if (this.runningJobId) return; // one at a time
     if (this.deps.getIsModelBusy()) {
       console.log('[CronScheduler] Tick skipped — model is busy with user chat');
       return;
     }
-    if (!this.isWithinActiveHours()) {
-      console.log('[CronScheduler] Tick skipped — outside active hours');
+    // Active hours only gates the heartbeat — NOT explicit cron jobs.
+    // If a user scheduled "daily at 9:59 PM", that fires regardless of active hours.
+    // We only apply the active hours check when the ONLY pending work is heartbeat.
+    const hasOverdueExplicitJobs = this.store.jobs.some(j =>
+      j.enabled &&
+      j.type !== 'heartbeat' &&
+      j.status !== 'running' &&
+      j.status !== 'paused' &&
+      j.status !== 'completed' &&
+      j.nextRun !== null &&
+      new Date(j.nextRun) <= new Date()
+    );
+    if (!hasOverdueExplicitJobs && !this.isWithinActiveHours()) {
+      // Only skip if there are no explicit cron jobs due — heartbeat respects active hours
       return;
     }
 
@@ -450,6 +473,28 @@ export class CronScheduler {
     this.deps.broadcast({ type: 'tasks_update', jobs: this.store.jobs, config: this.store.heartbeat });
     this.deps.broadcast({ type: 'task_running', jobId: job.id, jobName: job.name });
 
+    // Check for running background tasks and interrupt them if this schedule requires it
+    const interruptedTasks: string[] = [];
+    const runningTasks = BackgroundTaskRunner.getRunningTasks();
+    if (runningTasks.length > 0) {
+      console.log(`[CronScheduler] Schedule "${job.name}" found ${runningTasks.length} running background task(s) - interrupting...`);
+      for (const taskId of runningTasks) {
+        const interrupted = BackgroundTaskRunner.interruptTaskForSchedule(taskId, job.id);
+        if (interrupted) {
+          interruptedTasks.push(taskId);
+          console.log(`[CronScheduler] Interrupted background task ${taskId} for schedule ${job.id}`);
+        }
+      }
+      // Store interrupted tasks by schedule ID for later resumption
+      if (interruptedTasks.length > 0) {
+        this.interruptedTasksBySchedule.set(job.id, interruptedTasks);
+      }
+      // Give tasks a moment to pause at round boundary
+      if (interruptedTasks.length > 0) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+
     // Fake sessionId for the cron call — isolated from user sessions
     const mainSessionId = this.deps.getMainSessionId?.() || 'default';
     const targetSessionId = job.sessionTarget === 'main'
@@ -473,6 +518,7 @@ export class CronScheduler {
 
     let resultText = '';
     let duration = 0;
+    let spawnedTaskId: string | null = null;
 
     try {
       if (job.payloadKind === 'systemEvent') {
@@ -482,6 +528,32 @@ export class CronScheduler {
           resultText = text;
         } else {
           resultText = 'SYSTEM_EVENT_EMPTY';
+        }
+      } else if (this.deps.spawnBackgroundTask) {
+        // ── Preferred path: spawn a proper BackgroundTask with full task runner ──
+        // This gives the job a plan, journal, kanban card, retry logic, and
+        // correct tool access — instead of a raw single-shot handleChat call.
+        const spawned = await this.deps.spawnBackgroundTask(job);
+        if (spawned) {
+          spawnedTaskId = spawned.taskId;
+          console.log(`[CronScheduler] Job "${job.name}" spawned as background task ${spawned.taskId}`);
+          // The task runs asynchronously — we mark the job complete now.
+          // The BackgroundTaskRunner will broadcast task_complete when done.
+          resultText = `__BACKGROUND_TASK_SPAWNED__:${spawned.taskId}`;
+        } else {
+          // Fallback to direct handleChat if spawn failed
+          const modelOverride = String(job.model || '').trim() || undefined;
+          const result = await this.deps.handleChat(
+            job.prompt,
+            targetSessionId,
+            sendSSE,
+            undefined,
+            undefined,
+            undefined,
+            modelOverride,
+            'cron'
+          );
+          resultText = result.text || '';
         }
       } else {
         const modelOverride = String(job.model || '').trim() || undefined;
@@ -505,7 +577,8 @@ export class CronScheduler {
     }
 
     // Determine if this is a silent OK or real output
-    const isOk = /^\s*HEARTBEAT_OK\s*$/i.test(resultText);
+    const isSpawnedTask = resultText.startsWith('__BACKGROUND_TASK_SPAWNED__:');
+    const isOk = isSpawnedTask || /^\s*HEARTBEAT_OK\s*$/i.test(resultText);
     const runStatus: JobRunStatus = isOk
       ? 'ok'
       : (/^\s*ERROR:/i.test(resultText) ? 'error' : 'success');
@@ -583,6 +656,21 @@ export class CronScheduler {
     }
     this.runningJobId = null;
 
+    // After schedule completes, resume any tasks that were interrupted by this schedule
+    const tasksToResume = this.interruptedTasksBySchedule.get(job.id);
+    if (tasksToResume && tasksToResume.length > 0) {
+      console.log(`[CronScheduler] Schedule "${job.name}" completed - scheduling resumption of ${tasksToResume.length} task(s)`);
+      // Schedule resumption for next heartbeat cycle or shortly after
+      setTimeout(() => {
+        for (const taskId of tasksToResume) {
+          if (BackgroundTaskRunner.resumeTaskAfterSchedule(taskId, job.id)) {
+            console.log(`[CronScheduler] Resumed task ${taskId} after schedule ${job.id} completed`);
+          }
+        }
+        this.interruptedTasksBySchedule.delete(job.id);
+      }, 2000); // 2 second delay to ensure final state is persisted
+    }
+
     // Broadcast final state to all WebSocket clients
     this.deps.broadcast({
       type: 'task_done',
@@ -594,6 +682,61 @@ export class CronScheduler {
       jobs: this.store.jobs,
       config: this.store.heartbeat,
     });
+  }
+
+  // ─── Task Pause/Resume/Interrupt ─────────────────────────────────────────────
+
+  /**
+   * Pause a job (e.g., to resume/retry later)
+   */
+  pauseJob(id: string, reason: 'manual' | 'interrupted_by_schedule' = 'manual'): CronJob | null {
+    const job = this.store.jobs.find(j => j.id === id);
+    if (!job) return null;
+    job.status = 'paused';
+    job.pausedReason = reason;
+    this.saveStore();
+    this.broadcastUpdate();
+    console.log(`[CronScheduler] Job "${job.name}" paused (reason: ${reason})`);
+    return job;
+  }
+
+  /**
+   * Resume a paused job
+   */
+  resumeJob(id: string): CronJob | null {
+    const job = this.store.jobs.find(j => j.id === id);
+    if (!job) return null;
+    if (job.status !== 'paused') {
+      console.warn(`[CronScheduler] Attempt to resume non-paused job "${job.name}"`);
+      return job;
+    }
+    job.status = 'scheduled';
+    job.pausedReason = undefined;
+    // Recalculate nextRun
+    const now = new Date();
+    job.nextRun = job.type === 'one-shot' && job.runAt
+      ? job.runAt
+      : applyDeterministicStagger(
+          getNextRun(job.schedule, now, job.tz).toISOString(),
+          job.id,
+          job.schedule
+        );
+    this.saveStore();
+    this.broadcastUpdate();
+    console.log(`[CronScheduler] Job "${job.name}" resumed`);
+    return job;
+  }
+
+  /**
+   * Get job status and pause info
+   */
+  getJobStatus(id: string): { job: CronJob | null; isPaused: boolean; pauseReason?: string } {
+    const job = this.store.jobs.find(j => j.id === id);
+    return {
+      job: job || null,
+      isPaused: job?.status === 'paused',
+      pauseReason: job?.pausedReason,
+    };
   }
 
   // ─── Broadcast Helper ─────────────────────────────────────────────────────────

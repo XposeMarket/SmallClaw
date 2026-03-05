@@ -452,6 +452,8 @@
 
   .job-item:hover { border-color: #c2d6f4; box-shadow: 0 4px 12px rgba(15, 60, 120, 0.08); }
   .job-item.active { border-color: #9fbef1; background: #f1f6ff; }
+  .job-item.unread { background: linear-gradient(135deg, #f0f8ff 0%, #e8f4ff 100%); border-color: #8ec4f8; }
+  .job-item.unread.active { background: #f1f6ff; border-color: #5ca9f0; }
 
   .job-item-title { font-size: 12px; font-weight: 700; }
 
@@ -478,6 +480,21 @@
     font-size: 12px;
     line-height: 1.7;
     background: var(--panel-2);
+  }
+
+  .status-active {
+    background: #c8f0c4;
+    color: #0d5c2f;
+  }
+
+  .status-paused {
+    background: #fff4d6;
+    color: #7d5700;
+  }
+
+  .status-failed {
+    background: #ffd6d6;
+    color: #8b0000;
   }
 
   .agent-card {
@@ -1087,6 +1104,299 @@
   .log-line.error { color: var(--err); }
   .log-line.warn { color: var(--warn); }
 
+  /* Agent Execution Panel */
+  #agent-execution-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .agent-item {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+    transition: background 0.15s ease;
+    user-select: none;
+  }
+
+  .agent-item:hover {
+    background: rgba(22, 104, 227, 0.08);
+  }
+
+  .agent-item:last-child {
+    border-bottom: none;
+  }
+
+  .agent-item.expanded {
+    background: rgba(22, 104, 227, 0.12);
+  }
+
+  .agent-item-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+
+  .agent-item-name {
+    font-weight: 600;
+    font-size: 11px;
+    color: var(--text);
+    flex: 1;
+  }
+
+  .agent-item-status {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .agent-item-status.active {
+    background: rgba(15, 159, 110, 0.2);
+    color: var(--ok);
+  }
+
+  .agent-item-status.completed {
+    background: rgba(22, 104, 227, 0.2);
+    color: var(--brand);
+  }
+
+  .agent-item-status.paused {
+    background: rgba(209, 75, 75, 0.2);
+    color: var(--err);
+  }
+
+  .agent-item-task {
+    font-size: 10px;
+    color: var(--muted);
+    margin-bottom: 4px;
+    word-break: break-word;
+  }
+
+  .agent-item-logs {
+    display: none;
+    margin-top: 8px;
+    padding: 8px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    max-height: 150px;
+    overflow-y: auto;
+    font-size: 10px;
+    line-height: 1.5;
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--muted);
+  }
+
+  .agent-item.expanded .agent-item-logs {
+    display: block;
+  }
+
+  .agent-log-entry {
+    margin-bottom: 3px;
+  }
+
+  .agent-log-entry-time {
+    color: var(--muted);
+    opacity: 0.6;
+    margin-right: 6px;
+  }
+
+  .agent-log-entry-type {
+    color: var(--brand);
+    font-weight: 600;
+    margin-right: 6px;
+  }
+
+  .agent-log-entry-content {
+    color: var(--text);
+  }
+
+  /* Error Response Panel */
+  #error-response-panel {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--panel);
+    border: 2px solid var(--line);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 20px 60px rgba(16, 32, 64, 0.16);
+    z-index: 9998;
+    max-width: 520px;
+    width: 90vw;
+    max-height: 80vh;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #error-response-panel.visible {
+    display: flex;
+  }
+
+  .error-response-header {
+    padding: 16px;
+    border-bottom: 1px solid var(--line);
+    flex-shrink: 0;
+  }
+
+  .error-response-title {
+    font-size: 16px;
+    font-weight: 800;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+
+  .error-response-desc {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+
+  .error-response-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+  }
+
+  .error-response-options {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .error-option-btn {
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--text);
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+    transition: all 0.15s ease;
+    font-family: 'Manrope', sans-serif;
+  }
+
+  .error-option-btn:hover {
+    border-color: var(--brand);
+    background: rgba(22, 104, 227, 0.08);
+  }
+
+  .error-option-btn.selected {
+    border-color: var(--brand);
+    background: rgba(22, 104, 227, 0.15);
+    color: var(--brand-2);
+  }
+
+  .error-option-btn.danger {
+    border-color: var(--err);
+    color: var(--err);
+  }
+
+  .error-option-btn.danger:hover {
+    background: rgba(209, 75, 75, 0.1);
+  }
+
+  .error-response-inputs {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 12px;
+    padding: 12px;
+    background: var(--panel-2);
+    border-radius: 8px;
+    display: none;
+  }
+
+  .error-response-inputs.visible {
+    display: flex;
+  }
+
+  .input-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .input-field label {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .input-field input {
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 12px;
+    font-family: 'Manrope', sans-serif;
+  }
+
+  .input-field input::placeholder {
+    color: var(--muted);
+    opacity: 0.6;
+  }
+
+  .input-field input:focus {
+    outline: none;
+    border-color: var(--brand);
+    box-shadow: 0 0 0 2px rgba(22, 104, 227, 0.1);
+  }
+
+  .error-response-footer {
+    padding: 12px 16px;
+    border-top: 1px solid var(--line);
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+    justify-content: flex-end;
+  }
+
+  .btn-error-submit {
+    padding: 8px 14px;
+    background: var(--brand);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: 'Manrope', sans-serif;
+    transition: background 0.15s ease;
+  }
+
+  .btn-error-submit:hover {
+    background: var(--brand-2);
+  }
+
+  .btn-error-cancel {
+    padding: 8px 14px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: 'Manrope', sans-serif;
+    transition: all 0.15s ease;
+  }
+
+  .btn-error-cancel:hover {
+    border-color: var(--muted);
+  }
+
   .right-panel { grid-area: right; display: flex; flex-direction: column; }
   .right-section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
   .sys-grid {
@@ -1555,6 +1865,194 @@
   }
   .hb-modal textarea { min-height: 80px; resize: vertical; }
   .hb-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+  /* Error Response Panel - Inline Styling */
+  .error-response-panel {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+    background: var(--panel);
+    margin: 12px 0;
+    animation: slideDown 0.3s ease;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+  }
+
+  @keyframes slideDown {
+    from { opacity: 0; transform: translateY(-10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .error-header {
+    margin-bottom: 16px;
+  }
+
+  .error-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+
+  .error-description {
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  .error-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 8px;
+    margin: 16px 0;
+  }
+
+  .error-option-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: inherit;
+    font-size: 13px;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .error-option-btn:hover:not(.danger):not(:disabled) {
+    background: rgba(22, 104, 227, 0.08);
+    border-color: var(--brand);
+    transform: translateY(-1px);
+  }
+
+  .error-option-btn:active:not(.danger):not(:disabled) {
+    transform: translateY(0);
+  }
+
+  .error-option-btn.danger {
+    border-color: var(--err);
+    color: var(--err);
+  }
+
+  .error-option-btn.danger:hover {
+    background: rgba(209, 75, 75, 0.1);
+  }
+
+  .error-option-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .error-inputs {
+    display: none;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 16px;
+    padding: 16px;
+    padding-top: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .error-inputs.visible {
+    display: flex;
+  }
+
+  .input-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .input-field label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+  }
+
+  .input-field input {
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 13px;
+    background: var(--panel-2);
+    color: var(--text);
+    transition: all 0.2s ease;
+  }
+
+  .input-field input:focus {
+    outline: none;
+    border-color: var(--brand);
+    box-shadow: 0 0 0 3px rgba(22, 104, 227, 0.1);
+  }
+
+  .continue-btn {
+    padding: 10px 16px;
+    background: var(--brand);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    font-weight: 500;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    margin-top: 8px;
+  }
+
+  .continue-btn:hover {
+    background: #0f4ac9;
+    transform: translateY(-1px);
+  }
+
+  .continue-btn:active {
+    transform: translateY(0);
+  }
+
+  .continue-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .error-context {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+
+  .error-context-btn {
+    background: none;
+    border: none;
+    color: var(--brand);
+    cursor: pointer;
+    font-size: 12px;
+    text-decoration: underline;
+    padding: 0;
+  }
+
+  .error-context-detail {
+    display: none;
+    margin-top: 8px;
+    padding: 8px 12px;
+    background: rgba(0,0,0,0.02);
+    border-radius: 6px;
+    border-left: 3px solid var(--muted);
+    font-size: 12px;
+    color: var(--muted);
+    font-family: 'Monaco', 'Courier New', monospace;
+    max-height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .error-context-detail.visible {
+    display: block;
+  }
 </style>
 </head>
 <body>
@@ -1568,6 +2066,7 @@
   <div class="mode-toggle">
     <button class="mode-btn active" id="btn-chat" onclick="setMode('chat')">Chat</button>
     <button class="mode-btn" id="btn-bgtasks" onclick="setMode('bgtasks')">Tasks</button>
+    <button class="mode-btn" id="btn-schedule" onclick="setMode('schedule')">Schedule</button>
   </div>
 
   <div class="status-bar">
@@ -1762,6 +2261,86 @@
     <div id="bgt-panel-body" style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px">
       <!-- Filled by openBgtPanel() -->
     </div>
+    <!-- Persistent task chat input — always visible regardless of task status -->
+    <div id="bgt-chat-bar" style="flex-shrink:0;border-top:1px solid var(--line);padding:10px 12px;background:var(--panel);display:flex;flex-direction:column;gap:6px">
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted)">Chat with agent</div>
+      <div style="display:flex;gap:8px;align-items:flex-end">
+        <textarea id="bgt-chat-input" rows="2" placeholder="Send a message to the task agent... (Shift+Enter for newline)" style="flex:1;resize:none;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;font-family:inherit;background:var(--panel-2);color:var(--text);outline:none" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();bgtChatSend();}"></textarea>
+        <button onclick="bgtChatSend()" style="background:var(--brand);color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:12px;font-weight:700;cursor:pointer;flex-shrink:0;height:36px">Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SCHEDULE VIEW -->
+<div id="schedule-view" style="display:none;flex-direction:column;gap:0;position:absolute;top:90px;bottom:12px;left:12px;right:12px;background:var(--bg);padding:16px;overflow:hidden;border:1px solid var(--line);border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);z-index:5;">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-shrink:0">
+    <div style="display:flex;align-items:center;gap:12px">
+      <span style="font-size:16px;font-weight:800;letter-spacing:-0.01em">Schedules</span>
+      <span id="schedule-count" style="font-size:11px;background:#eaf2ff;color:#0d4faf;border-radius:999px;padding:2px 10px;font-weight:700">0 schedules</span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button onclick="openScheduleCreateModal()" style="border:1px solid var(--brand);background:var(--brand);color:white;border-radius:8px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer">+ New Schedule</button>
+      <button onclick="refreshSchedules()" style="border:1px solid var(--line);background:var(--panel);color:var(--muted);border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer">Refresh</button>
+    </div>
+  </div>
+
+  <!-- Schedule list -->
+  <div id="schedule-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding-right:8px">
+    <div class="empty-state" style="text-align:center;color:var(--muted);padding:40px 20px">No schedules yet. <strong>+ New Schedule</strong> to get started.</div>
+  </div>
+</div>
+
+<!-- Schedule Create/Edit Modal -->
+<div id="schedule-modal" style="display:none;position:fixed;inset:0;background:rgba(10,20,40,0.35);z-index:9999;align-items:center;justify-content:center;padding:18px">
+  <div style="width:min(480px,96vw);max-height:90vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-md)">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--line);flex-shrink:0">
+      <div id="schedule-modal-title" style="font-weight:800">Create Schedule</div>
+      <button onclick="closeScheduleModal()" style="border:0;background:none;font-size:18px;cursor:pointer;color:var(--muted);line-height:1">✕</button>
+    </div>
+    <div style="padding:16px;display:flex;flex-direction:column;gap:14px">
+      <div>
+        <label style="display:block;font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px">Name</label>
+        <input id="schedule-name" type="text" placeholder="e.g., Daily standup" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;background:var(--panel-2)" />
+      </div>
+      <div>
+        <label style="display:block;font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px">Schedule Pattern</label>
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <input id="schedule-pattern" type="text" placeholder="e.g., daily at 09:00 or '0 9 * * *' cron" style="flex:1;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;background:var(--panel-2)" />
+          <button onclick="parseSchedulePattern()" style="border:1px solid var(--brand);background:var(--brand);color:white;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">Parse</button>
+        </div>
+        <div id="schedule-pattern-preview" style="font-size:11px;color:var(--muted);padding:6px 8px;background:var(--panel-2);border-radius:6px;display:none"></div>
+      </div>
+      <div>
+        <label style="display:block;font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px">Timezone</label>
+        <select id="schedule-timezone" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;background:var(--panel-2)">
+          <option value="UTC">UTC</option>
+          <option value="America/New_York">America/New_York</option>
+          <option value="America/Chicago">America/Chicago</option>
+          <option value="America/Denver">America/Denver</option>
+          <option value="America/Los_Angeles">America/Los_Angeles</option>
+          <option value="Europe/London">Europe/London</option>
+          <option value="Europe/Paris">Europe/Paris</option>
+          <option value="Asia/Tokyo">Asia/Tokyo</option>
+        </select>
+      </div>
+      <div>
+        <label style="display:block;font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px">Prompt / Action</label>
+        <textarea id="schedule-prompt" placeholder="What should happen when this schedule runs?" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;background:var(--panel-2);resize:vertical;min-height:80px;font-family:'IBM Plex Mono',monospace"></textarea>
+      </div>
+      <div>
+        <label style="display:block;font-size:12px;font-weight:700;color:var(--text);margin-bottom:6px">Delivery Channel</label>
+        <select id="schedule-channel" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:13px;background:var(--panel-2)">
+          <option value="web">Web (notification)</option>
+          <option value="telegram">Telegram (coming soon)</option>
+          <option value="discord">Discord (coming soon)</option>
+        </select>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--line);flex-shrink:0">
+      <button class="btn btn-sm" style="background:var(--panel-2);color:var(--muted);border:1px solid var(--line)" onclick="closeScheduleModal()">Cancel</button>
+      <button class="btn btn-sm" id="schedule-save-btn" onclick="saveSchedule()">Create Schedule</button>
+    </div>
   </div>
 </div>
 
@@ -1946,15 +2525,47 @@
     </div>
   </div>
 
+  <!-- AGENT EXECUTION PANEL -->
+  <div style="display:flex;flex-direction:column;max-height:200px;overflow:hidden;border:1px solid var(--border);border-radius:10px;background:var(--panel-2);margin-bottom:10px">
+    <div style="padding:8px 12px;border-bottom:1px solid var(--border);flex-shrink:0">
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);margin-bottom:8px">Active Agents</div>
+    </div>
+    <div id="agent-execution-panel" style="flex:1;overflow-y:auto;padding:0">
+      <div style="padding:8px 12px;font-size:11px;color:var(--muted)">Waiting for task execution...</div>
+    </div>
+  </div>
+
   <!-- PROCESS LOG -->
   <div style="display:flex;flex-direction:column;flex:1 1 320px;overflow:hidden;min-height:280px">
     <div style="padding:8px 16px 6px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);flex-shrink:0">
-      <span style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted)">Process Log</span>
+      <a href="javascript:void(0)" onclick="openProcessLogFile()" style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);text-decoration:none;cursor:pointer;hover:color:var(--brand)">Process Log</a>
       <button onclick="clearProcessLog()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px;font-family:inherit">✕ clear</button>
     </div>
     <div id="process-log" style="flex:1;overflow-y:auto;padding:8px 12px;font-size:11px;line-height:1.7;font-family:'JetBrains Mono',monospace">
       <div style="color:var(--muted);text-align:center;padding:20px 0;opacity:0.5">Waiting for activity...</div>
     </div>
+  </div>
+</div>
+
+<!-- ERROR RESPONSE MODAL -->
+<div id="error-response-panel">
+  <div class="error-response-header">
+    <div class="error-response-title" id="error-response-title">⚠️ Authentication Required</div>
+    <div class="error-response-desc" id="error-response-desc">The task needs your help to continue. Please provide the required information.</div>
+  </div>
+
+  <div class="error-response-content">
+    <div class="error-response-options" id="error-response-options">
+      <!-- Options will be populated by JavaScript -->
+    </div>
+    <div class="error-response-inputs" id="error-response-inputs">
+      <!-- Input fields will be populated by JavaScript -->
+    </div>
+  </div>
+
+  <div class="error-response-footer">
+    <button class="btn-error-cancel" onclick="closeErrorResponse()">Cancel Task</button>
+    <button class="btn-error-submit" id="error-response-submit-btn" onclick="submitErrorResponse()">Continue</button>
   </div>
 </div>
 
@@ -2003,6 +2614,7 @@
     <div style="padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:8px">
       <button id="settings-tab-system" class="sidebar-action" onclick="setSettingsTab('system')">System</button>
       <button id="settings-tab-search" class="sidebar-action" onclick="setSettingsTab('search')">Search</button>
+      <button id="settings-tab-credentials" class="sidebar-action" onclick="setSettingsTab('credentials')">Credentials</button>
       <button id="settings-tab-policy" class="sidebar-action" onclick="setSettingsTab('policy')">Agent Policy</button>
       <button id="settings-tab-security" class="sidebar-action" onclick="setSettingsTab('security')">Security</button>
       <button id="settings-tab-models" class="sidebar-action" onclick="setSettingsTab('models')">Models</button>
@@ -2043,14 +2655,9 @@
           <option value="verified">Verified</option>
           <option value="strict">Strict</option>
         </select>
-        <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 6px">Tavily API Key</label>
-        <input id="settings-tavily-key" type="password" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:8px;font-size:12px" />
-        <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 6px">Google API Key</label>
-        <input id="settings-google-key" type="password" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:8px;font-size:12px" />
-        <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 6px">Google CSE ID</label>
-        <input id="settings-google-cx" type="text" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:8px;font-size:12px" />
-        <label style="display:block;font-size:12px;color:var(--muted);margin:10px 0 6px">Brave API Key</label>
-        <input id="settings-brave-key" type="password" style="width:100%;border:1px solid var(--line);border-radius:10px;padding:8px;font-size:12px" />
+        <div style="margin-top:12px;padding:8px 10px;background:#f0f6ff;border:1px solid #bdd3f6;border-radius:8px;font-size:11px;color:#1e40af">
+          🔑 API keys are managed in the <strong>Credentials</strong> tab and stored encrypted.
+        </div>
       </div>
       <div style="border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff">
         <div class="right-section-title" style="margin-bottom:8px">Behavior</div>
@@ -2058,6 +2665,75 @@
           Fast: quickest lookup, fewer checks.
           Verified: one sanity retry + trust preference.
           Strict: strongest source requirements on must-verify domains.
+        </div>
+      </div>
+    </div>
+
+    <div id="settings-panel-credentials" style="display:none;padding:14px 16px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+
+        <!-- Search Provider Keys -->
+        <div style="border:1px solid var(--line);border-radius:12px;padding:14px">
+          <div class="right-section-title" style="margin-bottom:4px">Search Provider Keys</div>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:12px">Stored encrypted in vault — never written to config.json in plain text.</div>
+
+          <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">Tavily API Key</label>
+          <div style="display:flex;gap:6px;margin-bottom:10px">
+            <input id="cred-tavily-key" type="password" placeholder="tvLy-…" autocomplete="new-password"
+              style="flex:1;border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12px;font-family:var(--font-mono, monospace)" />
+            <button onclick="toggleCredVis('cred-tavily-key',this)" title="Show/hide"
+              style="padding:0 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2);font-size:13px;cursor:pointer;flex-shrink:0">👁</button>
+          </div>
+
+          <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">Google API Key</label>
+          <div style="display:flex;gap:6px;margin-bottom:10px">
+            <input id="cred-google-key" type="password" placeholder="AIzaSy…" autocomplete="new-password"
+              style="flex:1;border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12px;font-family:var(--font-mono, monospace)" />
+            <button onclick="toggleCredVis('cred-google-key',this)" title="Show/hide"
+              style="padding:0 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2);font-size:13px;cursor:pointer;flex-shrink:0">👁</button>
+          </div>
+
+          <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">Google CSE ID <span style="font-weight:400;color:var(--muted)">(not a secret — stored in config)</span></label>
+          <input id="cred-google-cx" type="text" placeholder="c3222d…"
+            style="width:100%;border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12px;margin-bottom:10px;box-sizing:border-box" />
+
+          <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:5px">Brave API Key</label>
+          <div style="display:flex;gap:6px">
+            <input id="cred-brave-key" type="password" placeholder="BSA…" autocomplete="new-password"
+              style="flex:1;border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12px;font-family:var(--font-mono, monospace)" />
+            <button onclick="toggleCredVis('cred-brave-key',this)" title="Show/hide"
+              style="padding:0 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2);font-size:13px;cursor:pointer;flex-shrink:0">👁</button>
+          </div>
+        </div>
+
+        <!-- Right column: status + info -->
+        <div style="display:flex;flex-direction:column;gap:12px">
+
+          <!-- Vault status card -->
+          <div style="border:1px solid var(--line);border-radius:12px;padding:14px">
+            <div class="right-section-title" style="margin-bottom:8px">Vault Status</div>
+            <div id="cred-vault-status" style="font-size:12px;color:var(--muted)">Loading…</div>
+          </div>
+
+          <!-- How it works -->
+          <div style="border:1px solid #bdd3f6;border-radius:12px;padding:14px;background:#f0f6ff">
+            <div style="font-size:12px;font-weight:700;color:#1e40af;margin-bottom:6px">🔒 How Credentials Work</div>
+            <div style="font-size:11.5px;color:#1e40af;line-height:1.65">
+              When you hit <strong>Save Settings</strong>, any key you've entered is encrypted with AES-256-GCM and stored in <code style="background:#dbeafe;padding:1px 4px;border-radius:4px">vault.enc</code>.<br><br>
+              Config files only ever contain a <code style="background:#dbeafe;padding:1px 4px;border-radius:4px">vault:…</code> reference — never the actual key.<br><br>
+              If a field shows <strong>••••••••</strong>, a key is already stored. Leave it as-is to keep the existing key, or type a new one to replace it.
+            </div>
+          </div>
+
+          <!-- Audit log preview -->
+          <div style="border:1px solid var(--line);border-radius:12px;padding:14px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+              <div class="right-section-title">Recent Vault Access</div>
+              <button onclick="loadCredVaultLog()" style="font-size:10px;padding:3px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel-2);cursor:pointer;color:var(--muted)">Refresh</button>
+            </div>
+            <div id="cred-vault-log" style="font-size:10.5px;color:var(--muted);font-family:monospace;max-height:110px;overflow-y:auto;line-height:1.6">Loading…</div>
+          </div>
+
         </div>
       </div>
     </div>
@@ -2834,7 +3510,7 @@ function setAgentSessionId(id) {
   return next;
 }
 let agentSessionId = '';
-setAgentSessionId(localStorage.getItem(AGENT_SESSION_KEY) || generateSessionId());
+setAgentSessionId(generateSessionId()); // always fresh session on page load
 
 // Chat state
 let chatHistory = [];
@@ -2857,6 +3533,11 @@ let currentPreflightStatus = '';
 let currentProgressLines = [];
 let processLogAutoFollow = true;
 let rightColumnAutoFollow = true;
+
+// Agent Execution Tracking
+let agentExecutionMap = new Map(); // Map<agentId, { name, status, task, logs: [] }>
+let agentIdCounter = 0;
+const AGENT_STATUS = { ACTIVE: 'active', COMPLETED: 'completed', PAUSED: 'paused' };
 let agentsConfigList = [];
 let selectedAgentId = '';
 let agentMdEditor = null;
@@ -2966,6 +3647,8 @@ function syncActiveChat() {
   chatHistory = sess ? (sess.history || []) : [];
   processLogEntries = sess ? (sess.processLog || []) : [];
   liveTaskSteps = [];  // clear live steps so a different session never inherits in-progress tool display
+  // Mark session as read when opening it
+  if (sess) sess.unread = false;
   renderChatMessages();
   renderProcessLog();
   renderLiveStepsPanel();
@@ -3027,25 +3710,38 @@ function openSession(id) {
   syncActiveChat();
 }
 
+function markSessionUnread(sessionId) {
+  const sess = chatSessions.find(s => s.id === sessionId);
+  if (sess && sessionId !== activeChatSessionId) {
+    sess.unread = true;
+    renderSessionsList();
+  }
+}
+
 // ---- Mode switching ----
 function setMode(mode) {
-  if (mode !== 'chat' && mode !== 'bgtasks') mode = 'chat';
+  if (mode !== 'chat' && mode !== 'bgtasks' && mode !== 'schedule') mode = 'chat';
   currentMode = mode;
   // Toggle buttons
   document.getElementById('btn-chat').classList.toggle('active', mode === 'chat');
   const bgtBtn = document.getElementById('btn-bgtasks');
   if (bgtBtn) bgtBtn.classList.toggle('active', mode === 'bgtasks');
+  const schedBtn = document.getElementById('btn-schedule');
+  if (schedBtn) schedBtn.classList.toggle('active', mode === 'schedule');
   // Toggle views
   document.getElementById('chat-view').style.display = mode === 'chat' ? 'flex' : 'none';
   const bgtView = document.getElementById('bgtasks-view');
   if (bgtView) bgtView.style.display = mode === 'bgtasks' ? 'flex' : 'none';
+  const schedView = document.getElementById('schedule-view');
+  if (schedView) schedView.style.display = mode === 'schedule' ? 'flex' : 'none';
   // Toggle sidebar + right panel visibility
   const aside = document.querySelector('aside');
   const rightPanel = document.getElementById('right-panel');
   if (aside) aside.style.display = mode === 'chat' ? '' : 'none';
   if (rightPanel) rightPanel.style.display = mode === 'chat' ? '' : 'none';
-  // Load background tasks when switching to bgtasks
+  // Load data when switching to respective views
   if (mode === 'bgtasks') refreshBgTasks();
+  if (mode === 'schedule') refreshSchedules();
 }
 
 // --- Heartbeat / Tasks System -----------------------------------------------
@@ -4252,6 +4948,95 @@ async function sendChat(queuedMessage = null) {
   }
 }
 
+// ---- Agent Execution Tracking ----
+function spawnAgentExecution(agentName, taskPrompt, isSubagent = false) {
+  const agentId = (isSubagent ? 'sub_' : 'main_') + (++agentIdCounter);
+  const agentData = {
+    id: agentId,
+    name: agentName,
+    status: AGENT_STATUS.ACTIVE,
+    task: taskPrompt,
+    logs: [],
+    isSubagent: isSubagent,
+    startTime: new Date(),
+  };
+  agentExecutionMap.set(agentId, agentData);
+  renderAgentExecutionPanel();
+  return agentId;
+}
+
+function addAgentLog(agentId, type, content) {
+  const agentData = agentExecutionMap.get(agentId);
+  if (!agentData) return;
+  const ts = new Date().toLocaleTimeString();
+  agentData.logs.push({ ts, type, content });
+  // Keep only last 20 logs per agent
+  if (agentData.logs.length > 20) agentData.logs.shift();
+  renderAgentExecutionPanel();
+}
+
+function completeAgentExecution(agentId) {
+  const agentData = agentExecutionMap.get(agentId);
+  if (!agentData) return;
+  agentData.status = AGENT_STATUS.COMPLETED;
+  renderAgentExecutionPanel();
+}
+
+function pauseAgentExecution(agentId, reason) {
+  const agentData = agentExecutionMap.get(agentId);
+  if (!agentData) return;
+  agentData.status = AGENT_STATUS.PAUSED;
+  if (reason) addAgentLog(agentId, 'error', reason);
+  renderAgentExecutionPanel();
+}
+
+function renderAgentExecutionPanel() {
+  const panel = document.getElementById('agent-execution-panel');
+  if (!panel) return;
+
+  if (agentExecutionMap.size === 0) {
+    panel.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--muted)">Waiting for task execution...</div>';
+    return;
+  }
+
+  const agents = Array.from(agentExecutionMap.values()).sort((a, b) => a.startTime - b.startTime);
+  panel.innerHTML = agents.map((agent) => {
+    const statusClass = agent.status === AGENT_STATUS.ACTIVE ? 'active' : 
+                        agent.status === AGENT_STATUS.COMPLETED ? 'completed' : 'paused';
+    const arrow = agent.expanded ? '▼' : '▶';
+    const logsHtml = agent.logs.length > 0
+      ? agent.logs.map(log => `<div class="agent-log-entry"><span class="agent-log-entry-time">${escHtml(log.ts)}</span><span class="agent-log-entry-type">[${escHtml(log.type.toUpperCase())}]</span><span class="agent-log-entry-content">${escHtml(log.content)}</span></div>`).join('')
+      : '<div style="color:var(--muted);opacity:0.6">No logs yet</div>';
+
+    return `
+      <div class="agent-item ${agent.expanded ? 'expanded' : ''}" onclick="toggleAgentPanel('${agent.id}')">
+        <div class="agent-item-header">
+          <span style="color:var(--muted);font-size:10px;min-width:12px">${arrow}</span>
+          <div class="agent-item-name">${escHtml(agent.isSubagent ? '└─ ' + agent.name : agent.name)}</div>
+          <div class="agent-item-status ${statusClass}">${agent.status.toUpperCase()}</div>
+        </div>
+        <div class="agent-item-task">${escHtml(agent.task.substring(0, 70))}${agent.task.length > 70 ? '...' : ''}</div>
+        <div class="agent-item-logs">${logsHtml}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function toggleAgentPanel(agentId) {
+  const agentData = agentExecutionMap.get(agentId);
+  if (!agentData) return;
+  agentData.expanded = !agentData.expanded;
+  renderAgentExecutionPanel();
+}
+
+function openProcessLogFile() {
+  // Call server endpoint to open the process log file
+  if (activeTaskId) {
+    fetch(`/api/open-file?task=${encodeURIComponent(activeTaskId)}&type=process`)
+      .catch(err => console.error('Unable to open process log:', err));
+  }
+}
+
 function clearChat() {
   chatHistory = [];
   persistActiveChat();
@@ -4286,6 +5071,17 @@ function connectWS() {
     if (msg.type === 'job_created') {
       log(`Job created: ${msg.jobId}`, 'info');
     }
+    if (msg.type === 'boot_greeting') {
+      // Inject boot greeting as first message in current fresh session
+      const bootSess = chatSessions.find(s => s.id === activeChatSessionId);
+      if (bootSess && (!bootSess.history || bootSess.history.length === 0)) {
+        bootSess.history = [{ role: 'assistant', content: msg.text }];
+        bootSess.updatedAt = Date.now();
+        saveChatSessions();
+        syncActiveChat();
+        renderChatMessages();
+      }
+    }
     // -- Cron/Heartbeat task events --
     if (msg.type === 'tasks_update') {
       hbJobs = msg.jobs || [];
@@ -4305,16 +5101,27 @@ function connectWS() {
       if (msg.automatedSession && !msg.isOk) {
         // Add the automated session to chatSessions so it appears in the sidebar
         const as = msg.automatedSession;
-        chatSessions.push({
-          id: as.id, title: as.title, history: as.history.map(m => ({ role: m.role === 'ai' ? 'assistant' : m.role, content: m.content })),
-          processLog: [], createdAt: as.createdAt, updatedAt: as.createdAt, automated: true, jobName: as.jobName
-        });
+        const existingIdx = chatSessions.findIndex(s => s.id === as.id);
+        const newSession = {
+          id: as.id, title: as.title,
+          history: as.history.map(m => ({ role: m.role === 'ai' ? 'assistant' : m.role, content: m.content })),
+          processLog: [], createdAt: as.createdAt, updatedAt: Date.now(),
+          automated: true, jobName: as.jobName, unread: true,
+        };
+        if (existingIdx === -1) chatSessions.push(newSession);
+        else chatSessions[existingIdx] = { ...chatSessions[existingIdx], ...newSession };
         saveChatSessions();
         renderSessionsList();
+        bgtToast('\uD83D\uDD50 Scheduled task done', `"${msg.jobName}" — results in sidebar`);
         addProcessEntry('info', `Task "${msg.jobName}" completed — check sidebar for results`);
       } else if (msg.isOk) {
         addProcessEntry('info', `Task "${msg.jobName}" — OK (nothing to report)`);
       }
+    }
+    // Cron job spawned a background task — switch to tasks view if currently watching
+    if (msg.type === 'cron_task_spawned') {
+      bgtToast('\uD83D\uDD50 Scheduled job running', `"${msg.jobName}" started as background task`);
+      if (currentMode === 'bgtasks') refreshBgTasks();
     }
     if (msg.type === 'task_sse') {
       // Live progress from a running task — could update the NOW card
@@ -4335,9 +5142,39 @@ function connectWS() {
       }
       // Toast notification for completions and errors
       if (msg.type === 'task_complete') {
-        bgtToast(`✓ Task complete`, msg.summary ? msg.summary.slice(0,120) : '');
+        bgtToast(`\u2713 Task complete`, msg.summary ? msg.summary.slice(0,120) : '');
+        // If this task has a cron session ID (starts with cron_), create/update a sidebar session
+        // so the results are immediately visible without a page refresh.
+        if (msg.taskId) {
+          (async () => {
+            try {
+              const data = await fetch(`/api/bg-tasks/${msg.taskId}`).then(r => r.json());
+              const task = data?.task || data;
+              if (task && task.sessionId && task.sessionId.startsWith('cron_')) {
+                const journal = task.journal || [];
+                const summaryEntry = journal.filter(e => e.type === 'summary' || e.type === 'complete').pop();
+                const summaryText = msg.summary || (summaryEntry?.content) || '(Task complete — open Tasks panel for details)';
+                const titleText = `\uD83D\uDD50 ${task.title || 'Scheduled Task'} \u2014 ${new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
+                const sessionId = `auto_${task.id}_${Date.now()}`;
+                const existingIdx = chatSessions.findIndex(s => s.id === task.sessionId || (s.jobName && s.automated && s.title === titleText));
+                const newSession = {
+                  id: sessionId, title: titleText,
+                  history: [
+                    { role: 'user', content: `[Scheduled Task: ${task.title}]\n\n${task.prompt || ''}` },
+                    { role: 'assistant', content: summaryText },
+                  ],
+                  processLog: [], createdAt: Date.now(), updatedAt: Date.now(),
+                  automated: true, jobName: task.title, unread: true,
+                };
+                if (existingIdx === -1) chatSessions.push(newSession);
+                saveChatSessions();
+                renderSessionsList();
+              }
+            } catch {}
+          })();
+        }
       } else if (msg.type === 'task_failed') {
-        bgtToast(`✕ Task failed`, msg.error ? msg.error.slice(0,120) : '');
+        bgtToast(`\u2715 Task failed`, msg.error ? msg.error.slice(0,120) : '');
       } else if (msg.type === 'task_needs_assistance') {
         bgtToast(`Task paused`, msg.reason ? String(msg.reason).slice(0, 120) : 'Needs assistance');
       }
@@ -4358,6 +5195,27 @@ function connectWS() {
         saveChatSessions();
         if (currentSessionId === msg.sessionId) renderMessages();
       }
+    }
+    // ---- Agent Execution Events ----
+    if (msg.type === 'agent_spawned') {
+      const agentId = spawnAgentExecution(msg.name || 'Subagent', msg.task || '', msg.isSubagent);
+      // Store mapping for WebSocket message routing
+      if (msg.serverAgentId) {
+        if (!window.agentIdMap) window.agentIdMap = {};
+        window.agentIdMap[msg.serverAgentId] = agentId;
+      }
+    }
+    if (msg.type === 'agent_log') {
+      const agentId = window.agentIdMap?.[msg.serverAgentId] || msg.agentId;
+      if (agentId) addAgentLog(agentId, msg.logType || 'info', msg.content);
+    }
+    if (msg.type === 'agent_completed') {
+      const agentId = window.agentIdMap?.[msg.serverAgentId] || msg.agentId;
+      if (agentId) completeAgentExecution(agentId);
+    }
+    if (msg.type === 'agent_paused') {
+      const agentId = window.agentIdMap?.[msg.serverAgentId] || msg.agentId;
+      if (agentId) pauseAgentExecution(agentId, msg.reason);
     }
   };
   ws.onclose = () => setTimeout(connectWS, 2000);
@@ -4467,7 +5325,7 @@ function setQuickThinkingEffort(level) {
 
 function setSettingsTab(tab) {
   settingsTab = tab;
-  const tabs = ['system', 'search', 'policy', 'security', 'models', 'agents', 'channels', 'integrations'];
+  const tabs = ['system', 'search', 'credentials', 'policy', 'security', 'models', 'agents', 'channels', 'integrations'];
   tabs.forEach(t => {
     const btn = document.getElementById(`settings-tab-${t}`);
     const panel = document.getElementById(`settings-panel-${t}`);
@@ -4484,11 +5342,100 @@ function setSettingsTab(tab) {
         if (t === 'models') loadModelSettings();
         if (t === 'agents') loadAgentsTab();
         if (t === 'integrations') loadIntegrationsTab();
+        if (t === 'credentials') loadCredentialsTab();
       } else {
         panel.style.display = 'none';
       }
     }
   });
+}
+
+// --- Credentials Tab ---------------------------------------------------------
+
+async function loadCredentialsTab() {
+  await Promise.all([loadCredFields(), loadCredVaultStatus(), loadCredVaultLog()]);
+}
+
+async function loadCredFields() {
+  try {
+    const s = await api('/api/settings/search');
+    // Server returns '••••••••' if key is set, '' if not
+    const setField = (id, val) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.value = val || '';
+      el.placeholder = val ? '••••••••  (key stored — enter new value to replace)' : el.getAttribute('data-placeholder') || '';
+    };
+    setField('cred-tavily-key',  s.tavily_api_key);
+    setField('cred-google-key',  s.google_api_key);
+    setField('cred-brave-key',   s.brave_api_key);
+    const cxEl = document.getElementById('cred-google-cx');
+    if (cxEl) cxEl.value = s.google_cx || '';
+  } catch(e) {
+    console.warn('loadCredFields:', e);
+  }
+}
+
+async function loadCredVaultStatus() {
+  const el = document.getElementById('cred-vault-status');
+  if (!el) return;
+  try {
+    const data = await api('/api/credentials/status');
+    const keys = data.keys || [];
+    if (!keys.length) {
+      el.innerHTML = '<span style="color:var(--warn)">⚠ No credentials stored yet.</span>';
+      return;
+    }
+    el.innerHTML = keys.map(k => {
+      const label = {
+        'search.tavily_api_key':  'Tavily API Key',
+        'search.google_api_key':  'Google API Key',
+        'search.brave_api_key':   'Brave API Key',
+        'llm.openai.api_key':     'OpenAI API Key',
+        'hooks.token':            'Webhook Token',
+        'channels.telegram.botToken': 'Telegram Token',
+        'channels.discord.botToken':  'Discord Token',
+      }[k] || k;
+      return `<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
+        <span style="color:var(--ok);font-size:13px">✓</span>
+        <span style="font-size:12px;color:var(--text)">${label}</span>
+        <span style="font-size:10px;color:var(--muted);font-family:monospace">${k}</span>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    el.innerHTML = `<span style="color:var(--err);font-size:12px">Could not load vault status: ${e.message}</span>`;
+  }
+}
+
+async function loadCredVaultLog() {
+  const el = document.getElementById('cred-vault-log');
+  if (!el) return;
+  try {
+    const data = await api('/api/credentials/audit');
+    const lines = (data.lines || []).slice(-18).reverse();
+    if (!lines.length) { el.textContent = 'No audit entries yet.'; return; }
+    el.innerHTML = lines.map(l => {
+      const safe = l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const color = l.includes('SET') ? 'var(--ok)' : l.includes('GET') ? 'var(--brand)' : l.includes('DEL') ? 'var(--err)' : 'var(--muted)';
+      return `<div style="color:${color};white-space:nowrap">${safe}</div>`;
+    }).join('');
+  } catch(e) {
+    el.textContent = 'Could not load audit log.';
+  }
+}
+
+function toggleCredVis(inputId, btn) {
+  const el = document.getElementById(inputId);
+  if (!el) return;
+  if (el.type === 'password') {
+    el.type = 'text';
+    btn.textContent = '🙈';
+    // Auto-rehide after 8s
+    setTimeout(() => { el.type = 'password'; btn.textContent = '👁'; }, 8000);
+  } else {
+    el.type = 'password';
+    btn.textContent = '👁';
+  }
 }
 
 // --- Provider-aware Model Settings ------------------------------------------
@@ -4923,10 +5870,7 @@ async function openSettings(tab) {
     const s = await api('/api/settings/search');
     document.getElementById('settings-provider').value = s.preferred_provider || 'tavily';
     document.getElementById('settings-search-rigor').value = s.search_rigor || 'verified';
-    document.getElementById('settings-tavily-key').value = s.tavily_api_key || '';
-    document.getElementById('settings-google-key').value = s.google_api_key || '';
-    document.getElementById('settings-google-cx').value = s.google_cx || '';
-    document.getElementById('settings-brave-key').value = s.brave_api_key || '';
+    // Keys are loaded via the Credentials tab — not here
   } catch {}
   try {
     const p = await api('/api/settings/agent');
@@ -5437,10 +6381,10 @@ async function saveSettings() {
   const payload = {
     preferred_provider: document.getElementById('settings-provider').value,
     search_rigor: document.getElementById('settings-search-rigor').value,
-    tavily_api_key: document.getElementById('settings-tavily-key').value.trim(),
-    google_api_key: document.getElementById('settings-google-key').value.trim(),
-    google_cx: document.getElementById('settings-google-cx').value.trim(),
-    brave_api_key: document.getElementById('settings-brave-key').value.trim(),
+    tavily_api_key: document.getElementById('cred-tavily-key')?.value.trim() || '',
+    google_api_key: document.getElementById('cred-google-key')?.value.trim() || '',
+    google_cx: document.getElementById('cred-google-cx')?.value.trim() || '',
+    brave_api_key: document.getElementById('cred-brave-key')?.value.trim() || '',
   };
   const policyPayload = {
     force_web_for_fresh: document.getElementById('settings-force-web-fresh').checked,
@@ -5542,9 +6486,9 @@ function renderSessionsList() {
   }
   const sorted = [...chatSessions].sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
   el.innerHTML = sorted.map(s => `
-    <div class="job-item ${s.id === activeChatSessionId ? 'active' : ''}" onclick="openSession('${s.id}')">
+    <div class="job-item ${s.id === activeChatSessionId ? 'active' : ''}${s.unread ? ' unread' : ''}" onclick="openSession('${s.id}')">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
-        <div class="job-item-title">${escHtml(s.title || 'New chat')}</div>
+        <div class="job-item-title" style="flex:1">${s.unread ? '🔵 ' : ''}${escHtml(s.title || 'New chat')}</div>
         ${sessionsEditMode ? `<button class="sidebar-action" style="padding:3px 8px;font-size:10px" onclick="deleteChatSession('${s.id}', event)">Delete</button>` : ''}
       </div>
       <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
@@ -6769,6 +7713,226 @@ document.addEventListener('click', (e) => {
   }
 });
 
+// --- SCHEDULER MANAGEMENT ---------------------------------------------------
+
+let schedules = [];
+let editingScheduleId = null;
+
+async function refreshSchedules() {
+  try {
+    const result = await api('/api/schedules');
+    if (result.success && Array.isArray(result.schedules)) {
+      schedules = result.schedules;
+      renderScheduleList();
+    }
+  } catch (err) {
+    console.error('Failed to load schedules:', err);
+  }
+}
+
+function renderScheduleList() {
+  const list = document.getElementById('schedule-list');
+  const count = document.getElementById('schedule-count');
+  if (!list) return;
+
+  if (schedules.length === 0) {
+    list.innerHTML = '<div class="empty-state" style="text-align:center;color:var(--muted);padding:40px 20px">No schedules yet. <strong>+ New Schedule</strong> to get started.</div>';
+    if (count) count.textContent = '0 schedules';
+    return;
+  }
+
+  if (count) count.textContent = `${schedules.length} schedule${schedules.length !== 1 ? 's' : ''}`;
+
+  list.innerHTML = schedules.map(job => {
+    const nextRun = job.next_run ? new Date(job.next_run).toLocaleString() : 'Never';
+    const lastRun = job.last_run ? new Date(job.last_run).toLocaleString() : 'Never';
+    const statusClass = job.status === 'active' ? 'status-active' : job.status === 'paused' ? 'status-paused' : 'status-failed';
+    
+    return `
+      <div style="display:flex;align-items:start;justify-content:space-between;gap:12px;padding:12px;background:var(--panel);border:1px solid var(--line);border-radius:10px;cursor:pointer" onclick="editSchedule('${job.id}')">
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <div style="font-weight:700;font-size:13px">${job.name || 'Untitled'}</div>
+            <span class="${statusClass}" style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:6px;${job.status === 'active' ? 'background:#c8f0c4;color:#0d5c2f' : job.status === 'paused' ? 'background:#fff4d6;color:#7d5700' : 'background:#ffd6d6;color:#8b0000'}">${job.status || 'unknown'}</span>
+          </div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.4;margin-bottom:6px">${job.prompt ? job.prompt.slice(0, 60) + (job.prompt.length > 60 ? '...' : '') : 'No prompt'}</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:11px;color:var(--muted)">
+            <div><strong>Next:</strong> ${nextRun}</div>
+            <div><strong>Last:</strong> ${lastRun}</div>
+          </div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
+          <button onclick="event.stopPropagation(); runScheduleNow('${job.id}')" style="border:1px solid var(--line);background:var(--panel-2);color:var(--muted);border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap" title="Run now">Run Now</button>
+          <button onclick="event.stopPropagation(); toggleSchedulePause('${job.id}')" style="border:1px solid var(--line);background:var(--panel-2);color:var(--muted);border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap" title="Toggle pause">${job.status === 'active' ? 'Pause' : 'Resume'}</button>
+          <button onclick="event.stopPropagation(); deleteSchedule('${job.id}')" style="border:1px solid #ff6b6b;background:#ffe0e0;color:#8b0000;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap" title="Delete">Delete</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function openScheduleCreateModal() {
+  editingScheduleId = null;
+  document.getElementById('schedule-modal-title').textContent = 'Create Schedule';
+  document.getElementById('schedule-save-btn').textContent = 'Create Schedule';
+  document.getElementById('schedule-name').value = '';
+  document.getElementById('schedule-pattern').value = '';
+  document.getElementById('schedule-prompt').value = '';
+  document.getElementById('schedule-timezone').value = 'UTC';
+  document.getElementById('schedule-channel').value = 'web';
+  document.getElementById('schedule-pattern-preview').style.display = 'none';
+  document.getElementById('schedule-modal').style.display = 'flex';
+}
+
+function editSchedule(jobId) {
+  const job = schedules.find(j => j.id === jobId);
+  if (!job) return;
+  
+  editingScheduleId = jobId;
+  document.getElementById('schedule-modal-title').textContent = 'Edit Schedule';
+  document.getElementById('schedule-save-btn').textContent = 'Save Changes';
+  document.getElementById('schedule-name').value = job.name || '';
+  document.getElementById('schedule-pattern').value = job.cron || job.run_at || '';
+  document.getElementById('schedule-prompt').value = job.prompt || '';
+  document.getElementById('schedule-timezone').value = job.timezone || 'UTC';
+  document.getElementById('schedule-channel').value = job.delivery_channel || 'web';
+  document.getElementById('schedule-pattern-preview').style.display = 'none';
+  document.getElementById('schedule-modal').style.display = 'flex';
+}
+
+function closeScheduleModal() {
+  document.getElementById('schedule-modal').style.display = 'none';
+  editingScheduleId = null;
+}
+
+async function parseSchedulePattern() {
+  const pattern = document.getElementById('schedule-pattern').value.trim();
+  const timezone = document.getElementById('schedule-timezone').value;
+  if (!pattern) {
+    alert('Enter a schedule pattern (e.g., "daily at 09:00" or "0 9 * * *")');
+    return;
+  }
+  
+  try {
+    const result = await api('/api/schedules/parse', {
+      method: 'POST',
+      body: JSON.stringify({ text: pattern, timezone })
+    });
+    
+    const preview = document.getElementById('schedule-pattern-preview');
+    if (result.success) {
+      preview.textContent = `✓ ${result.preview || result.human_text || 'Valid pattern'}`;
+      preview.style.display = 'block';
+      preview.style.color = 'var(--muted)';
+    } else {
+      preview.textContent = `⚠ ${result.error || 'Invalid pattern'}`;
+      preview.style.display = 'block';
+      preview.style.color = '#ff6b6b';
+    }
+  } catch (err) {
+    document.getElementById('schedule-pattern-preview').textContent = '⚠ Parse failed';
+    document.getElementById('schedule-pattern-preview').style.display = 'block';
+    document.getElementById('schedule-pattern-preview').style.color = '#ff6b6b';
+  }
+}
+
+async function saveSchedule() {
+  const name = document.getElementById('schedule-name').value.trim();
+  const pattern = document.getElementById('schedule-pattern').value.trim();
+  const prompt = document.getElementById('schedule-prompt').value.trim();
+  const timezone = document.getElementById('schedule-timezone').value;
+  const channel = document.getElementById('schedule-channel').value;
+  
+  if (!name) return alert('Schedule name is required');
+  if (!pattern) return alert('Schedule pattern is required');
+  if (!prompt) return alert('Prompt/action is required');
+  
+  const method = editingScheduleId ? 'PUT' : 'POST';
+  const path = editingScheduleId ? `/api/schedules/${editingScheduleId}` : '/api/schedules';
+  
+  try {
+    const result = await api(path, {
+      method,
+      body: JSON.stringify({
+        name,
+        pattern,
+        prompt,
+        timezone,
+        delivery_channel: channel,
+        confirm: true  // Confirmation (as per scheduler rules)
+      })
+    });
+    
+    if (result.success) {
+      closeScheduleModal();
+      await refreshSchedules();
+    } else {
+      alert('Error: ' + (result.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Failed to save schedule: ' + err.message);
+  }
+}
+
+async function deleteSchedule(jobId) {
+  if (!confirm('Delete this schedule? This action cannot be undone.')) return;
+  
+  try {
+    const result = await api(`/api/schedules/${jobId}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ confirm: true })
+    });
+    
+    if (result.success) {
+      await refreshSchedules();
+    } else {
+      alert('Error: ' + (result.error || 'Failed to delete'));
+    }
+  } catch (err) {
+    alert('Failed to delete schedule: ' + err.message);
+  }
+}
+
+async function toggleSchedulePause(jobId) {
+  const job = schedules.find(j => j.id === jobId);
+  if (!job) return;
+  
+  const newStatus = job.status === 'active' ? 'paused' : 'active';
+  
+  try {
+    const result = await api(`/api/schedules/${jobId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: newStatus })
+    });
+    
+    if (result.success) {
+      await refreshSchedules();
+    } else {
+      alert('Error: ' + (result.error || 'Failed to update'));
+    }
+  } catch (err) {
+    alert('Failed to toggle pause: ' + err.message);
+  }
+}
+
+async function runScheduleNow(jobId) {
+  try {
+    const result = await api(`/api/schedules/${jobId}/run`, {
+      method: 'POST',
+      body: JSON.stringify({})
+    });
+    
+    if (result.success) {
+      await refreshSchedules();
+      alert('Schedule running now...');
+    } else {
+      alert('Error: ' + (result.error || 'Failed to run'));
+    }
+  } catch (err) {
+    alert('Failed to run schedule: ' + err.message);
+  }
+}
+
 loadChatSessions();
 applyTheme(getInitialTheme());
 setupProcessAndRightScrollTracking();
@@ -6980,6 +8144,9 @@ async function openBgtPanel(taskId) {
   bgtOpenTaskId = taskId;
   const panel = document.getElementById('bgt-panel');
   if (panel) panel.style.display = 'flex';
+  // Clear chat input when switching tasks
+  const chatInput = document.getElementById('bgt-chat-input');
+  if (chatInput) { chatInput.value = ''; chatInput.disabled = false; chatInput.style.opacity = ''; }
   await bgtRefreshOpenPanel();
   // Highlight the card
   renderBgTasks();
@@ -7184,6 +8351,40 @@ async function bgtSendReply(taskId) {
     alert('Error sending message: ' + e.message);
   } finally {
     input.disabled = false;
+    input.focus();
+  }
+}
+
+async function bgtChatSend() {
+  const input = document.getElementById('bgt-chat-input');
+  if (!input || !bgtOpenTaskId) return;
+  const message = input.value.trim();
+  if (!message) return;
+  input.value = '';
+  input.disabled = true;
+  input.style.opacity = '0.5';
+  try {
+    const result = await api(`/api/bg-tasks/${bgtOpenTaskId}/message`, { method: 'POST', body: JSON.stringify({ message }) });
+    if (result.success) {
+      // Show optimistic sent indicator in journal area
+      const body = document.getElementById('bgt-panel-body');
+      if (body) {
+        const sentDiv = document.createElement('div');
+        sentDiv.style.cssText = 'background:var(--brand);color:#fff;border-radius:8px;padding:6px 10px;font-size:12px;align-self:flex-end;max-width:80%;word-break:break-word;opacity:0.85';
+        sentDiv.textContent = '\u2192 ' + message;
+        body.appendChild(sentDiv);
+        body.scrollTop = body.scrollHeight;
+      }
+      // Refresh panel after short delay to show journal update
+      setTimeout(() => bgtRefreshOpenPanel(), 1000);
+    } else {
+      alert('Failed to send: ' + (result.error || 'unknown error'));
+    }
+  } catch (e) {
+    alert('Error: ' + e.message);
+  } finally {
+    input.disabled = false;
+    input.style.opacity = '';
     input.focus();
   }
 }
@@ -7545,6 +8746,297 @@ function showIntegMsg(msg, color, bg) {
   el.textContent = msg;
   clearTimeout(el._timeout);
   el._timeout = setTimeout(() => { el.style.opacity = '0'; }, 3500);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ERROR RESPONSE SYSTEM — Full JavaScript Implementation
+// Handles: show/hide panel, option selection, input rendering,
+// credential entry, form submission, WS event binding
+// ───────────────────────────────────────────────────────────────────────────
+
+// State
+let _errTaskId = null;
+let _errTemplate = null;
+let _errSelectedAction = null;
+let _errCategory = null;
+let _errBackdrop = null;
+
+function _getOrCreateErrorBackdrop() {
+  if (_errBackdrop) return _errBackdrop;
+  _errBackdrop = document.createElement('div');
+  _errBackdrop.id = 'error-response-backdrop';
+  _errBackdrop.style.cssText = 'position:fixed;inset:0;background:rgba(10,20,40,0.45);z-index:9997;display:none';
+  _errBackdrop.addEventListener('click', closeErrorResponse);
+  document.body.appendChild(_errBackdrop);
+  return _errBackdrop;
+}
+
+function showErrorResponsePanel(taskId, category, errorMessage, errorDetail, template) {
+  _errTaskId = taskId;
+  _errTemplate = template;
+  _errSelectedAction = null;
+  _errCategory = category;
+
+  // Title & description
+  const titleEl = document.getElementById('error-response-title');
+  const descEl = document.getElementById('error-response-desc');
+  if (titleEl) titleEl.textContent = template?.title || ('\u26a0\ufe0f ' + (category || 'Error').toUpperCase());
+  if (descEl) descEl.textContent = template?.description || errorMessage || 'The task needs your help to continue.';
+
+  // Render options
+  const optionsEl = document.getElementById('error-response-options');
+  if (optionsEl) {
+    optionsEl.innerHTML = '';
+    const options = template?.options || [
+      { id: 'retry_now', label: '\u27f3 Retry Now', icon: '\u27f3' },
+      { id: 'skip', label: '\u229a Skip Step', icon: '\u229a' },
+      { id: 'cancel', label: '\u2715 Cancel Task', icon: '\u2715', danger: true },
+    ];
+    options.forEach(opt => {
+      const btn = document.createElement('button');
+      btn.className = 'error-option-btn' + (opt.danger ? ' danger' : '');
+      btn.dataset.actionId = opt.id;
+      btn.innerHTML = `<strong>${escHtml(opt.icon || '')} ${escHtml(opt.label)}</strong>${opt.description ? `<br><span style="font-weight:400;opacity:0.75">${escHtml(opt.description)}</span>` : ''}`;
+      btn.addEventListener('click', () => selectErrorOption(opt));
+      optionsEl.appendChild(btn);
+    });
+  }
+
+  // Clear inputs
+  const inputsEl = document.getElementById('error-response-inputs');
+  if (inputsEl) {
+    inputsEl.innerHTML = '';
+    inputsEl.classList.remove('visible');
+  }
+
+  // Reset submit button
+  const submitBtn = document.getElementById('error-response-submit-btn');
+  if (submitBtn) submitBtn.disabled = true;
+
+  // Show backdrop + panel
+  const backdrop = _getOrCreateErrorBackdrop();
+  backdrop.style.display = 'block';
+  const panel = document.getElementById('error-response-panel');
+  if (panel) panel.classList.add('visible');
+
+  // Notification toast
+  bgtToast('\u26a0\ufe0f Task needs help', (template?.title || category || 'Error') + ' — see panel');
+}
+
+function selectErrorOption(opt) {
+  _errSelectedAction = opt.id;
+
+  // Highlight selected
+  document.querySelectorAll('.error-option-btn').forEach(b => b.classList.remove('selected'));
+  const btn = document.querySelector(`.error-option-btn[data-action-id="${opt.id}"]`);
+  if (btn) btn.classList.add('selected');
+
+  // Show input fields if this option requires them
+  const inputsEl = document.getElementById('error-response-inputs');
+  if (inputsEl) {
+    inputsEl.innerHTML = '';
+    inputsEl.classList.remove('visible');
+
+    const triggerInputs = opt.triggerInputs || [];
+    const allFields = _errTemplate?.requiredInputs || [];
+    const fieldsToShow = triggerInputs.length > 0
+      ? allFields.filter(f => triggerInputs.includes(f.id))
+      : [];
+
+    if (fieldsToShow.length > 0) {
+      fieldsToShow.forEach(field => {
+        const wrap = document.createElement('div');
+        wrap.className = 'input-field';
+        const label = document.createElement('label');
+        label.textContent = field.label;
+        label.setAttribute('for', 'err-input-' + field.id);
+        const input = document.createElement('input');
+        input.id = 'err-input-' + field.id;
+        input.type = field.type || 'text';
+        input.placeholder = field.placeholder || '';
+        input.dataset.fieldId = field.id;
+        if (field.validation === 'digits_only') {
+          input.inputMode = 'numeric';
+          input.pattern = '[0-9]*';
+          input.maxLength = 8;
+        }
+        wrap.appendChild(label);
+        wrap.appendChild(input);
+        inputsEl.appendChild(wrap);
+      });
+      inputsEl.classList.add('visible');
+      // Focus first input
+      const firstInput = inputsEl.querySelector('input');
+      if (firstInput) setTimeout(() => firstInput.focus(), 80);
+    }
+  }
+
+  // Enable submit unless it's cancel (which submits immediately)
+  const submitBtn = document.getElementById('error-response-submit-btn');
+  if (submitBtn) {
+    submitBtn.disabled = false;
+    submitBtn.textContent = opt.danger ? 'Cancel Task' : 'Continue';
+  }
+}
+
+function closeErrorResponse() {
+  _errTaskId = null;
+  _errTemplate = null;
+  _errSelectedAction = null;
+  _errCategory = null;
+
+  const backdrop = document.getElementById('error-response-backdrop');
+  if (backdrop) backdrop.style.display = 'none';
+  const panel = document.getElementById('error-response-panel');
+  if (panel) panel.classList.remove('visible');
+}
+
+async function submitErrorResponse() {
+  if (!_errTaskId || !_errSelectedAction) return;
+
+  const action = _errSelectedAction;
+  const category = _errCategory;
+
+  // Collect input values
+  const inputs = {};
+  document.querySelectorAll('#error-response-inputs input[data-field-id]').forEach(el => {
+    if (el.value.trim()) inputs[el.dataset.fieldId] = el.value.trim();
+  });
+
+  // Validate required fields for credential action
+  if (action === 'credentials') {
+    if (!inputs.email) {
+      const emailEl = document.getElementById('err-input-email');
+      if (emailEl) { emailEl.style.borderColor = 'var(--err)'; emailEl.focus(); }
+      return;
+    }
+    if (!inputs.password) {
+      const pwEl = document.getElementById('err-input-password');
+      if (pwEl) { pwEl.style.borderColor = 'var(--err)'; pwEl.focus(); }
+      return;
+    }
+  }
+
+  if (action === 'verification_code') {
+    if (!inputs.code) {
+      const codeEl = document.getElementById('err-input-code');
+      if (codeEl) { codeEl.style.borderColor = 'var(--err)'; codeEl.focus(); }
+      return;
+    }
+  }
+
+  // Disable submit to prevent double-send
+  const submitBtn = document.getElementById('error-response-submit-btn');
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Sending…'; }
+
+  try {
+    const resp = await fetch(`/api/bg-tasks/${_errTaskId}/error-response`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, category, inputs }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      closeErrorResponse();
+      if (data.resumed) {
+        bgtToast('\u2705 Task resuming', 'Agent is continuing with your response');
+        // Refresh the kanban board to show updated status
+        if (typeof refreshBgTasks === 'function') setTimeout(refreshBgTasks, 800);
+      } else {
+        bgtToast('Task cancelled', 'Task has been stopped');
+        if (typeof refreshBgTasks === 'function') setTimeout(refreshBgTasks, 400);
+      }
+    } else {
+      bgtToast('\u274c Error', data.error || 'Failed to submit response');
+      if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Continue'; }
+    }
+  } catch (err) {
+    console.error('[ErrorResponse] Submit failed:', err);
+    bgtToast('\u274c Network error', 'Could not submit response');
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Continue'; }
+  }
+}
+
+// Hook into the existing WebSocket message handler
+// We extend the onmessage handler after the page loads
+(function patchWebSocketForErrorResponse() {
+  function applyPatch() {
+    // Find the ws variable — it’s declared in a closure, so we intercept via MutationObserver
+    // Alternative: override addEventListener on WebSocket prototype to intercept messages
+    const _origOnMessage = WebSocket.prototype.__defineGetter__
+      ? null
+      : null; // not needed — use event listener approach below
+
+    // We hook into the document-level custom event that server-v2’s WS handler
+    // already dispatches. If that’s not available, we’ll patch the WS directly.
+    document.addEventListener('ws:message', handleErrorResponseWsEvent);
+
+    // Also directly patch any open WebSocket connections by overriding WebSocket prototype
+    const _OrigWS = window.WebSocket;
+    window.WebSocket = function(...args) {
+      const ws = new _OrigWS(...args);
+      const _origAddEventListener = ws.addEventListener.bind(ws);
+      ws.addEventListener = function(type, listener, ...rest) {
+        if (type === 'message') {
+          const wrappedListener = function(e) {
+            try {
+              const msg = JSON.parse(e.data);
+              if (msg.type === 'task_error_requires_response') {
+                handleErrorResponseWsEvent({ detail: msg });
+              }
+            } catch {}
+            return listener.call(this, e);
+          };
+          return _origAddEventListener('message', wrappedListener, ...rest);
+        }
+        return _origAddEventListener(type, listener, ...rest);
+      };
+      // Also patch onmessage setter
+      let _onmsgHandler = null;
+      Object.defineProperty(ws, 'onmessage', {
+        get: () => _onmsgHandler,
+        set: (fn) => {
+          _onmsgHandler = fn;
+          _origAddEventListener('message', (e) => {
+            try {
+              const msg = JSON.parse(e.data);
+              if (msg.type === 'task_error_requires_response') {
+                handleErrorResponseWsEvent({ detail: msg });
+              }
+            } catch {}
+            if (_onmsgHandler) _onmsgHandler.call(ws, e);
+          });
+        },
+        configurable: true,
+      });
+      return ws;
+    };
+    // Copy static properties
+    Object.assign(window.WebSocket, _OrigWS);
+    window.WebSocket.prototype = _OrigWS.prototype;
+    window.WebSocket.CONNECTING = _OrigWS.CONNECTING;
+    window.WebSocket.OPEN = _OrigWS.OPEN;
+    window.WebSocket.CLOSING = _OrigWS.CLOSING;
+    window.WebSocket.CLOSED = _OrigWS.CLOSED;
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', applyPatch);
+  } else {
+    applyPatch();
+  }
+})();
+
+function handleErrorResponseWsEvent(e) {
+  const msg = e.detail || e;
+  if (!msg || msg.type !== 'task_error_requires_response') return;
+  showErrorResponsePanel(
+    msg.taskId,
+    msg.errorCategory,
+    msg.errorMessage,
+    msg.errorDetail,
+    msg.template,
+  );
 }
 
 </script>

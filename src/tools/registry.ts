@@ -3,6 +3,8 @@ import { shellTool } from './shell.js';
 import { readTool, writeTool, editTool, listTool, deleteTool, renameTool, copyTool, mkdirTool, statTool, appendTool, applyPatchTool } from './files.js';
 import { webSearchTool, webFetchTool } from './web.js';
 import { memorySearchTool, memoryWriteTool } from './memory.js';
+import { memoryReadTool } from './memory-read.js';
+import { memoryFileSearchTool } from './memory-file-search.js';
 import { skillListTool, skillSearchTool, skillInstallTool, skillRemoveTool, skillExecTool } from './skills.js';
 import { timeNowTool } from './time.js';
 import { selfUpdateTool } from './self-update.js';
@@ -128,6 +130,8 @@ class ToolRegistry {
     // Memory tools
     this.registerSafe(memoryWriteTool);
     this.registerSafe(memorySearchTool);
+    this.registerSafe(memoryReadTool);
+    this.registerSafe(memoryFileSearchTool);
     // Time tool (system clock — no network)
     this.registerSafe(timeNowTool);
     // ClawHub skills tools

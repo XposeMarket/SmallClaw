@@ -71,8 +71,8 @@ const WORKSPACE_DIR =
 export const DEFAULT_CONFIG: SmallClawConfig = {
   version: '1.0.1',
   gateway: {
-    port: 18789,
-    host: '127.0.0.1',
+    port: process.env.GATEWAY_PORT ? parseInt(process.env.GATEWAY_PORT, 10) : 18789,
+    host: process.env.GATEWAY_HOST ?? (process.env.DOCKER_CONTAINER ? '0.0.0.0' : '127.0.0.1'),
     auth: {
       enabled: true,
       token: undefined

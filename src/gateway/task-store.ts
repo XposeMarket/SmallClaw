@@ -29,7 +29,8 @@ export type PauseReason =
   | 'heartbeat_cycle'
   | 'user_pause'
   | 'error'
-  | 'max_steps';
+  | 'max_steps'
+  | 'interrupted_by_schedule';
 
 export type JournalEntryType =
   | 'tool_call'
@@ -40,7 +41,8 @@ export type JournalEntryType =
   | 'resume'
   | 'error'
   | 'plan_mutation'
-  | 'heartbeat';
+  | 'heartbeat'
+  | 'write_note';
 
 export interface TaskPlanStep {
   index: number;
@@ -89,6 +91,12 @@ export interface TaskRecord {
   status: TaskStatus;
   pauseReason?: PauseReason;
 
+  // ── Schedule interruption context ────────────────────────────────────────
+  pausedByScheduleId?: string;       // Which schedule caused the pause
+  pausedAt?: number;                 // When task was paused
+  pausedAtStepIndex?: number;        // Plan step index when paused
+  shouldResumeAfterSchedule?: boolean; // Resume when schedule completes
+
   plan: TaskPlanStep[];
   currentStepIndex: number;
   maxPlanDepth: number;              // default 20
@@ -103,6 +111,11 @@ export interface TaskRecord {
 
   resumeContext: TaskResumeContext;
   finalSummary?: string;
+
+  /** Number of times the self-healer has intervened on this task. Resets on manual resume. */
+  selfHealAttempts?: number;
+  /** Number of completion-verifier resynth attempts. */
+  resynthAttempts?: number;
 }
 
 // ─── Index ─────────────────────────────────────────────────────────────────────
@@ -264,13 +277,24 @@ export function saveTask(task: TaskRecord): void {
 export function updateTaskStatus(
   id: string,
   status: TaskStatus,
-  opts?: { pauseReason?: PauseReason; finalSummary?: string },
+  opts?: {
+    pauseReason?: PauseReason;
+    finalSummary?: string;
+    pausedByScheduleId?: string | undefined;
+    pausedAt?: number | undefined;
+    pausedAtStepIndex?: number | undefined;
+    shouldResumeAfterSchedule?: boolean | undefined;
+  },
 ): TaskRecord | null {
   const task = loadTask(id);
   if (!task) return null;
   task.status = status;
-  if (opts?.pauseReason) task.pauseReason = opts.pauseReason;
-  if (opts?.finalSummary) task.finalSummary = opts.finalSummary;
+  if (opts?.pauseReason !== undefined) task.pauseReason = opts.pauseReason;
+  if (opts?.finalSummary !== undefined) task.finalSummary = opts.finalSummary;
+  if (opts?.pausedByScheduleId !== undefined) task.pausedByScheduleId = opts.pausedByScheduleId;
+  if (opts?.pausedAt !== undefined) task.pausedAt = opts.pausedAt;
+  if (opts?.pausedAtStepIndex !== undefined) task.pausedAtStepIndex = opts.pausedAtStepIndex;
+  if (opts?.shouldResumeAfterSchedule !== undefined) task.shouldResumeAfterSchedule = opts.shouldResumeAfterSchedule;
   if (status === 'complete' || status === 'failed') task.completedAt = Date.now();
   task.lastProgressAt = Date.now();
   saveTask(task);

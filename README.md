@@ -153,7 +153,9 @@ SmallClaw controls a real browser via Playwright — not just opening a URL for 
 | `run_command` | Open an app or file for you to interact with (VS Code, Notepad, Chrome). SmallClaw can open it but not control it. |
 | `start_task` | Launch a multi-step background task for long-running operations |
 
-## Prerequisites
+## Installation
+
+### Prerequisites
 
 1. **Node.js** 18+ ([Download](https://nodejs.org/))
 2. **At least one model provider**:
@@ -164,46 +166,88 @@ SmallClaw controls a real browser via Playwright — not just opening a URL for 
    - OpenAI Codex OAuth (ChatGPT account)
 3. **At least 8GB RAM** (16GB recommended for coding tasks)
 
-## Installation
+### Setup
 
-```bash
-# Clone the repository
-git clone https://github.com/xposemarket/smallclaw.git
-cd smallclaw
+#### Windows
+1. Clone the repository: `git clone https://github.com/xposemarket/smallclaw.git && cd smallclaw`
+2. Install dependencies: `npm install`
+3. Build the project: `npm run build`
+4. To auto-start on login: Create a Windows Task Scheduler task pointing to:
+   ```powershell
+   node dist/cli/index.js gateway start
+   ```
+   (Use the Windows Task Scheduler GUI and set the action to run that command)
 
-# Install dependencies
-npm install
+#### macOS
+1. Clone the repository: `git clone https://github.com/xposemarket/smallclaw.git && cd smallclaw`
+2. Install dependencies: `npm install`
+3. Build the project: `npm run build`
+4. To auto-start on login: Create a LaunchAgent at `~/Library/LaunchAgents/com.smallclaw.plist` with:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+       <key>Label</key>
+       <string>com.smallclaw.gateway</string>
+       <key>ProgramArguments</key>
+       <array>
+           <string>/path/to/node</string>
+           <string>/path/to/smallclaw/dist/cli/index.js</string>
+           <string>gateway</string>
+           <string>start</string>
+       </array>
+       <key>RunAtLoad</key>
+       <true/>
+       <key>StandardOutPath</key>
+       <string>/tmp/smallclaw.log</string>
+       <key>StandardErrorPath</key>
+       <string>/tmp/smallclaw.err</string>
+   </dict>
+   </plist>
+   ```
+   Then run: `launchctl load ~/Library/LaunchAgents/com.smallclaw.plist`
 
-# Build the project
-npm run build
-
-# Make CLI available globally
-npm link
-```
-
-## CLI Rename (Stage 1)
-
-SmallClaw now uses the `smallclaw` command in docs and examples.
-
-- Preferred command: `smallclaw`
-- Legacy alias still works for now: `localclaw` (deprecated)
-
-### Migration from older installs
-
-```bash
-git pull --ff-only
-npm install
-npm run build
-npm link
-```
-
-Then use:
-
-```bash
-smallclaw gateway start
-```
+#### Linux
+1. Clone the repository: `git clone https://github.com/xposemarket/smallclaw.git && cd smallclaw`
+2. Install dependencies: `npm install`
+3. Build the project: `npm run build`
+4. To auto-start on login: Create a systemd service at `~/.config/systemd/user/smallclaw.service` with:
+   ```ini
+   [Unit]
+   Description=SmallClaw AI Gateway
+   After=network.target
+   
+   [Service]
+   Type=simple
+   WorkingDirectory=/path/to/smallclaw
+   ExecStart=/usr/bin/node dist/cli/index.js gateway start
+   Restart=on-failure
+   RestartSec=10
+   StandardOutput=append:/tmp/smallclaw.log
+   StandardError=append:/tmp/smallclaw.err
+   
+   [Install]
+   WantedBy=default.target
+   ```
+   Then run:
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user enable smallclaw
+   systemctl --user start smallclaw
+   ```
 
 ## Quick Start
+
+```bash
+# Install and build
+npm install && npm run build
+
+# Start the gateway
+npm start
+```
+
+Open `http://localhost:18789` in your browser.
 
 ### 1. Pull a model
 
@@ -215,22 +259,16 @@ ollama pull qwen3:4b
 ollama pull qwen2.5-coder:32b
 ```
 
-### 2. Start the gateway
-
-```bash
-smallclaw gateway start
-```
-
-Open `http://localhost:18789` in your browser. That's it.
-
-Legacy alias note: `localclaw gateway start` still works during the transition.
-
-### 3. Configure models and search
+### 2. Configure models and search
 
 In the web UI, open Settings (⚙️ in the top bar):
 
 - **Models tab** — choose provider + model (Ollama, llama.cpp, LM Studio, OpenAI API, or OpenAI Codex OAuth)
 - **Search tab** — add API keys for Tavily, Google, or Brave if you want better web search results
+
+### 3. Test webhooks
+
+See [WEBHOOKS.md](./WEBHOOKS.md) for curl examples and webhook endpoint testing (cross-platform)
 
 ## Configuration
 
@@ -451,6 +489,56 @@ SmallClaw is specifically designed around the constraints of 4B–32B parameter 
 - **Single-pass routing** — One LLM call decides whether to use tools or respond; no coordination overhead between multiple agents
 - **Surgical edits over rewrites** — `replace_lines`, `insert_after`, `delete_lines` instead of `write_file` for existing files
 
+## Docker Setup
+
+SmallClaw can be run fully containerized via Docker Compose.
+
+### Quick Start (Bundled Ollama)
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose --profile ollama up -d
+```
+
+Then open `http://your-server-ip:18789` in your browser.
+
+### External Ollama (Already Running)
+
+If Ollama is already running in a separate container on the same Docker network:
+
+```bash
+# In your .env file:
+SMALLCLAW_PROVIDER=ollama
+OLLAMA_HOST=http://your-ollama-container:11434
+
+# Start only the gateway:
+docker compose up -d smallclaw
+```
+
+### Mapping to a Different Host Port
+
+The app always listens on port **18789 inside the container**. To expose it on a different host port, set `HOST_PORT` in your `.env`:
+
+```bash
+# In your .env:
+HOST_PORT=8080
+# Docker maps: host:8080 → container:18789
+```
+
+### Environment Variables (Docker)
+
+| Variable | Default | Description |
+|---|---|---|
+| `HOST_PORT` | `18789` | Host port to expose SmallClaw on |
+| `GATEWAY_PORT` | `18789` | Internal container port (do not change) |
+| `GATEWAY_HOST` | `0.0.0.0` | Bind address inside container |
+| `DOCKER_CONTAINER` | `true` | Auto-set in Dockerfile; enables 0.0.0.0 binding |
+
+> **Important:** Inside Docker, the server must bind to `0.0.0.0`, not `127.0.0.1`. Binding to loopback makes the gateway unreachable from outside the container even with port mapping configured. SmallClaw handles this automatically when `DOCKER_CONTAINER=true`.
+
+---
+
 ## Troubleshooting
 
 ### "Cannot connect to Ollama"
@@ -480,6 +568,18 @@ ollama list
 - Check Settings → Models and confirm a model is selected and saved
 - Some models handle tool-calling better than others — qwen3 and qwen2.5-coder series are most reliable
 - If the model keeps ignoring tool calls, try a larger variant
+
+### Docker: Web UI unreachable after container starts
+If the container starts cleanly (you see the gateway banner and `[CronScheduler] Started`) but the UI is not reachable on the mapped port, there are three things to check:
+1. **Bind address** — The server must bind to `0.0.0.0` inside Docker, not `127.0.0.1`. This is handled automatically via the `DOCKER_CONTAINER=true` env var set in the Dockerfile. If you overrode `GATEWAY_HOST`, make sure it is `0.0.0.0`.
+2. **Port mismatch** — The app's internal port is always `18789`. Your `.env` file should use `HOST_PORT` (not `GATEWAY_PORT`) to remap on your machine. `GATEWAY_PORT` controls the internal port and should stay `18789`.
+3. **Stale image** — If you built the image before these fixes, rebuild with `--no-cache`: `docker compose build --no-cache`.
+
+### Background task resumes creating a new task instead of continuing
+If you reply to a paused/escalated task and SmallClaw starts a brand new task instead of resuming, this was a bug fixed in v1.0.3. The follow-up intercept now detects the existing blocked task for your session and routes your reply to it automatically. Phrases like "proceed", "go ahead", "I fixed it", and "done" all trigger a resume without needing to reference the task explicitly.
+
+### Browser automation looping on snapshots
+If a browser task takes repeated snapshots without clicking or filling anything, stall detection should now catch this within 5 identical snapshots (previously 20). If you're on an older build, update and rebuild. The browser advisor also enforces an anti-loop rule: if a snapshot was just taken and `@ref` numbers are available, the next action must be a click or fill — not another snapshot.
 
 ## Roadmap
 

@@ -288,6 +288,8 @@ async function takeSnapshot(page: PwPage, maxElements: number = 100): Promise<st
         unlabeled_non_input: number;
         unnamed_input_included: number;
       };
+      modalOpen: boolean;
+      modalLabel: string;
     } = await page.evaluate((max: number) => {
       const doc = (globalThis as any).document;
       // Expanded selector set — includes data-testid (React apps), explicit search inputs
@@ -301,10 +303,27 @@ async function takeSnapshot(page: PwPage, maxElements: number = 100): Promise<st
         'h1', 'h2', 'h3',
       ].join(', ');
 
+      // ── Modal / dialog detection ───────────────────────────────────────────
+      // If a modal or dialog is open, ONLY elements inside it are interactable.
+      // Scanning the full DOM would expose background elements the AI cannot
+      // actually click (they are aria-hidden or covered by the overlay).
+      // Priority: aria-modal dialogs > role=dialog > data-testid dialogs.
+      const openModal = (
+        doc.querySelector('[role="dialog"][aria-modal="true"]')
+        || doc.querySelector('[role="dialog"]:not([aria-hidden="true"])')
+        || doc.querySelector('[data-testid="sheetDialog"], [data-testid="confirmationSheetDialog"], [data-testid="keyboardShortcutModal"]')
+        || doc.querySelector('dialog[open]')
+        // X.com reply-permission dropdown and other sheets that aren't role=dialog
+        || doc.querySelector('[data-testid="Dropdown"]')
+        || doc.querySelector('[role="menu"]')
+        || null
+      );
+      const searchRoot = openModal || doc;
+
       // De-duplicate nodes (data-testid + input could match same element twice)
       const seen = new Set<any>();
       const nodes: any[] = [];
-      for (const el of Array.from(doc.querySelectorAll(selector))) {
+      for (const el of Array.from(searchRoot.querySelectorAll(selector))) {
         if (!seen.has(el)) { seen.add(el); nodes.push(el); }
         if (nodes.length >= max) break;
       }
@@ -390,7 +409,10 @@ async function takeSnapshot(page: PwPage, maxElements: number = 100): Promise<st
         });
       }
       diagnostics.included = results.length;
-      return { elements: results, diagnostics };
+      const modalLabel = openModal
+        ? (openModal.getAttribute('aria-label') || openModal.getAttribute('aria-labelledby') && (doc.getElementById(openModal.getAttribute('aria-labelledby') || '') as any)?.innerText || openModal.getAttribute('data-testid') || 'dialog')
+        : '';
+      return { elements: results, diagnostics, modalOpen: !!openModal, modalLabel: String(modalLabel || '').trim().slice(0, 80) };
     }, maxElements);
     const rawElements = Array.isArray(snapshotData?.elements) ? snapshotData.elements : [];
     const elements: SnapElement[] = rawElements
@@ -462,6 +484,13 @@ async function takeSnapshot(page: PwPage, maxElements: number = 100): Promise<st
     }
     const snapshotText = lines.join('\n');
 
+    // Modal / dialog open — warn the AI so it doesn't try to interact with background elements.
+    if (snapshotData?.modalOpen) {
+      const label = snapshotData.modalLabel ? ` ("${snapshotData.modalLabel}")` : '';
+      return snapshotText
+        + `\n\n[MODAL OPEN]${label} A dialog/modal is blocking the page. The ${elements.length} elements above are ONLY the controls inside this modal. Background page elements are NOT accessible until the modal is closed. To dismiss: look for a Close button or press Escape with browser_press_key({"key":"Escape"}).`;
+    }
+
     // Login wall detection — append an explicit action hint so the agent doesn't loop.
     // If the page looks like a login wall and there's a one-click sign-in button, say so.
     const elementText = elements.map(e => e.name).join(' ').toLowerCase();
@@ -502,9 +531,20 @@ const INTERACTIVE_SELECTOR = [
 async function clickByRef(page: PwPage, ref: number): Promise<{ role: string; name: string }> {
   const result = await page.evaluate((args: { refIdx: number; sel: string }) => {
     const doc = (globalThis as any).document;
+    // Respect modal focus traps — same logic as takeSnapshot
+    const openModal = (
+      doc.querySelector('[role="dialog"][aria-modal="true"]')
+      || doc.querySelector('[role="dialog"]:not([aria-hidden="true"])')
+      || doc.querySelector('[data-testid="sheetDialog"], [data-testid="confirmationSheetDialog"], [data-testid="keyboardShortcutModal"]')
+      || doc.querySelector('dialog[open]')
+      || doc.querySelector('[data-testid="Dropdown"]')
+      || doc.querySelector('[role="menu"]')
+      || null
+    );
+    const searchRoot = openModal || doc;
     const seen = new Set<any>();
     const nodes: any[] = [];
-    for (const el of Array.from(doc.querySelectorAll(args.sel))) {
+    for (const el of Array.from(searchRoot.querySelectorAll(args.sel))) {
       if (!seen.has(el)) { seen.add(el); nodes.push(el); }
     }
     let counter = 0;
@@ -545,12 +585,23 @@ async function clickByRef(page: PwPage, ref: number): Promise<{ role: string; na
 }
 
 // Fill the nth interactive element
-async function fillByRef(page: PwPage, ref: number, text: string): Promise<{ role: string; name: string }> {
+async function fillByRef(page: PwPage, ref: number, text: string): Promise<{ role: string; name: string; needsNativeType?: boolean }> {
   const result = await page.evaluate((args: { ref: number; text: string; sel: string }) => {
     const doc = (globalThis as any).document;
+    // Respect modal focus traps — same logic as takeSnapshot
+    const openModal = (
+      doc.querySelector('[role="dialog"][aria-modal="true"]')
+      || doc.querySelector('[role="dialog"]:not([aria-hidden="true"])')
+      || doc.querySelector('[data-testid="sheetDialog"], [data-testid="confirmationSheetDialog"], [data-testid="keyboardShortcutModal"]')
+      || doc.querySelector('dialog[open]')
+      || doc.querySelector('[data-testid="Dropdown"]')
+      || doc.querySelector('[role="menu"]')
+      || null
+    );
+    const searchRoot = openModal || doc;
     const seen = new Set<any>();
     const nodes: any[] = [];
-    for (const el of Array.from(doc.querySelectorAll(args.sel))) {
+    for (const el of Array.from(searchRoot.querySelectorAll(args.sel))) {
       if (!seen.has(el)) { seen.add(el); nodes.push(el); }
     }
     let counter = 0;
@@ -584,8 +635,12 @@ async function fillByRef(page: PwPage, ref: number, text: string): Promise<{ rol
           el.value = args.text;
           el.dispatchEvent(new Event('change', { bubbles: true }));
         } else if (el.getAttribute('contenteditable') === 'true') {
-          el.innerHTML = args.text;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
+          // contenteditable: mark element for Playwright-native handling outside evaluate().
+          // execCommand inside evaluate() is unreliable via CDP because OS focus may not
+          // be on the element. Return a sentinel so the Node.js side can use page.keyboard.
+          el.scrollIntoView({ block: 'center' });
+          el.click(); // bring DOM focus to the element
+          return { role: role || tag, name: name || tag, needsNativeType: true };
         } else {
           // Clear + set value + dispatch events (works for React/Angular inputs too)
           const nativeSetter = Object.getOwnPropertyDescriptor((globalThis as any).HTMLInputElement.prototype, 'value')?.set
@@ -602,8 +657,25 @@ async function fillByRef(page: PwPage, ref: number, text: string): Promise<{ rol
   }, { ref, text, sel: INTERACTIVE_SELECTOR });
 
   if (!result || result.error) throw new Error(result?.error || `Element @${ref} not found`);
-  await page.waitForTimeout(800);
-  return result as { role: string; name: string };
+
+  // contenteditable elements (e.g. X.com composer) need Playwright-native typing.
+  // The evaluate() click above set DOM focus; now we clear any existing content
+  // with Ctrl+A then type the text through the real CDP keyboard pipeline.
+  if ((result as any).needsNativeType) {
+    // Small wait for React to process the click/focus event
+    await page.waitForTimeout(300);
+    // Select-all to clear any pre-existing text in the composer
+    await page.keyboard.press('Control+A');
+    await page.waitForTimeout(100);
+    // Type text character by character — this fires real KeyDown/KeyPress/KeyUp/Input
+    // events that React's synthetic event system correctly intercepts.
+    await page.keyboard.type(text, { delay: 20 });
+    await page.waitForTimeout(400);
+  } else {
+    await page.waitForTimeout(800);
+  }
+
+  return { role: result.role, name: result.name, needsNativeType: !!(result as any).needsNativeType };
 }
 
 // Press a key (e.g. Enter, Tab)
@@ -763,7 +835,28 @@ async function extractStructuredFromPage(
     const isSearch = /(search|results|q=)/.test(url) || /(google|bing|duckduckgo|brave|yahoo)\./.test(host);
 
     if (isX) {
-      out.pageType = 'x_feed';
+      // Smarter X.com page type detection — not all x.com pages are feed pages.
+      // Compose, settings, notifications, and other interactive pages should be 'generic'
+      // so the browser advisor treats them as interaction targets, not feed collectors.
+      const xPathname = String((globalThis as any).location?.pathname || '');
+      const isXComposePage = /^\/(compose|intent)/.test(xPathname);
+      const isXSettingsPage = xPathname.startsWith('/settings') || xPathname.startsWith('/i/');
+      const isXNotifications = xPathname.startsWith('/notifications');
+      const isXHomeFeed = xPathname === '/' || xPathname === '/home' || xPathname === '';
+      const isXProfileOrThread = /^\/[a-z0-9_]+(\/(status\/\d+)?)?$/i.test(xPathname) && !isXComposePage && !isXSettingsPage && !isXNotifications;
+
+      if (isXComposePage || isXSettingsPage || isXNotifications) {
+        // Interactive page — treat as generic so advisor uses ref-based interaction mode
+        out.pageType = 'generic';
+        return out;
+      } else if (isXHomeFeed || isXProfileOrThread) {
+        out.pageType = 'x_feed';
+      } else {
+        // Unknown x.com path — fall back to generic (safer for interaction)
+        out.pageType = 'generic';
+        return out;
+      }
+
       const seen = new Set<string>();
       const tweets = Array.from(doc.querySelectorAll('article[data-testid="tweet"]')) as any[];
       for (const tw of tweets) {
@@ -1013,10 +1106,126 @@ export async function browserFill(sessionId: string, ref: number, text: string):
   if (!session) return 'ERROR: No browser session. Use browser_open first.';
   try {
     const el = await fillByRef(session.page, ref, text);
+
+    // After filling, find the submit button closest to the filled element in the DOM.
+    // This lets us annotate the snapshot so the model clicks the RIGHT Post button
+    // (the composer's) and not a Post button elsewhere on the page (e.g. in the feed).
+    // Find the Post/Tweet submit button ref after filling.
+    // Strategy: use X.com's stable data-testid first, then fall back to DOM walk.
+    // We recount refs using the same filter logic as takeSnapshot to get the correct number.
+    const submitHint = await session.page.evaluate((args: { ref: number; sel: string }) => {
+      const doc = (globalThis as any).document as any;
+      const openModal: any = (
+        doc.querySelector('[role="dialog"][aria-modal="true"]')
+        || doc.querySelector('[role="dialog"]:not([aria-hidden="true"])')
+        || doc.querySelector('dialog[open]')
+        || doc.querySelector('[data-testid="Dropdown"]')
+        || doc.querySelector('[role="menu"]')
+        || null
+      );
+      const searchRoot: any = openModal || doc.documentElement;
+
+      // Build the same visible-element list as takeSnapshot so ref numbers match exactly
+      const isVisible = (e: any): boolean => {
+        const r = typeof e.getBoundingClientRect === 'function' ? e.getBoundingClientRect() : null;
+        if (!r || (r.width === 0 && r.height === 0)) return false;
+        const style = typeof (globalThis as any).getComputedStyle === 'function' ? (globalThis as any).getComputedStyle(e) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+        return true;
+      };
+      const seen = new Set<any>();
+      const all: any[] = [];
+      for (const e of Array.from(searchRoot.querySelectorAll(args.sel))) {
+        if (!seen.has(e)) { seen.add(e); all.push(e); }
+      }
+      // Filter same way as takeSnapshot
+      const visible = all.filter((e: any) => {
+        const tag = e.tagName.toLowerCase();
+        const role = (e.getAttribute('role') || '').toLowerCase();
+        const ce = e.getAttribute('contenteditable') === 'true';
+        const isInput = ['input', 'textarea', 'select'].includes(tag) || ce || ['textbox', 'searchbox', 'combobox'].includes(role);
+        const name = (e.getAttribute('aria-label') || e.innerText || e.getAttribute('placeholder') || e.getAttribute('data-testid') || '').trim().slice(0, 80) || (ce ? 'editable' : '');
+        if (!name && !isInput) return false;
+        return isVisible(e);
+      });
+
+      // Strategy 1: X.com stable testid — tweetButtonInline is the in-timeline composer Post button
+      const xPostBtn = doc.querySelector('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]');
+      if (xPostBtn && isVisible(xPostBtn)) {
+        const btnRef = visible.indexOf(xPostBtn) + 1;
+        if (btnRef > 0) {
+          const label = (xPostBtn.getAttribute('aria-label') || xPostBtn.innerText || 'Post').trim();
+          return { ref: btnRef, label, strategy: 'testid' };
+        }
+      }
+
+      // Strategy 2: Find filled element, walk up DOM to find Post/Tweet button ancestor
+      let filledEl: any = null;
+      for (let i = 0; i < visible.length; i++) {
+        if (i + 1 === args.ref) { filledEl = visible[i]; break; }
+      }
+      if (!filledEl) return null;
+
+      let ancestor: any = filledEl.parentElement;
+      const MAX_DEPTH = 14;
+      for (let d = 0; d < MAX_DEPTH && ancestor; d++) {
+        const buttons = Array.from(ancestor.querySelectorAll('button, [role="button"]')) as any[];
+        for (const btn of buttons) {
+          const label = (btn.getAttribute('aria-label') || btn.innerText || '').trim();
+          if (/^(post|tweet)$/i.test(label) && isVisible(btn)) {
+            const btnRef = visible.indexOf(btn) + 1;
+            if (btnRef > 0) return { ref: btnRef, label, strategy: 'walk' };
+          }
+        }
+        ancestor = ancestor.parentElement;
+      }
+      return null;
+    }, { ref, sel: INTERACTIVE_SELECTOR }).catch(() => null);
+
     const snapshot = await takeSnapshot(session.page);
     session.lastSnapshot = snapshot;
     session.lastSnapshotAt = Date.now();
-    return `Filled @${ref} (${el.role}: "${el.name}") with "${text.slice(0, 50)}"\n\n${snapshot}`;
+
+    // ── X.com composer: click Post button directly after a contenteditable fill ──
+    // The ref-based hint is unreliable because X renders multiple "Post"-labelled
+    // buttons (inline composer + toolbar) and the wrong one gets picked.
+    // Strategy: try stable testids in order, fall back to text match.
+    // We do this HERE so the model never has to guess the ref.
+    if ((el as any).needsNativeType === true) {
+      // Only auto-submit for contenteditable fills (the X.com composer case)
+      const xPostSelectors = [
+        '[data-testid="tweetButtonInline"]',   // home feed inline composer
+        '[data-testid="tweetButton"]',          // full /compose modal
+      ];
+      let clicked = false;
+      for (const sel of xPostSelectors) {
+        try {
+          const btn = session.page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 800 }).catch(() => false)) {
+            await btn.click();
+            clicked = true;
+            console.log(`[Browser] Auto-clicked Post button via ${sel}`);
+            break;
+          }
+        } catch { /* try next */ }
+      }
+      if (clicked) {
+        // Wait for post to submit and feed to update
+        await session.page.waitForTimeout(2000);
+        await session.page.waitForLoadState('networkidle', { timeout: 4000 }).catch(() => {});
+        const afterSnapshot = await takeSnapshot(session.page);
+        session.lastSnapshot = afterSnapshot;
+        session.lastSnapshotAt = Date.now();
+        return `Filled composer and clicked Post button.\n\nTweet has been posted successfully.\n\n${afterSnapshot}`;
+      }
+    }
+
+    // Fallback: show snapshot + hint for model to click manually
+    let result = `Filled @${ref} (${el.role}: "${el.name}") with "${text.slice(0, 50)}"\n\n${snapshot}`;
+    if (submitHint) {
+      result += `\n\n⚠️ COMPOSER SUBMIT BUTTON: @${submitHint.ref} ("${submitHint.label}") — click THIS ref to post. Do NOT click any other @ref first. Do NOT take another snapshot first.`;
+    }
+    return result;
   } catch (err: any) {
     return `ERROR: Fill @${ref} failed: ${err.message}`;
   }
@@ -1123,7 +1332,7 @@ export function getBrowserToolDefinitions(): any[] {
       type: 'function',
       function: {
         name: 'browser_snapshot',
-        description: 'Re-scan the current page and return an updated list of interactive elements with @ref numbers. Call this after a click or fill to see what changed. If the element count seems low for a complex page, use browser_wait first to let the page finish loading.',
+        description: 'Re-scan the current page and return an updated list of interactive elements with @ref numbers. ONLY call this when you do NOT already have a recent snapshot in context — do NOT call it twice in a row or after browser_open/browser_fill/browser_wait which already return a snapshot. If you just received a snapshot, ACT on it immediately (browser_click or browser_fill) instead of re-snapping. Repeated snapshot calls without acting = stall loop.',
         parameters: { type: 'object', properties: {} },
       },
     },

@@ -1,84 +1,156 @@
-# TOOLS.md — Local Notes
-
-Skills define *how* tools work. This file is for *your* specifics.
+# TOOLS.md — Available Tools & Usage Guide
 
 ## Environment
 
 - **Platform:** Windows 11
-- **Workspace:** D:\localclaw\workspace
-- **Model:** Qwen3:4b via Ollama (localhost:11434)
+- **Workspace:** D:\SmallClaw\workspace
+- **Model:** Ollama (local)
 - **Gateway:** http://127.0.0.1:18789
 
-## Available Tools
+---
 
-- list_files — List workspace files
-- read_file — Read file with line numbers
-- create_file — Create new file (fails if exists)
-- replace_lines — Replace lines N-M
-- insert_after — Insert after line N
-- delete_lines — Delete lines N-M
-- find_replace — Find/replace exact text
-- delete_file — Delete file
-- web_search — Google Custom Search
+## File & Shell Tools
 
-## Notes
+| Tool | What it does |
+|------|-------------|
+| `shell` | Execute shell/cmd commands |
+| `read` | Read file contents with line numbers |
+| `write` | Write (create/overwrite) a file |
+| `edit` | Edit specific lines in a file |
+| `list` | List directory contents |
+| `delete` | Delete a file or directory |
+| `rename` | Rename/move a file |
+| `copy` | Copy a file |
+| `mkdir` | Create a directory |
+| `stat` | Get file metadata (size, dates) |
+| `append` | Append content to a file |
+| `apply_patch` | Apply a unified diff patch |
 
-- Line-based tools work best for edits (replace_lines, insert_after)
-- find_replace is fragile with whitespace — prefer line-based tools
-- For large files, read_file first to get line numbers
-- create_file blocks overwrites — use editing tools for existing files
+## Web Tools
 
-## Critical Tool Rules
+| Tool | What it does |
+|------|-------------|
+| `web_search` | Search the web (Google/Brave/Tavily) |
+| `web_fetch` | Fetch and parse a URL (no browser needed) |
 
-**NEVER use `run_command` to open a browser.** Use `browser_open(url)` instead. `run_command("chrome ...")` opens a separate window with no session — browser_snapshot will fail.
+## Memory Tools
 
-**Web Research Decision Table:**
+| Tool | What it does |
+|------|-------------|
+| `memory_write` | Write/upsert a fact to long-term memory store |
+| `memory_search` | Keyword search USER.md + SOUL.md snippets |
+| `memory_read` | Read full contents of USER.md, SOUL.md, or IDENTITY.md |
+| `persona_read` | Read a persona file with line numbers (before editing) |
+| `persona_update` | Surgically update SOUL.md, USER.md, IDENTITY.md, MEMORY.md |
 
-| Situation | Use |
-|-----------|-----|
-| Reading Reddit, GitHub, news, docs | `web_search` + `web_fetch` |
-| Filling a form, logging in, clicking a UI | `browser_open` + `browser_click` |
-| Reddit specifically | `web_search` with `site:reddit.com "term"` then `web_fetch` |
-| Opening ChatGPT/Claude in browser | `browser_open("https://chatgpt.com")` |
+## Intraday Memory
 
-**Desktop focus:** use short process name — `"msedge"`, `"chrome"`, `"code"` — never the full window title.
+| Tool | What it does |
+|------|-------------|
+| `write_note` | Write temporary note to today's intraday notes file (auto-cleaned EOD) |
+
+## Task Tools
+
+| Tool | What it does |
+|------|-------------|
+| `task_control` | List, create, update, complete tasks |
+
+## Time
+
+| Tool | What it does |
+|------|-------------|
+| `time_now` | Get current date/time |
+
+## Browser Tools
+
+| Tool | What it does |
+|------|-------------|
+| `browser_open` | Open a URL in the automation browser |
+| `browser_snapshot` | Screenshot + interactive element refs |
+| `browser_click` | Click an element by ref number |
+| `browser_fill` | Fill a form field |
+| `browser_press_key` | Press a keyboard key |
+| `browser_wait` | Wait N milliseconds |
+| `browser_scroll` | Scroll page up or down |
+| `browser_close` | Close browser session |
+
+## Desktop Tools
+
+| Tool | What it does |
+|------|-------------|
+| `desktop_screenshot` | Screenshot the desktop |
+| `desktop_find_window` | Find a window by process name |
+| `desktop_focus_window` | Focus a window by process name |
+| `desktop_click` | Click at x,y coordinates |
+| `desktop_drag` | Drag from one point to another |
+| `desktop_type` | Type text |
+| `desktop_press_key` | Press a key |
+| `desktop_wait` | Wait N ms |
+| `desktop_get_clipboard` | Read clipboard |
+| `desktop_set_clipboard` | Write to clipboard |
+
+## Skills Tools
+
+| Tool | What it does |
+|------|-------------|
+| `skill_list` | List installed skills |
+| `skill_search` | Search skills by keyword |
+| `skill_install` | Install a skill from ClawHub |
+| `skill_remove` | Remove a skill |
+| `skill_exec` | Execute a skill |
+
+## Self-Maintenance Tools
+
+| Tool | What it does |
+|------|-------------|
+| `read_source` | Read SmallClaw source code files |
+| `list_source` | List SmallClaw source files |
+| `propose_repair` | Propose a self-repair patch |
+| `self_update` | Run self-update process |
+| `spawn_agent` | Spawn a sub-agent |
 
 ---
 
-## Web Research Strategy — READ THIS BEFORE USING THE BROWSER
+## Decision Table — Which Tool to Use
 
-Choose the right tool for the job. Browser automation is fragile and slow. Only use it when you actually need to interact with a page.
-
-### Decision Table
-
-| What you need to do | Use this |
+| What you need | Use this |
 |---|---|
-| Read Reddit posts, GitHub, news articles, blogs | `web_search` + `web_fetch` — never the browser |
-| Read X/Twitter content | Browser only — open search URL directly (e.g. `https://x.com/search?q=TERM&f=live`), snapshot, scroll — never click into tweets or follow links |
-| Interact with a web app (forms, buttons, login) | Browser automation |
-| Scrape infinite scroll content | Browser + scroll loop — cap at a reasonable limit |
-
-### Rules for web_search + web_fetch (preferred for research)
-
-- Use `web_search` first to get URLs, then `web_fetch` each relevant URL to read full content
-- For Reddit specifically: use `site:reddit.com/r/SUBREDDIT "keyword"` search queries — do not open a browser
-- `web_fetch` works on Reddit, GitHub, and most static sites without triggering bot detection
-- Extract what you need from the fetched content and move on — do not browse around
-
-### Rules for browser automation (only when required)
-
-- Open the most specific URL possible — never start at a homepage and navigate from there
-- For X/Twitter: go straight to `https://x.com/search?q=TERM&f=live` — do not log in, do not click tweets, do not follow external links
-- Never click external links inside posts or feeds — they will navigate you away and you will lose your place
-- If you need to go back, use `browser_open` with the original URL — do not use Alt+Left or browser history
-- Take snapshots sparingly — one per page state, not repeatedly on the same unchanged page
-- If a snapshot loop guard triggers, STOP and rethink — do not retry the same call
-- On task resume: always re-open the target URL fresh via `browser_open` — never assume prior browser state is still valid
-
-### For read-only research tasks
-
-If the task is purely reading and summarizing (no login, no form submission, no interaction), use `web_search` + `web_fetch`. This applies to: Reddit, GitHub, news sites, documentation, blog posts. The browser is not needed and will cause problems.
+| Read a website, GitHub, Reddit, docs | `web_search` + `web_fetch` |
+| Log into a site or interact with a web form | `browser_open` + `browser_click/fill` |
+| Reddit research | `web_search` with `site:reddit.com "term"` → `web_fetch` |
+| Read or create local files | `read` / `write` / `edit` / `append` |
+| Run a command or script | `shell` |
+| Interact with a desktop app | `desktop_screenshot` + `desktop_click/type` |
+| Remember something permanently | `memory_write` (upsert + stable key) |
+| Update persona/user model | `persona_update` |
+| Search what you already know | `memory_search` |
+| Read a full persona file | `memory_read` or `persona_read` |
+| Temporary note during a task | `write_note` |
+| What time is it | `time_now` |
 
 ---
 
-*Add whatever helps you do your job. This is your cheat sheet.*
+## Critical Rules
+
+**NEVER use `shell` to open a browser.** Use `browser_open(url)` instead.
+
+**Desktop focus:** Use short process name — `"msedge"`, `"chrome"`, `"code"` — never the full window title. Fail twice → stop and report, do not loop.
+
+**Line-based edits:** Use `edit` (replace_lines) for existing files — more reliable than find/replace for whitespace-sensitive content.
+
+**Reddit:** Always `web_search` with `site:reddit.com "keyword"` then `web_fetch` individual post URLs. Never use the browser for Reddit.
+
+---
+
+## When TOOLS.md is Injected
+
+TOOLS.md is **not** always injected (saves context tokens). It is referenced when:
+- You make 3+ consecutive tool failures
+- You explicitly ask "what tools do I have"
+- System detects tool uncertainty in reasoning
+
+Otherwise, you should know your tools without being reminded.
+
+---
+
+*Last updated: 2026-03-04*

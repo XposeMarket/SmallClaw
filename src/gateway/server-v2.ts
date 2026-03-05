@@ -21,6 +21,7 @@ import {
   ensureAgentWorkspace,
   resolveAgentWorkspace,
 } from '../config/config';
+import { getVault } from '../security/vault';
 import { getOllamaClient } from '../agents/ollama-client';
 import { spawnAgent } from '../agents/spawner';
 import { getSession, addMessage, getHistory, getHistoryForApiCall, getWorkspace, setWorkspace, clearHistory, cleanupSessions } from './session';
@@ -28,6 +29,15 @@ import { hookBus } from './hooks';
 import { loadWorkspaceHooks } from './hook-loader';
 import { runBootMd } from './boot';
 import { TaskRunner, runTask, TaskTool, TaskState } from './task-runner';
+import { setupErrorResponseEndpoint } from './error-response-endpoint-integrated';
+import { initCredentialHandler, getCredentialHandler } from '../security/credential-handler';
+import { getVerificationFlowManager } from './verification-flow';
+import { getErrorAnalyzer } from './error-analyzer';
+import { getErrorHistory } from './error-history';
+import { getRetryStrategy } from './retry-strategy';
+import { getVisualErrorDetector } from './visual-error-detection';
+import { getErrorAudit } from '../security/error-audit';
+import { getContextInjectionManager } from './context-injection';
 import { SkillsManager } from './skills-manager';
 import {
   browserOpen,
@@ -105,6 +115,7 @@ import {
   type TaskStatus,
 } from './task-store';
 import { BackgroundTaskRunner } from './background-task-runner';
+import { SubagentManager } from './subagent-manager';
 import {
   FileOpProgressWatchdog,
   FileOpType,
@@ -127,13 +138,20 @@ import {
 import { OllamaProcessManager } from './ollama-process-manager';
 import { raceWithWatchdog, PreemptState } from './preempt-watchdog';
 import { detectGpu, logGpuStatus } from './gpu-detector';
+import { internalAgentTaskRouter } from './internal-agent-task';
+import {
+  registerAgentBuilderTools,
+  executeAgentBuilderTool,
+  AGENT_BUILDER_TOOL_NAMES,
+  getWorkflowContextBlock,
+} from './agent-builder-integration';
 
 // ─── Config ────────────────────────────────────────────────────────────────────
 
 const config = getConfig().getConfig();
 const CONFIG_DIR_PATH = getConfig().getConfigDir();
-const PORT = config.gateway.port || 18789;
-const HOST = config.gateway.host || '127.0.0.1';
+const PORT = config.gateway.port || (process.env.GATEWAY_PORT ? parseInt(process.env.GATEWAY_PORT, 10) : 18789);
+const HOST = config.gateway.host || process.env.GATEWAY_HOST || (process.env.DOCKER_CONTAINER ? '0.0.0.0' : '127.0.0.1');
 const MAX_TOOL_ROUNDS = 20;
 type ExecutionMode = 'interactive' | 'background_task' | 'heartbeat' | 'cron';
 
@@ -568,6 +586,80 @@ const cronScheduler = new CronScheduler({
       text,
     });
   },
+  spawnBackgroundTask: async (job) => {
+    try {
+      // ── Step 1: ask the preflight advisor to generate a real task plan ──────
+      // Awaited properly so the cron scheduler gets a real taskId back.
+      let taskTitle = job.name;
+      let plan: Array<{ index: number; description: string; status: 'pending' }> = [];
+
+      try {
+        const preflight = await callSecondaryPreflight({ userMessage: job.prompt });
+        if (preflight?.task_plan && preflight.task_plan.length > 0) {
+          taskTitle = preflight.task_title || job.name;
+          plan = preflight.task_plan.map((desc: string, i: number) => ({
+            index: i,
+            description: desc,
+            status: 'pending' as const,
+          }));
+          console.log(`[CronScheduler] Preflight generated ${plan.length} steps for "${job.name}"`);
+        }
+      } catch (preflightErr: any) {
+        console.warn(`[CronScheduler] Preflight unavailable for "${job.name}", using default plan:`, preflightErr.message);
+      }
+
+      // ── Step 2: fall back to a smart default plan if preflight gave nothing ─
+      if (plan.length === 0) {
+        const prompt = job.prompt.toLowerCase();
+        const isNews = /news|summar|stories|headlines|brief|report|digest/.test(prompt);
+        const isResearch = /research|find|look up|search|gather|collect/.test(prompt);
+        const isEmail = /email|inbox|gmail|message/.test(prompt);
+
+        if (isNews) {
+          plan = [
+            { index: 0, description: 'Search for today\'s top news stories from multiple sources', status: 'pending' },
+            { index: 1, description: 'Fetch and read full article content from results', status: 'pending' },
+            { index: 2, description: 'Synthesize stories into a concise 3-5 bullet summary with sources', status: 'pending' },
+            { index: 3, description: 'Deliver final summary to user', status: 'pending' },
+          ];
+        } else if (isResearch) {
+          plan = [
+            { index: 0, description: 'Search for relevant information on the topic', status: 'pending' },
+            { index: 1, description: 'Read and extract key details from top results', status: 'pending' },
+            { index: 2, description: 'Compile findings into a clear summary', status: 'pending' },
+          ];
+        } else if (isEmail) {
+          plan = [
+            { index: 0, description: 'Check inbox for new messages', status: 'pending' },
+            { index: 1, description: 'Summarize important emails', status: 'pending' },
+          ];
+        } else {
+          plan = [
+            { index: 0, description: `Execute: ${job.prompt.slice(0, 120)}`, status: 'pending' },
+            { index: 1, description: 'Review results and deliver output to user', status: 'pending' },
+          ];
+        }
+      }
+
+      // ── Step 3: create the task and launch the runner ────────────────────────
+      const cronSessionId = `cron_${job.id}`;
+      const task = createTask({
+        title: taskTitle,
+        prompt: job.prompt,
+        sessionId: cronSessionId,
+        channel: 'web',
+        plan,
+      });
+      appendJournal(task.id, { type: 'status_push', content: `Scheduled job "${job.name}" launched as background task (${plan.length} steps)` });
+      const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
+      runner.start().catch((err: any) => console.error(`[CronScheduler] Task ${task.id} error:`, err.message));
+      broadcastWS({ type: 'cron_task_spawned', jobId: job.id, jobName: job.name, taskId: task.id });
+      return { taskId: task.id, sessionId: cronSessionId };
+    } catch (err: any) {
+      console.error('[CronScheduler] spawnBackgroundTask failed:', err.message);
+      return null;
+    }
+  },
 });
 
 // ─── Telegram Channel Init ─────────────────────────────────────────────────────────
@@ -683,6 +775,9 @@ hookBus.register('gateway:startup', async ({ workspacePath }) => {
     const effectiveSessionId = sessionId || bootSessionId;
     setWorkspace(effectiveSessionId, workspacePath);
     const result = await handleChat(message, effectiveSessionId, sendSSE, undefined, undefined, bootContext);
+    if (result?.text) {
+      broadcastWS({ type: 'boot_greeting', text: result.text, sessionId: effectiveSessionId });
+    }
     return { text: result.text };
   });
 });
@@ -743,39 +838,190 @@ function readDailyMemoryContext(workspacePath: string, maxTokens: number = 800):
   }
 }
 
-async function buildPersonalityContext(sessionId: string, workspacePath: string): Promise<string> {
-  const identity = loadWorkspaceFile(workspacePath, 'IDENTITY.md', 200);
-  const dailyMemory = readDailyMemoryContext(workspacePath, 800);
-  const soul = loadWorkspaceFile(workspacePath, 'SOUL.md', 500);
-  const user = loadWorkspaceFile(workspacePath, 'USER.md', 300);
-  const memory = loadWorkspaceFile(workspacePath, 'MEMORY.md', 600);
-  const self = loadWorkspaceFile(workspacePath, 'SELF.md', 600);
+// ─── Tiered Prompt System ─────────────────────────────────────────────────────
 
-  const bootstrapFiles = [
-    { path: path.join(workspacePath, 'IDENTITY.md'), content: identity, label: 'IDENTITY' },
-    { path: path.join(workspacePath, 'memory', '_recent.md'), content: dailyMemory.trim(), label: 'RECENT_MEMORY' },
-    { path: path.join(workspacePath, 'SOUL.md'), content: soul, label: 'SOUL' },
-    { path: path.join(workspacePath, 'USER.md'), content: user, label: 'USER' },
-    { path: path.join(workspacePath, 'MEMORY.md'), content: memory, label: 'MEMORY' },
-    { path: path.join(workspacePath, 'SELF.md'), content: self, label: 'SELF' },
-  ];
+// Intent detection: returns matched tool categories for the message
+function detectToolCategories(text: string): Set<string> {
+  const lower = String(text || '').toLowerCase();
+  const cats = new Set<string>();
+  const WEB = ['search', 'find', 'look up', 'google', 'what is', 'who is', 'news', 'latest', 'research', 'look into', 'check online', 'summarize', 'article', 'read about'];
+  const BROWSER = ['open', 'login', 'log in', 'website', 'click', 'fill', 'form', 'navigate', 'go to', 'browse', 'sign in', 'download'];
+  const DESKTOP = ['desktop', 'screenshot', 'window', 'focus window', 'app', 'screen', 'type into', 'drag', 'clipboard'];
+  const FILES = ['read file', 'write file', 'edit file', 'create file', 'modify', 'replace', 'open file', 'delete file', 'rename', 'copy file', 'make a file', 'update the file', 'change the file', 'save to'];
+  const TASK = ['task', 'background', 'run this', 'start a', 'status', 'paused', 'resume', 'in progress', 'what tasks', 'running tasks'];
+  const SCHEDULE = ['schedule', 'every day', 'every week', 'at ', 'recurring', 'cron', 'automate', 'remind me', 'daily', 'weekly'];
+  const SHELL = ['run command', 'execute', 'terminal', 'powershell', 'script', 'command line', 'cmd', 'bash'];
+  const MEMORY = ['remember', 'note that', 'save that', 'write that down', 'dont forget', "don't forget", 'keep in mind', 'update my', 'add to my', 'i prefer', 'i like', 'i hate', 'i use', 'my name', 'call me', 'i work', 'my project', 'my stack'];
+  const DEBUG = ['why', 'error', 'failed', 'how does', 'architecture', 'debug', 'caused', 'broke', 'not working', 'explain how', 'whats wrong', "what's wrong"];
+  if (WEB.some(k => lower.includes(k))) cats.add('web');
+  if (BROWSER.some(k => lower.includes(k))) cats.add('browser');
+  if (DESKTOP.some(k => lower.includes(k))) cats.add('desktop');
+  if (FILES.some(k => lower.includes(k))) cats.add('files');
+  if (TASK.some(k => lower.includes(k))) cats.add('task');
+  if (SCHEDULE.some(k => lower.includes(k))) cats.add('schedule');
+  if (SHELL.some(k => lower.includes(k))) cats.add('shell');
+  if (MEMORY.some(k => lower.includes(k))) cats.add('memory');
+  if (DEBUG.some(k => lower.includes(k))) cats.add('debug');
+  return cats;
+}
 
-  await hookBus.fire({
-    type: 'agent:bootstrap',
-    sessionId,
-    workspacePath,
-    bootstrapFiles,
-    timestamp: Date.now(),
-  });
+// Tool rule blocks — compact, injected only when relevant
+const TOOL_BLOCKS: Record<string, string> = {
+  web: `WEB TOOLS: web_search(query) → headlines+snippets. web_fetch(url) → full page text. Use web_search first to get URLs, then web_fetch to read. For Reddit: web_search with site:reddit.com "keyword", then web_fetch post URLs — never open browser for Reddit.`,
 
-  const parts: string[] = [];
-  for (const file of bootstrapFiles) {
-    const content = String(file?.content || '').trim();
-    if (!content) continue;
-    const label = String(file?.label || '').trim().toUpperCase() || 'BOOTSTRAP';
-    parts.push(`[${label}]\n${content}`);
+  browser: `BROWSER TOOLS: browser_open(url) → opens+returns snapshot. browser_snapshot() → refresh elements. browser_click(ref) → click by @ref. browser_fill(ref,text) → fill input. browser_press_key(key) → Enter/Tab/Escape. browser_wait(ms) → wait then snapshot. browser_close() → close tab. Chrome profile is persistent — already logged into sites. SNAPSHOT RULE: browser_open, browser_fill, browser_wait, and browser_click ALL return a fresh snapshot automatically — do NOT call browser_snapshot immediately after any of them. Only call browser_snapshot when you have NOT received a snapshot recently. Calling browser_snapshot twice in a row or after any tool that already returned one is a loop bug — act on the existing snapshot instead. SCROLL RULE: Do NOT scroll/PageDown on an interactive page before reading its snapshot — the compose area and action buttons are visible without scrolling. Read the snapshot refs and act. POST/TWEET RULE: After filling a tweet/post composer, the fill result will show "⚠️ COMPOSER SUBMIT BUTTON: @N" — you MUST click that exact @N ref immediately as your very next action. Do NOT click any other ref, do NOT snapshot, do NOT wait. If no COMPOSER SUBMIT BUTTON annotation appears, find the button named "Post" or "Tweet" that is visually inside the composer area and click it. Filling the textarea alone is NOT completion. After clicking Post, snapshot to verify it was published.`,
+
+  desktop: `DESKTOP TOOLS: desktop_screenshot() → capture+OCR. desktop_find_window(name) → find window. desktop_focus_window(name) → bring to front (use SHORT process name: msedge, chrome, code). desktop_click(x,y) → click coords. desktop_type(text) → type. desktop_press_key(key) → key combo. desktop_drag(x1,y1,x2,y2) → drag. desktop_get_clipboard()/set_clipboard(text). Always screenshot first. Focus window before click/type. Fail twice on focus → stop and report.`,
+
+  files: `FILE TOOLS: read_file(filename) → contents with line numbers. Always read before editing. replace_lines(filename,start,end,content) → surgical edit. insert_after(filename,line,content) → insert. delete_lines(filename,start,end) → delete. find_replace(filename,find,replace) → exact text swap. create_file(filename,content) → new only (fails if exists). delete_file(filename). RULES: read first, surgical edits only, never rewrite whole file for partial changes.`,
+
+  task: `TASK TOOLS: task_control(action,...)  actions: list/get/resume/rerun/pause/delete. start_task(title,prompt) → launch new background task. Check for existing tasks first before creating — never duplicate. Do NOT use read_file to check task state.`,
+
+  schedule: `SCHEDULE TOOL: schedule_job(action,...) actions: list/create/update/pause/resume/delete/run_now. Always confirm before create/update/delete. Keep schedule timing separate from instruction_prompt content.`,
+
+  shell: `SHELL TOOL: run_command(command) → opens app for user to see (chrome, notepad, vscode). For web automation use browser_* not run_command. For desktop interaction use desktop_* not run_command.`,
+
+  memory: `MEMORY TOOLS: memory_browse(file) → list categories in user.md or soul.md. memory_write(file,category,content) → add/update a fact (creates category if new). memory_read(file) → full file contents. File is "user" or "soul". Browse first to find the right category. Write immediately when you learn something — don't wait.`,
+
+  debug: `DEBUG: If asked about errors or architecture, use read_source(file) to inspect SmallClaw source. SELF.md has architecture overview. Workspace files: IDENTITY.md, SOUL.md, USER.md, TOOLS.md, SELF.md. Read the relevant one before diagnosing.`,
+};
+
+// Read memory categories for a specific file (for category-aware injection)
+function readMemoryCategories(workspacePath: string, file: 'user' | 'soul'): string[] {
+  const filename = file === 'user' ? 'USER.md' : 'SOUL.md';
+  const filePath = path.join(workspacePath, filename);
+  if (!fs.existsSync(filePath)) return [];
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const matches = content.match(/^##\s+([^\n]+)/gm) || [];
+  return matches.map(m => m.replace(/^##\s+/, '').trim());
+}
+
+// Read memory snippets matching detected categories (for category-aware injection)
+function readMemorySnippets(workspacePath: string, categories: string[]): string {
+  if (categories.length === 0) return '';
+  const snippets: string[] = [];
+  for (const file of ['USER.md', 'SOUL.md']) {
+    const filePath = path.join(workspacePath, file);
+    if (!fs.existsSync(filePath)) continue;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split('\n');
+    let inSection = false;
+    let currentSection = '';
+    const sectionLines: string[] = [];
+    for (const line of lines) {
+      const headingMatch = line.match(/^##\s+(.+)/);
+      if (headingMatch) {
+        if (inSection && sectionLines.length > 0) {
+          snippets.push(`[${file}:${currentSection}]\n${sectionLines.join('\n')}`);
+        }
+        currentSection = headingMatch[1].trim();
+        inSection = categories.some(cat => currentSection.toLowerCase().includes(cat.toLowerCase()) || cat.toLowerCase().includes(currentSection.toLowerCase()));
+        sectionLines.length = 0;
+      } else if (inSection && line.trim()) {
+        sectionLines.push(line);
+      }
+    }
+    if (inSection && sectionLines.length > 0) {
+      snippets.push(`[${file}:${currentSection}]\n${sectionLines.join('\n')}`);
+    }
+  }
+  return snippets.slice(0, 6).join('\n\n');
+}
+
+// Map tool categories to memory category keywords
+const TOOL_TO_MEMORY_CATS: Record<string, string[]> = {
+  web: ['web', 'research', 'search'],
+  browser: ['browser', 'web'],
+  files: ['files', 'coding', 'editing', 'development'],
+  task: ['tasks', 'workflow'],
+  schedule: ['schedule', 'automation'],
+  shell: ['shell', 'commands'],
+  memory: ['preferences', 'communication'],
+};
+
+async function buildPersonalityContext(
+  sessionId: string,
+  workspacePath: string,
+  messageText: string,
+  executionMode: string,
+  historyLength: number,
+): Promise<string> {
+
+  // ── Path B: autonomous execution — full prompt, no changes ─────────────────
+  const isAutonomous = executionMode === 'background_task' || executionMode === 'cron' || executionMode === 'heartbeat';
+  if (isAutonomous) {
+    const identity = loadWorkspaceFile(workspacePath, 'IDENTITY.md', 400);
+    const soul = loadWorkspaceFile(workspacePath, 'SOUL.md', 800);
+    const user = loadWorkspaceFile(workspacePath, 'USER.md', 600);
+    const today = new Date().toISOString().split('T')[0];
+    const intradayPath = path.join(workspacePath, 'memory', `${today}-intraday-notes.md`);
+    const intradayNotes = fs.existsSync(intradayPath) ? fs.readFileSync(intradayPath, 'utf-8').trim().slice(-600) : '';
+    const parts = [
+      identity ? `[IDENTITY]\n${identity}` : '',
+      soul ? `[SOUL]\n${soul}` : '',
+      user ? `[USER]\n${user}` : '',
+      intradayNotes ? `[TODAY_NOTES]\n${intradayNotes}` : '',
+    ].filter(Boolean);
+    await hookBus.fire({ type: 'agent:bootstrap', sessionId, workspacePath, bootstrapFiles: [], timestamp: Date.now() });
+    return parts.length > 0 ? '\n\n' + parts.join('\n\n') : '';
   }
 
+  // ── Path A: interactive chat — tiered ─────────────────────────────────────
+  const identity = loadWorkspaceFile(workspacePath, 'IDENTITY.md', 400);
+  const user = loadWorkspaceFile(workspacePath, 'USER.md', 500);
+  const today = new Date().toISOString().split('T')[0];
+  const intradayPath = path.join(workspacePath, 'memory', `${today}-intraday-notes.md`);
+  const intradayNotes = fs.existsSync(intradayPath) ? fs.readFileSync(intradayPath, 'utf-8').trim().slice(-600) : '';
+
+  // ── Tier 1: first message in session ──────────────────────────────────────
+  if (historyLength === 0) {
+    const parts = [
+      identity ? `[IDENTITY]\n${identity}` : '',
+      user ? `[USER]\n${user}` : '',
+      intradayNotes ? `[TODAY_NOTES]\n${intradayNotes}` : '',
+    ].filter(Boolean);
+    await hookBus.fire({ type: 'agent:bootstrap', sessionId, workspacePath, bootstrapFiles: [], timestamp: Date.now() });
+    return parts.length > 0 ? '\n\n' + parts.join('\n\n') : '';
+  }
+
+  // ── Tier 2 / 3: subsequent messages — detect intent ───────────────────────
+  const cats = detectToolCategories(messageText);
+  const soul = loadWorkspaceFile(workspacePath, 'SOUL.md', 600);
+
+  // Build tool blocks for detected categories
+  const toolBlockParts: string[] = [];
+  for (const cat of cats) {
+    if (TOOL_BLOCKS[cat]) toolBlockParts.push(TOOL_BLOCKS[cat]);
+  }
+
+  // Build memory snippets for categories related to detected tool groups
+  const memoryCategoryKeywords: string[] = [];
+  for (const cat of cats) {
+    const memCats = TOOL_TO_MEMORY_CATS[cat] || [];
+    memoryCategoryKeywords.push(...memCats);
+  }
+  const memorySnippets = memoryCategoryKeywords.length > 0
+    ? readMemorySnippets(workspacePath, memoryCategoryKeywords)
+    : '';
+
+  // Tier 3: complex/multi-domain — add tools.md hint
+  const isComplex = cats.size >= 3 || /\b(how do i|help me|can you|i need to|i want to)\b/i.test(messageText);
+  const toolsHint = isComplex ? `\nFor full tool reference: read_file TOOLS.md` : '';
+
+  // Self.md for debug
+  const self = cats.has('debug') ? loadWorkspaceFile(workspacePath, 'SELF.md', 600) : '';
+
+  const parts = [
+    identity ? `[IDENTITY]\n${identity}` : '',
+    user ? `[USER]\n${user}` : '',
+    soul ? `[SOUL]\n${soul}` : '',
+    intradayNotes ? `[TODAY_NOTES]\n${intradayNotes}` : '',
+    toolBlockParts.length > 0 ? `[TOOLS]\n${toolBlockParts.join('\n\n')}${toolsHint}` : (toolsHint ? `[TOOLS]${toolsHint}` : ''),
+    memorySnippets ? `[RELEVANT_MEMORY]\n${memorySnippets}` : '',
+    self ? `[SELF]\n${self}` : '',
+  ].filter(Boolean);
+
+  await hookBus.fire({ type: 'agent:bootstrap', sessionId, workspacePath, bootstrapFiles: [], timestamp: Date.now() });
   return parts.length > 0 ? '\n\n' + parts.join('\n\n') : '';
 }
 
@@ -798,7 +1044,7 @@ function logToDaily(workspacePath: string, role: string, content: string) {
 // ─── Tool Definitions ──────────────────────────────────────────────────────────
 
 function buildTools() {
-  return [
+  const toolDefs = [
     {
       type: 'function',
       function: {
@@ -907,6 +1153,22 @@ function buildTools() {
     {
       type: 'function',
       function: {
+        name: 'write_note',
+        description: 'Write a temporary note to today\'s intraday memory file. Works in all sessions (task and chat). Notes persist across the day and are included in tomorrow\'s boot context. Auto-cleaned at end of day.',
+        parameters: {
+          type: 'object', required: ['content'],
+          properties: {
+            content: { type: 'string', description: 'Note content — what you found, decided, or want to remember' },
+            tag: { type: 'string', description: 'Optional tag: task, debug, discovery, or general (default: general)' },
+            task_id: { type: 'string', description: 'Optional task ID if this note is related to a specific task' },
+            step: { type: 'string', description: 'Legacy: step label (still accepted, mapped to tag)' },
+          },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
         name: 'web_search',
         description: 'Search the web for current information. Use web_fetch on result URLs to read full page content.',
         parameters: {
@@ -1009,6 +1271,21 @@ function buildTools() {
         },
       },
     },
+    {
+      type: 'function',
+      function: {
+        name: 'parse_schedule_pattern',
+        description: 'Parse natural language schedule patterns to cron expressions. Use before creating schedules to convert user language like "daily at 3:13pm" to proper cron syntax.',
+        parameters: {
+          type: 'object',
+          required: ['text'],
+          properties: {
+            text: { type: 'string', description: 'Natural language pattern, e.g. "daily at 3:13pm", "every weekday at 9am", "weekly on monday"' },
+            timezone: { type: 'string', description: 'Optional IANA timezone (e.g. America/New_York). Defaults to UTC.' },
+          },
+        },
+      },
+    },
     // Browser automation tools
     ...getBrowserToolDefinitions(),
     ...getDesktopToolDefinitions(),
@@ -1089,7 +1366,130 @@ function buildTools() {
         },
       }];
     })(),
-  ];
+    // Modular subagent spawning — create custom specialists on the fly
+    {
+      type: 'function' as const,
+      function: {
+        name: 'spawn_subagent',
+        description:
+          'Create and spawn a specialized sub-agent for a specific task. Define the subagent\'s tools, constraints, and instructions dynamically. ' +
+          'Perfect for delegating research, analysis, or data extraction to a constrained secondary agent. ' +
+          'Subagent configs are persisted and reusable (you can call the same subagent_id again later).',
+        parameters: {
+          type: 'object',
+          required: ['subagent_id', 'task_prompt'],
+          properties: {
+            subagent_id: {
+              type: 'string',
+              description: 'Unique identifier for this subagent (e.g., "news_researcher_v1", "article_analyzer"). Use persistent names so you can call it again.',
+            },
+            task_prompt: {
+              type: 'string',
+              description: 'The specific task for this subagent to complete (e.g., "Extract headline and key facts from these 3 Reuters article snapshots").',
+            },
+            context_data: {
+              type: 'object',
+              description: 'Optional context to pass to the subagent: snapshots, URLs, previously extracted text, etc.',
+            },
+            create_if_missing: {
+              type: 'object',
+              description: 'If subagent does not exist, create it with these specifications. Subagent config files are saved to .smallclaw/subagents/ and can be edited by users.',
+              properties: {
+                description: {
+                  type: 'string',
+                  description: 'What this subagent specializes in (e.g., "News article researcher that extracts facts from web pages")',
+                },
+                allowed_tools: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Tools this subagent can access. Examples: web_fetch, browser_open, browser_click, read_file, time_now. Use wildcard patterns like "browser_*".',
+                },
+                forbidden_tools: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Explicit tool blacklist to prevent (e.g., ["run_command", "create_file"])',
+                },
+                system_instructions: {
+                  type: 'string',
+                  description: 'Detailed instructions for how this subagent should think and behave (personality, priorities, special rules)',
+                },
+                constraints: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Hard rules the subagent MUST follow (e.g., "Extract ONLY facts, never hallucinate", "Return max 5 items", "Verify facts across 2+ sources")',
+                },
+                success_criteria: {
+                  type: 'string',
+                  description: 'Condition for when the subagent has completed successfully (e.g., "When you have extracted headlines and key facts from at least 3 news sources")',
+                },
+                max_steps: {
+                  type: 'number',
+                  description: 'Maximum tool calls before stopping (default 20)',
+                },
+                timeout_ms: {
+                  type: 'number',
+                  description: 'Maximum milliseconds to wait (default 300000 = 5 minutes)',
+                },
+                model: {
+                  type: 'string',
+                  description: 'Optional override of which model runs this subagent',
+                },
+              },
+              required: ['description', 'allowed_tools', 'system_instructions', 'constraints', 'success_criteria'],
+            },
+          },
+        },
+      },
+    },
+    // ── Memory Tools ──────────────────────────────────────────────────────────
+    {
+      type: 'function',
+      function: {
+        name: 'memory_browse',
+        description: 'List the category sections currently in USER.md or SOUL.md. Call this before memory_write to find the right category or decide to create a new one.',
+        parameters: {
+          type: 'object',
+          required: ['file'],
+          properties: {
+            file: { type: 'string', description: '"user" for USER.md or "soul" for SOUL.md' },
+          },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'memory_write',
+        description: 'Write a fact or update to USER.md or SOUL.md under a specific category section. Creates the category if it does not exist. Use memory_browse first to pick the right category.',
+        parameters: {
+          type: 'object',
+          required: ['file', 'category', 'content'],
+          properties: {
+            file: { type: 'string', description: '"user" for USER.md or "soul" for SOUL.md' },
+            category: { type: 'string', description: 'Category section name (e.g. "coding", "communication_style", "projects"). Use existing categories when possible.' },
+            content: { type: 'string', description: 'The fact or update to write. Be specific and concise. Example: "Prefers vanilla JS over frameworks"' },
+          },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'memory_read',
+        description: 'Read the full contents of USER.md or SOUL.md. Use when you need complete context before making changes.',
+        parameters: {
+          type: 'object',
+          required: ['file'],
+          properties: {
+            file: { type: 'string', description: '"user" for USER.md or "soul" for SOUL.md' },
+          },
+        },
+      },
+    },
+    // ── Agent Builder Integration Tools ──────────────────────────────────────
+  ] as any[];
+  registerAgentBuilderTools(toolDefs);
+  return toolDefs;
 }
 
 // ─── Search Providers ─────────────────────────────────────────────────────────
@@ -1766,6 +2166,141 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
         return { name, args, result: `Unsupported schedule_job action: ${action}`, error: true };
       }
 
+      case 'spawn_subagent': {
+        // Spawn a specialized sub-agent with restricted tool set
+        // This is used by primary agents to delegate work to secondary specialists
+        try {
+          const subagentId = String(args.subagent_id || '').trim();
+          const taskPrompt = String(args.task_prompt || '').trim();
+          const contextData = args.context_data && typeof args.context_data === 'object' ? args.context_data : undefined;
+          const createIfMissing = args.create_if_missing && typeof args.create_if_missing === 'object' ? args.create_if_missing : undefined;
+
+          if (!subagentId) {
+            return { name, args, result: 'spawn_subagent requires subagent_id', error: true };
+          }
+          if (!taskPrompt) {
+            return { name, args, result: 'spawn_subagent requires task_prompt', error: true };
+          }
+
+          // Get workspace path from config
+          const workspacePath = getConfig().getConfig().workspace?.path || process.cwd();
+
+          // Create SubagentManager with broadcast capability
+          const subagentMgr = new SubagentManager(workspacePath, broadcastWS);
+
+          // Call the subagent (creates if missing)
+          const result = await subagentMgr.callSubagent(
+            {
+              subagent_id: subagentId,
+              task_prompt: taskPrompt,
+              context_data: contextData,
+              create_if_missing: createIfMissing,
+            },
+            sessionId // parent task ID (session context)
+          );
+
+          return {
+            name,
+            args,
+            result: JSON.stringify(result, null, 2),
+            error: false,
+          };
+        } catch (err: any) {
+          return { name, args, result: `spawn_subagent error: ${err.message}`, error: true };
+        }
+      }
+
+      case 'parse_schedule_pattern': {
+        const text = String(args.text || '').trim();
+        if (!text) {
+          return { name, args, result: 'parse_schedule_pattern requires text parameter', error: true };
+        }
+        
+        try {
+          let cron = '';
+          let preview = '';
+          const t = text.toLowerCase().trim();
+          
+          // Helper: extract time from text and handle AM/PM
+          function extractTime(text: string): { hour: number; minute: number } | null {
+            const timeMatch = text.match(/(\d{1,2}):?(\d{2})?\s*(am|pm)?/i);
+            if (!timeMatch) return null;
+            
+            let hour = parseInt(timeMatch[1], 10);
+            const minute = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
+            const period = timeMatch[3]?.toLowerCase();
+            
+            if (period === 'pm' && hour !== 12) {
+              hour += 12;
+            } else if (period === 'am' && hour === 12) {
+              hour = 0;
+            }
+            
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+            
+            return { hour, minute };
+          }
+          
+          if (t.includes('daily') || t.includes('every day')) {
+            const timeInfo = extractTime(t);
+            if (timeInfo) {
+              const hourStr = String(timeInfo.hour).padStart(2, '0');
+              const minStr = String(timeInfo.minute).padStart(2, '0');
+              cron = `${timeInfo.minute} ${timeInfo.hour} * * *`;
+              preview = `Daily at ${hourStr}:${minStr}`;
+            } else {
+              cron = '0 9 * * *';
+              preview = 'Daily at 09:00';
+            }
+          } else if (t.includes('weekly')) {
+            const timeInfo = extractTime(t);
+            if (timeInfo) {
+              cron = `${timeInfo.minute} ${timeInfo.hour} * * 1`;
+              preview = `Weekly on Monday at ${String(timeInfo.hour).padStart(2, '0')}:${String(timeInfo.minute).padStart(2, '0')}`;
+            } else {
+              cron = '0 9 * * 1';
+              preview = 'Weekly on Monday at 09:00';
+            }
+          } else if (t.includes('monday') || t.includes('tuesday') || t.includes('wednesday') || t.includes('thursday') || t.includes('friday')) {
+            const timeInfo = extractTime(t);
+            if (timeInfo) {
+              cron = `${timeInfo.minute} ${timeInfo.hour} * * 1-5`;
+              preview = `Weekdays at ${String(timeInfo.hour).padStart(2, '0')}:${String(timeInfo.minute).padStart(2, '0')}`;
+            } else {
+              cron = '0 9 * * 1-5';
+              preview = 'Weekdays at 09:00';
+            }
+          } else if (/^\d{1,2} \d{1,2} \d|\d \d \*/.test(t)) {
+            cron = t;
+            preview = 'Custom cron pattern';
+          } else {
+            return {
+              name,
+              args,
+              result: JSON.stringify({
+                success: false,
+                error: 'Could not parse pattern. Try: "daily at 3:13pm", "daily at 15:13", "weekly", or cron like "0 9 * * *"',
+              }, null, 2),
+              error: true,
+            };
+          }
+          
+          return {
+            name,
+            args,
+            result: JSON.stringify({
+              success: true,
+              cron,
+              preview,
+              timezone: args.timezone || 'UTC',
+            }, null, 2),
+            error: false,
+          };
+        } catch (err: any) {
+          return { name, args, result: `parse_schedule_pattern error: ${err.message}`, error: true };
+        }
+      }
+
       // Browser automation tools
       case 'browser_open': {
         const result = await browserOpen(sessionId, args.url || '');
@@ -1852,6 +2387,113 @@ async function executeTool(name: string, args: any, workspacePath: string, sessi
       case 'desktop_set_clipboard': {
         const result = await desktopSetClipboard(String(args.text || ''));
         return { name, args, result, error: result.startsWith('ERROR') };
+      }
+
+      case 'memory_browse': {
+        const mbFile = String(args.file || 'user').toLowerCase().trim();
+        const mbFilename = mbFile === 'soul' ? 'SOUL.md' : 'USER.md';
+        const mbPath = path.join(workspacePath, mbFilename);
+        if (!fs.existsSync(mbPath)) {
+          return { name, args, result: `${mbFilename} not found. Create it first.`, error: true };
+        }
+        const mbContent = fs.readFileSync(mbPath, 'utf-8');
+        const mbMatches = mbContent.match(/^## (.+)/gm) || [];
+        const mbCategories = mbMatches.map((m: string) => m.replace(/^## /, '').trim());
+        if (mbCategories.length === 0) {
+          return { name, args, result: `${mbFilename} has no categories yet. Use memory_write to create the first one.`, error: false };
+        }
+        return { name, args, result: `${mbFilename} categories:\n${mbCategories.map((c: string) => `- ${c}`).join('\n')}\n\nUse memory_write(file="${mbFile}", category="<name>", content="...") to add a fact.`, error: false };
+      }
+
+      case 'memory_write': {
+        const mwFile = String(args.file || 'user').toLowerCase().trim();
+        const mwCategory = String(args.category || '').trim().toLowerCase().replace(/\s+/g, '_');
+        const mwContent = String(args.content || '').trim();
+        if (!mwCategory) return { name, args, result: 'memory_write: category is required', error: true };
+        if (!mwContent) return { name, args, result: 'memory_write: content is required', error: true };
+        const mwFilename = mwFile === 'soul' ? 'SOUL.md' : 'USER.md';
+        const mwPath = path.join(workspacePath, mwFilename);
+        if (!fs.existsSync(mwPath)) return { name, args, result: `${mwFilename} not found`, error: true };
+        let mwFileContent = fs.readFileSync(mwPath, 'utf-8');
+        const mwDate = new Date().toISOString().split('T')[0];
+        const mwEntry = `- ${mwContent} [${mwDate}]`;
+        const mwSectionHeader = `## ${mwCategory}`;
+        const mwSectionIdx = mwFileContent.indexOf(`\n${mwSectionHeader}`);
+        if (mwSectionIdx !== -1) {
+          // Section exists — find end of section, insert before next ## or EOF
+          const afterHeader = mwSectionIdx + mwSectionHeader.length + 1;
+          const nextSection = mwFileContent.indexOf('\n## ', afterHeader);
+          const insertAt = nextSection !== -1 ? nextSection : mwFileContent.length;
+          mwFileContent = mwFileContent.slice(0, insertAt) + '\n' + mwEntry + mwFileContent.slice(insertAt);
+        } else {
+          // New category — append before closing --- or at end
+          const closingComment = mwFileContent.lastIndexOf('\n---');
+          const insertAt = closingComment !== -1 ? closingComment : mwFileContent.length;
+          mwFileContent = mwFileContent.slice(0, insertAt) + '\n\n' + mwSectionHeader + '\n' + mwEntry + mwFileContent.slice(insertAt);
+        }
+        fs.writeFileSync(mwPath, mwFileContent, 'utf-8');
+        return { name, args, result: `Written to ${mwFilename} [${mwCategory}]: ${mwContent}`, error: false };
+      }
+
+      case 'memory_read': {
+        const mrFile = String(args.file || 'user').toLowerCase().trim();
+        const mrFilename = mrFile === 'soul' ? 'SOUL.md' : 'USER.md';
+        const mrPath = path.join(workspacePath, mrFilename);
+        if (!fs.existsSync(mrPath)) return { name, args, result: `${mrFilename} not found`, error: true };
+        const mrContent = fs.readFileSync(mrPath, 'utf-8');
+        return { name, args, result: mrContent, error: false };
+      }
+
+      case 'write_note': {
+        const noteContent = String(args.content || '').trim();
+        if (!noteContent) {
+          return { name, args, result: 'write_note: empty content', error: true };
+        }
+        const noteTag = String(args.tag || args.step || 'general').trim();
+        const noteTaskId = args.task_id ? String(args.task_id) : null;
+
+        // Always write to intraday notes file (works in all sessions)
+        try {
+          const noteDate = new Date().toISOString().split('T')[0];
+          const memDir = path.join(workspacePath, 'memory');
+          if (!fs.existsSync(memDir)) fs.mkdirSync(memDir, { recursive: true });
+          const intradayFile = path.join(memDir, `${noteDate}-intraday-notes.md`);
+          const timestamp = new Date().toISOString();
+          let entry = `\n### [${noteTag.toUpperCase()}] ${timestamp}\n${noteContent}`;
+          if (noteTaskId) entry += `\n_Related task: ${noteTaskId}_`;
+          fs.appendFileSync(intradayFile, entry + '\n');
+        } catch (err: any) {
+          return { name, args, result: `write_note: failed to write intraday note: ${err.message}`, error: true };
+        }
+
+        // Also append to task journal if in a task session
+        const isTaskSession = String(sessionId || '').startsWith('task_');
+        if (isTaskSession) {
+          try {
+            const taskId = sessionId.replace(/^task_/, '');
+            const { appendJournal } = require('./task-store');
+            appendJournal(taskId, {
+              type: 'write_note',
+              content: `[${noteTag}] ${noteContent.slice(0, 300)}`,
+              detail: noteContent.slice(0, 2000),
+            });
+          } catch {}
+        }
+
+        return { name, args, result: `Note saved [${noteTag}] (${noteContent.length} chars) → intraday-notes`, error: false };
+      }
+
+      // ── Agent Builder Integration ────────────────────────────────────────────
+      case 'architect_workflow':
+      case 'verify_workflow_credentials':
+      case 'test_workflow':
+      case 'deploy_workflow':
+      case 'get_workflow_status':
+      case 'search_workflow_templates':
+      case 'execute_workflow_template':
+      case 'create_node_subagent': {
+        const result = await executeAgentBuilderTool(name, args);
+        return { name, args, result, error: false };
       }
 
       default:
@@ -2227,11 +2869,18 @@ function buildDesktopAck(toolName: string, result: ToolResult): string {
   }
 }
 
+function goalIsInteractiveAction(goal: string): boolean {
+  // Returns true when the user's goal is to DO something on the page (post, click, fill, submit)
+  // rather than READ or RESEARCH. Used to skip feed-collection mode on social feeds.
+  return /\b(post|tweet|retweet|reply|send|publish|submit|compose|write.*tweet|make.*post|create.*post|type.*message|fill|click|navigate to|go to|open composer|draft)\b/i.test(String(goal || ''));
+}
+
 function isBrowserHeavyResearchPage(input: {
   url?: string;
   pageType?: string;
   snapshotElements?: number;
   feedCount?: number;
+  goal?: string;
 }): boolean {
   const url = String(input.url || '').toLowerCase();
   const pageType = String(input.pageType || '').toLowerCase();
@@ -2418,12 +3067,18 @@ async function handleChat(
   let browserAdvisorHintPreview = '';
   let browserForcedRetries = 0;
   let browserAdvisorCallsThisTurn = 0;
+  // Scroll-before-act gate: tracks whether a fill/click has happened yet this turn.
+  // Blocks PageDown/scroll calls on interactive pages until the model actually acts.
+  let browserFillOrClickDoneThisTurn = false;
+  let browserScrollBeforeActCount = 0;
+  const SCROLL_BEFORE_ACT_MAX = 1; // allow at most 1 scroll before a fill/click
   let desktopContinuationPending = false;
   let desktopAdvisorRoute: 'answer_now' | 'continue_desktop' | 'handoff_primary' | null = null;
   let desktopAdvisorHintPreview = '';
   let desktopAdvisorCallsThisTurn = 0;
   let browserAdvisorLastHash = '';
   let browserAdvisorUrlKey = '';
+  let consecutiveUnchangedSnapshots = 0;
   let browserAdvisorBatch = 0;
   let browserAdvisorDedupeCount = 0;
   let browserNoFeedProgressStreak = 0;
@@ -2689,7 +3344,7 @@ async function handleChat(
     }
   }
 
-  const personalityCtx = await buildPersonalityContext(sessionId, workspacePath);
+  const personalityCtx = await buildPersonalityContext(sessionId, workspacePath, message, executionMode || 'interactive', history.length);
 
   // Inject active browser session state so LLM knows to reuse it instead of re-opening
   const browserInfo = getBrowserSessionInfo(sessionId);
@@ -2731,91 +3386,7 @@ async function handleChat(
   const messages: any[] = [
     {
       role: 'system',
-      content: `${executionModeSystemBlock ? `${executionModeSystemBlock}\n\n` : ''}You are SmallClaw 🦞, a friendly AI assistant that runs locally.
-Current date: ${dateStr}, ${timeStr}.
-
-TOOLS:
-- list_files: List workspace files
-- read_file: Read file WITH line numbers (do this before editing)
-- create_file: Create NEW file (fails if exists)
-- replace_lines: Replace lines N-M with new content
-- insert_after: Insert content after line N
-- delete_lines: Delete lines N-M
-- find_replace: Find exact text and replace
-- delete_file: Delete a file
-- web_search: Search the web. Returns headlines + short snippets.
-- web_fetch: Fetch full text content from a URL. Use after web_search to read the actual page.
-- run_command: Open apps for the USER to see (chrome, notepad, vscode). Use desktop_* tools to interact with desktop apps afterward.
-- start_task: Launch a multi-step task (for complex operations needing many steps)
-- task_control: List/get/resume/rerun/pause/delete existing background tasks and statuses
-- schedule_job: Manage scheduled automation jobs (list/create/update/pause/resume/delete/run_now)
-- browser_open: Navigate to a URL in a browser YOU control via Playwright (a persistent Chrome profile saved at C:\Users\rafel\.smallclaw\chrome-debug-profile — you stay logged into sites after the first login, no re-auth needed). You can click, fill, snapshot after.
-- browser_snapshot: Refresh visible elements. If element count looks low, call browser_wait first
-- browser_click: Click by @ref. ALWAYS take browser_snapshot after to confirm the click worked
-- browser_fill: Type into an [INPUT] element by @ref, then press Enter or click submit
-- browser_press_key: Press Enter/Tab/Escape. Use Enter after filling a search box
-- browser_wait: Wait N ms then snapshot — use when page has few elements or content is still loading
-- browser_close: Close browser tab
-- desktop_screenshot: Capture full desktop screenshot and window context (Windows)
-- desktop_find_window: Find desktop windows by title/process
-- desktop_focus_window: Bring a desktop window to foreground
-- desktop_click: Click at screen coordinates
-- desktop_drag: Drag mouse from one coordinate to another
-- desktop_wait: Wait for UI to settle (ms)
-- desktop_type: Type text into focused desktop window
-- desktop_press_key: Press key/combo in focused desktop window
-- desktop_get_clipboard: Read clipboard text
-- desktop_set_clipboard: Set clipboard text
-
-IDENTITY RULE:
-Your name is SmallClaw. When a user asks you to search for, open, or find any external tool or project, look it up as requested. NEVER redirect to SmallClaw links or repos unless the user is specifically asking about SmallClaw itself. If a search fails, say so and ask for clarification.
-
-TOOL ROUTING - web_fetch vs browser:
-- Use browser_open + browser_snapshot for: social feeds (X/Twitter, Reddit), login-gated pages, JavaScript-heavy SPAs, anything that requires scrolling or clicking to reveal content.
-- Use web_fetch for: static article URLs, documentation, blog posts, news pages — any URL where you already have the link and just need the text content. It is faster and cheaper than browser.
-- Combined pattern: use browser to discover and collect links from a feed, then use web_fetch on specific linked URLs to read their full content.
-
-BROWSER RULES:
-0. YOU control the browser via Playwright — it is NOT the user's browser. The user is separate. The Chrome profile is persistent so you are already logged into sites the user has signed into before.
-1. run_command launches apps/windows. Use browser_* for web pages and desktop_* for native app/screen control.
-2. If you already have a browser open, DO NOT call browser_open again. Use browser_snapshot to see the current page, then browser_click to navigate.
-3. If you land on a login page and see a one-click sign-in button (e.g. "Sign in as [name]", "Continue as [name]", Google/Apple sign-in), click it immediately — do not snapshot repeatedly. The Chrome profile preserves the OAuth session so it will complete without a password.
-3. browser_open RETURNS a snapshot — read it immediately. Find the correct link by @ref, then call browser_click to follow it.
-4. After EVERY click, read the snapshot returned in the tool result to confirm what changed.
-5. Prefer direct search URLs over clicking search boxes.
-
-DESKTOP RULES (Windows):
-1. Use desktop_screenshot first to inspect active/open windows.
-2. Use desktop_focus_window before desktop_click or desktop_type when the target app is not focused.
-3. desktop_screenshot includes OCR preview text when available; use that evidence for status checks.
-4. For status checks like "is VS Code done?", capture a fresh desktop_screenshot before answering.
-
-SCHEDULER RULES:
-1. If the user asks for recurring or time-based automation ("every day", "at 9am", "tomorrow"), use schedule_job.
-2. Always ask for explicit yes/no confirmation before create/update/delete schedule actions.
-3. Keep schedule details (when) separate from instruction_prompt (what to do).
-
-TASK MANAGEMENT RULES:
-1. If the user asks about existing background tasks (status/list/rerun/resume), call task_control first.
-2. Do NOT use list_files/read_file to discover task state.
-3. Use start_task only for creating a new task, not for resuming/rerunning an existing one.
-
-AUTOMATION AUTHORIZATION:
-- This app runs on the user's own machine; user requests here are explicit authorization for local browser and desktop automation.
-- If the user asks to "use my computer" to open a site/click/type, execute with browser_* or desktop_* tools instead of refusing.
-- Do not output policy refusal text for normal user-authorized local automation requests.
-
-EDITING RULES:
-1. ALWAYS read_file first to see line numbers.
-2. Use replace_lines, insert_after, delete_lines for SURGICAL edits.
-3. NEVER rewrite an entire file to change part of it.
-4. KEEP all existing content the user didn't ask to change.
-5. create_file is ONLY for new files.
-
-RESPONSE RULES:
-- Keep responses SHORT (1-2 sentences).
-- Do NOT think out loud. Act and report.
-- For greetings/questions, reply naturally without tools.${callerContext ? '\n\n' + callerContext : ''}${browserStateCtx}${personalityCtx}${skillsManager.buildPromptContext(500)}`,
+      content: `${executionModeSystemBlock ? `${executionModeSystemBlock}\n\n` : ''}You are SmallClaw 🦞, a local AI assistant.\nCurrent date: ${dateStr}, ${timeStr}.\nNever search for or link SmallClaw repos unless the user is asking about SmallClaw itself.\nThis app runs on the user's own machine — browser/desktop automation requests are pre-authorized.\nKeep responses SHORT (1-2 sentences). Don't think out loud. Act and report. Greet naturally without tools.${callerContext ? '\n\n' + callerContext : ''}${browserStateCtx}${personalityCtx}${skillsManager.buildPromptContext(500)}\n\n${getWorkflowContextBlock()}`,
     },
   ];
 
@@ -2958,9 +3529,20 @@ RESPONSE RULES:
     console.log(
       `[Orchestrator] Preflight start (${preflightCfg.secondary.provider}:${preflightCfg.secondary.model})`,
     );
+    const preflightBlockedTask = findBlockedTaskForSession(sessionId);
     const preflight = await callSecondaryPreflight({
       userMessage: message,
       recentHistory: history.slice(-4).map(h => ({ role: h.role, content: h.content })),
+      blockedTask: preflightBlockedTask
+        ? {
+            id: preflightBlockedTask.id,
+            title: preflightBlockedTask.title,
+            status: preflightBlockedTask.status,
+            currentStepIndex: preflightBlockedTask.currentStepIndex,
+            planLength: Array.isArray(preflightBlockedTask.plan) ? preflightBlockedTask.plan.length : 0,
+            pauseReason: preflightBlockedTask.pauseReason,
+          }
+        : undefined,
     });
 
     if (preflight) {
@@ -3113,6 +3695,7 @@ RESPONSE RULES:
     browserAdvisorDedupeCount = 0;
     browserAdvisorBatch = 0;
     browserAdvisorLastHash = '';
+    consecutiveUnchangedSnapshots = 0;
     browserNoFeedProgressStreak = 0;
     browserStabilizeUrlKey = '';
     browserStabilizeWaitRetries = 0;
@@ -3274,7 +3857,26 @@ RESPONSE RULES:
       return;
     }
     const hashUnchanged = packet.contentHash === browserAdvisorLastHash;
-    if (hashUnchanged && !browserContinuationPending) return;
+    if (hashUnchanged && !browserContinuationPending) {
+      // On non-feed interactive pages, a stuck snapshot hash means the model is looping.
+      // After 2 consecutive identical snapshots, force the advisor to run so it generates
+      // a concrete @ref-based action instead of silently returning and letting the model re-snapshot.
+      consecutiveUnchangedSnapshots += 1;
+      if (consecutiveUnchangedSnapshots >= 2) {
+        // Force advisor call — override the early return so it runs with existing data.
+        // Applies to ALL page types including feed pages: if the snapshot hasn't changed,
+        // the model is looping and needs a concrete directive from the advisor.
+        browserContinuationPending = true;
+        browserAdvisorRoute = 'continue_browser';
+        browserAdvisorHintPreview = 'Snapshot unchanged — forcing advisor to generate concrete action';
+        sendSSE('info', { message: `Snapshot hash unchanged (${consecutiveUnchangedSnapshots}x) — forcing browser advisor to generate concrete action.` });
+        // Don't return — fall through to advisor call below
+      } else {
+        return;
+      }
+    } else {
+      consecutiveUnchangedSnapshots = 0;
+    }
     browserAdvisorLastHash = packet.contentHash;
     browserAdvisorCallsThisTurn += 1;
     browserAdvisorBatch += 1;
@@ -4187,15 +4789,9 @@ RULES:
         || allToolResults.length > 0
         || isExecutionLikeRequest(message);
       const lastToolFailed = allToolResults.length > 0 && allToolResults[allToolResults.length - 1].error;
-      const shouldContinueInsteadOfFinalizing =
-        orchestrationSkillEnabled
-        && executionMode !== 'background_task'
-        && isExecutionTurn
-        && continuationNudges < MAX_CONTINUATION_NUDGES
-        && (
-          looksLikeIntentOnlyReply(candidateText)
-          || (lastToolFailed && !hasConcreteCompletion(candidateText))
-        );
+      // DISABLED: Force continuation was causing excessive unnecessary tool calls
+      // Users should get immediate final response, not artificial padding
+      const shouldContinueInsteadOfFinalizing = false;
 
       const shouldForceBrowserRetry =
         orchestrationSkillEnabled
@@ -4520,6 +5116,53 @@ RULES:
       const toolCallId = String((call as any)?.id || '').trim();
       const toolName = call.function?.name || 'unknown';
       const toolArgs = normalizeToolArgs(call.function?.arguments);
+
+      // ── Scroll-before-act gate ────────────────────────────────────────────────
+      // Block PageDown / browser_scroll on interactive pages when the model hasn't
+      // filled or clicked anything yet. This is the #1 cause of the scroll loop bug
+      // where the AI scrolls past the X.com composer instead of filling it.
+      // Feed/search pages (x_feed, search_results) are exempt — they need scrolling.
+      const isScrollAttempt =
+        (toolName === 'browser_press_key' && String(toolArgs?.key || '').toLowerCase() === 'pagedown')
+        || toolName === 'browser_scroll';
+      if (isScrollAttempt && !browserFillOrClickDoneThisTurn) {
+        const sessionInfo = getBrowserSessionInfo(sessionId);
+        const currentPacket = sessionInfo.active
+          ? await getBrowserAdvisorPacket(sessionId, { maxItems: 0, snapshotElements: 10 }).catch(() => null)
+          : null;
+        const pageType = currentPacket?.page?.pageType || 'generic';
+        const isFeedPage = pageType === 'x_feed' || pageType === 'search_results';
+        if (!isFeedPage) {
+          browserScrollBeforeActCount++;
+          if (browserScrollBeforeActCount > SCROLL_BEFORE_ACT_MAX) {
+            const lastSnap = currentPacket?.snapshot || '';
+            const blockMsg = [
+              `SCROLL BLOCKED: You scrolled ${browserScrollBeforeActCount} time(s) without filling or clicking anything.`,
+              `This is the scroll-before-act loop bug. The page already shows actionable elements — stop scrolling and act on them.`,
+              lastSnap ? `\nCurrent page snapshot (act on these @ref elements NOW):\n${lastSnap.slice(0, 2000)}` : '',
+              `\nRequired next action: find the input or button you need and call browser_fill(ref, text) or browser_click(ref) immediately.`,
+              `Do NOT call browser_press_key(PageDown), browser_scroll, or browser_snapshot. Act on the snapshot above.`,
+            ].filter(Boolean).join(' ');
+            console.warn(`[v2] SCROLL-BEFORE-ACT BLOCKED (${browserScrollBeforeActCount}x): ${toolName} on ${pageType} page before any fill/click`);
+            sendSSE('info', { message: `Scroll-before-act gate: blocked ${toolName} on non-feed page (${browserScrollBeforeActCount}/${SCROLL_BEFORE_ACT_MAX} allowed before act required).` });
+            const blockedResult: ToolResult = { name: toolName, args: toolArgs, result: blockMsg, error: true };
+            allToolResults.push(blockedResult);
+            logToolCall(workspacePath, toolName, toolArgs, blockMsg, true);
+            sendSSE('tool_call', { action: toolName, args: toolArgs, stepNum: allToolResults.length });
+            sendSSE('tool_result', { action: toolName, result: blockMsg.slice(0, 300), error: true, stepNum: allToolResults.length });
+            messages.push({ role: 'tool', tool_name: toolName, tool_call_id: toolCallId || undefined, content: blockMsg });
+            messages.push({ role: 'user', content: `Scroll blocked. You must call browser_fill or browser_click on a @ref from the snapshot above before scrolling. Stop planning and act now.` });
+            continue;
+          }
+        }
+      }
+      // Track fills and clicks so the gate knows when it's safe to scroll
+      if (toolName === 'browser_fill' || toolName === 'browser_click') {
+        browserFillOrClickDoneThisTurn = true;
+        browserScrollBeforeActCount = 0;
+      }
+      // ── End scroll-before-act gate ────────────────────────────────────────────
+
       const loopSig = `${toolName}:${hashArgs(toolArgs)}`;
       const loopPivotNudge = 'Loop detector: you are looping on this tool, try a different approach or ask the user.';
       const loopCheck = checkLoopDetection(toolName, toolArgs);
@@ -4773,7 +5416,7 @@ RULES:
         const maxSteps = toolArgs.max_steps || 25;
         sendSSE('info', { message: `Starting multi-step task: ${taskGoal}` });
 
-        const taskTools = tools.filter(t => t.function.name !== 'start_task') as any[];
+        const taskTools = tools.filter((t: any) => t.function.name !== 'start_task') as any[];
 
         const taskResult = await runTask({
           goal: taskGoal,
@@ -5297,7 +5940,8 @@ async function handleTaskControlAction(sessionId: string, args: any): Promise<Ta
         ? ['needs_assistance', 'stalled', 'paused', 'failed', 'complete']
         : candidateAction === 'delete'
           ? ['needs_assistance', 'stalled', 'paused', 'failed', 'queued', 'complete', 'waiting_subagent']
-          : ['needs_assistance', 'stalled', 'paused', 'failed', 'queued'];
+          // 'running' included so tasks stuck in running state (dead runner) can be resumed
+          : ['needs_assistance', 'stalled', 'paused', 'failed', 'queued', 'running'];
     const scope = getTaskScopeBuckets(sessionId, preferredStatuses);
     let preferred = [...scope.sessionTasks, ...scope.channelTasks];
     if (preferred.length === 0) {
@@ -5333,8 +5977,17 @@ async function handleTaskControlAction(sessionId: string, args: any): Promise<Ta
         success: true,
         action,
         task: summarizeTaskRecord(task),
-        message: `Task "${task.title}" is already running.`,
+        message: `Task "${task.title}" is already actively running (runner is live).`,
       };
+    }
+
+    // Status is 'running' but no active runner found — runner died without cleanup.
+    // Auto-correct the stale status so the resume proceeds normally.
+    if (task.status === 'running') {
+      appendJournal(task.id, { type: 'status_push', content: 'Stale running status detected (no active runner). Auto-correcting to paused for resume.' });
+      BackgroundTaskRunner.forceRelease(task.id); // clear any ghost activeRunners entry
+      updateTaskStatus(task.id, 'paused', { pauseReason: 'error' });
+      task.status = 'paused'; // keep local ref in sync
     }
 
     if (action === 'resume') {
@@ -5343,6 +5996,10 @@ async function handleTaskControlAction(sessionId: string, args: any): Promise<Ta
       }
       updateTaskStatus(task.id, 'queued');
       appendJournal(task.id, { type: 'resume', content: `task_control resume${note ? `: ${note.slice(0, 220)}` : ''}` });
+      // Reset self-heal counter so the user's manual intervention gives a fresh start
+      task.selfHealAttempts = 0;
+      task.resynthAttempts = 0;
+      saveTask(task);
       if (note) {
         const resumeMessages = Array.isArray(task.resumeContext?.messages) ? task.resumeContext.messages : [];
         updateResumeContext(task.id, {
@@ -5478,25 +6135,55 @@ async function tryHandleBlockedTaskFollowup(sessionId: string, rawMessage: strin
   const message = String(rawMessage || '').trim();
   if (!message) return null;
 
-  // Only intercept when there is an explicit task ID in the message AND a clear control verb.
-  // Everything else — including greetings, new requests, ambiguous messages — falls through
-  // to the AI so the LLM can decide what to do. No hardcoded fake responses.
+  // ── Path A: Explicit task UUID in the message (original behavior) ───────────
   const explicitTaskId = parseTaskIdFromText(message);
-  if (!explicitTaskId) return null;
+  if (explicitTaskId) {
+    const rerunRequested = isRerunIntent(message);
+    const resumeRequested = isResumeIntent(message);
+    const cancelRequested = isCancelIntent(message);
+    if (!rerunRequested && !resumeRequested && !cancelRequested) return null;
+    const action = rerunRequested ? 'rerun' : cancelRequested ? 'pause' : 'resume';
+    const ctl = await handleTaskControlAction(sessionId, { action, task_id: explicitTaskId, note: message });
+    return ctl.success ? (ctl.message || null) : null;
+  }
 
-  const rerunRequested = isRerunIntent(message);
-  const resumeRequested = isResumeIntent(message);
+  // ── Path B: No UUID — look for a blocked/escalated task on this session ─────
+  // Handles user messages like "proceed", "I logged in", "go ahead", "fixed it", etc.
+  // where the task ID is implicit from context.
+  const blockedTask = findBlockedTaskForSession(sessionId);
+  if (!blockedTask) return null;
+
   const cancelRequested = isCancelIntent(message);
+  const rerunRequested = isRerunIntent(message);
 
-  if (!rerunRequested && !resumeRequested && !cancelRequested) return null;
+  // Broad resume detection: standard resume verbs OR short affirmations that only
+  // make sense as "yes, continue" replies when a blocked task already exists.
+  const resumeRequestedBroad =
+    isResumeIntent(message) ||
+    /^\s*(proceed|go ahead|ok|okay|continue|yes|yep|sure|do it|keep going|try again|move on|sounds good|ready|done|fixed|logged in|i logged in|it('s| is) fixed|all good)\.?\s*$/i.test(message) ||
+    /\b(logged in|fixed it|done now|all set|ready now|proceed|go ahead)\.?$/i.test(message);
+
+  if (!resumeRequestedBroad && !cancelRequested && !rerunRequested) return null;
+
+  // Safety: if the message is long and contains strong new-task language, let it
+  // fall through to the AI rather than hijacking it as a resume.
+  const hasNewTaskLanguage =
+    message.length > 80 &&
+    /\b(open|go to|navigate|search for|create a|make a|write a|post a|send a|find me|check the)\b/i.test(message);
+  if (hasNewTaskLanguage) return null;
 
   const action = rerunRequested ? 'rerun' : cancelRequested ? 'pause' : 'resume';
   const ctl = await handleTaskControlAction(sessionId, {
     action,
-    task_id: explicitTaskId,
+    task_id: blockedTask.id,
     note: message,
   });
-  return ctl.success ? (ctl.message || null) : null;
+
+  if (!ctl.success) return null;
+
+  const verb = action === 'resume' ? 'Resuming' : action === 'rerun' ? 'Rerunning' : 'Cancelling';
+  const taskLabel = `"${blockedTask.title}"`;
+  return `${verb} task ${taskLabel}. ${ctl.message || ''}`.trim();
 }
 
 const app = express();
@@ -6015,12 +6702,18 @@ app.post('/api/bg-tasks/:id/pause', (req, res) => {
 app.post('/api/bg-tasks/:id/resume', (req, res) => {
   const task = loadTask(req.params.id);
   if (!task) { res.status(404).json({ success: false, error: 'Task not found' }); return; }
-  if (
-    task.status === 'paused'
-    || task.status === 'queued'
-    || task.status === 'stalled'
-    || task.status === 'needs_assistance'
-  ) {
+  const resumableStatuses: TaskStatus[] = ['paused', 'queued', 'stalled', 'needs_assistance', 'running', 'failed'];
+  if (resumableStatuses.includes(task.status as TaskStatus)) {
+    // If status is 'running' but no active runner exists, the runner died without cleanup.
+    // Treat it as resumable — reset to queued and start a fresh runner.
+    if (task.status === 'running' && BackgroundTaskRunner.isRunning(task.id)) {
+      res.json({ success: false, error: 'Task is already actively running.' });
+      return;
+    }
+    // Status is 'running' but runner is dead — clear any ghost activeRunners entry before relaunching
+    if (task.status === 'running') {
+      BackgroundTaskRunner.forceRelease(task.id);
+    }
     updateTaskStatus(task.id, 'queued');
     const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
     runner.start().catch(err => console.error(`[BackgroundTaskRunner] Resume ${task.id} error:`, err.message));
@@ -6028,6 +6721,130 @@ app.post('/api/bg-tasks/:id/resume', (req, res) => {
   } else {
     res.json({ success: false, error: `Task status is ${task.status}, cannot resume` });
   }
+});
+
+// ─── Error Response Endpoint ────────────────────────────────────────────────
+// Receives structured user response to a task error, injects it as a resume
+// instruction, and relaunches the task runner so the agent acts on it.
+app.post('/api/bg-tasks/:id/error-response', async (req: any, res: any) => {
+  const task = loadTask(req.params.id);
+  if (!task) { res.status(404).json({ success: false, error: 'Task not found' }); return; }
+
+  const { action, category, inputs } = req.body || {};
+  if (!action) { res.status(400).json({ success: false, error: 'action is required' }); return; }
+
+  // Build a clear natural-language injection the agent will see on its next round
+  let instruction = '';
+
+  if (action === 'cancel') {
+    // User wants to stop — mark failed and return
+    updateTaskStatus(task.id, 'failed', { pauseReason: undefined });
+    appendJournal(task.id, { type: 'status_push', content: 'User cancelled task via error response.' });
+    res.json({ success: true, resumed: false });
+    return;
+  }
+
+  if (action === 'credentials' && inputs?.email) {
+    instruction = [
+      `CRITICAL INSTRUCTION (from user — error response):`,
+      `The user has provided login credentials to resolve the authentication error.`,
+      `Email: ${inputs.email}`,
+      `Password: [PROVIDED — use the credential ID to retrieve it]`,
+      ``,
+      `Your next steps:`,
+      `1. Return to the login form on the page`,
+      `2. Fill the email field with: ${inputs.email}`,
+      `3. Fill the password field with the provided password`,
+      `4. Click the login/submit button`,
+      `5. If a 2FA/verification code is requested next, pause and ask the user`,
+      `6. Do NOT retry with the same credentials if login fails — pause and ask user instead`,
+    ].join('\n');
+
+    // Store credentials securely if credential handler is available
+    try {
+      const credHandler = getCredentialHandler();
+      const credId = credHandler.store(task.id, 'auth', { email: inputs.email, password: inputs.password || '' });
+      instruction += `\nCredential ID (for secure retrieval): ${credId}`;
+      getErrorAudit(path.join(CONFIG_DIR_PATH, 'logs', 'audit.log')).logCredentialProvided(task.id, 'auth');
+    } catch {}
+
+  } else if (action === 'verification_code' && inputs?.code) {
+    instruction = [
+      `CRITICAL INSTRUCTION (from user — error response):`,
+      `The user has provided the verification/2FA code: ${inputs.code}`,
+      ``,
+      `Your next steps:`,
+      `1. Find the verification code input field on the page`,
+      `2. Fill it with: ${inputs.code}`,
+      `3. Submit/confirm the code`,
+      `4. Continue the original task after successful verification`,
+    ].join('\n');
+
+  } else if (action === 'manual_complete') {
+    instruction = [
+      `CRITICAL INSTRUCTION (from user — error response):`,
+      `The user has manually completed the CAPTCHA or challenge.`,
+      `The page should now be accessible. Continue from where you left off.`,
+      `Take a fresh browser_snapshot() to see the current page state before proceeding.`,
+    ].join('\n');
+
+  } else if (action === 'retry_now' || action === 'retry_delay') {
+    const delayMs = action === 'retry_delay' ? 30000 : 0;
+    if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
+    instruction = [
+      `CRITICAL INSTRUCTION (from user — error response):`,
+      `The user has requested a retry after the network/service error.`,
+      `Retry the last failed operation. If it fails again, pause for assistance.`,
+    ].join('\n');
+
+  } else if (action === 'skip_content' || action === 'skip_step' || action === 'skip') {
+    instruction = [
+      `CRITICAL INSTRUCTION (from user — error response):`,
+      `The user has chosen to skip this step/content.`,
+      `Do not attempt this step again. Move on to the next task step.`,
+      `Mark this step as skipped and continue.`,
+    ].join('\n');
+
+  } else if (action === 'grant_permission') {
+    instruction = [
+      `CRITICAL INSTRUCTION (from user — error response):`,
+      `The user has granted permission or resolved the access issue.`,
+      `Retry the operation that was blocked. If still denied, skip and continue.`,
+    ].join('\n');
+
+  } else if (action === 'google' || action === 'oauth') {
+    const provider = inputs?.provider || 'Google';
+    instruction = [
+      `CRITICAL INSTRUCTION (from user — error response):`,
+      `The user wants to use ${provider} OAuth sign-in.`,
+      `Find and click the "Sign in with ${provider}" button on the page.`,
+      `The browser will handle the OAuth redirect. Wait for it to complete and return to the original page.`,
+      `If a verification code or additional step is needed after OAuth, pause and ask the user.`,
+    ].join('\n');
+
+  } else {
+    // Generic fallback — pass raw action as instruction
+    instruction = [
+      `CRITICAL INSTRUCTION (from user — error response):`,
+      `User action: ${action}`,
+      inputs ? `Additional context: ${JSON.stringify(inputs)}` : '',
+      `Proceed accordingly. If unsure, take a fresh browser_snapshot() and reassess.`,
+    ].filter(Boolean).join('\n');
+  }
+
+  // Inject instruction into resume context so the runner sees it immediately
+  updateResumeContext(task.id, { onResumeInstruction: instruction });
+  appendJournal(task.id, {
+    type: 'status_push',
+    content: `Error response received: action=${action} category=${category || 'unknown'}. Resuming task.`,
+  });
+
+  // Requeue and relaunch
+  updateTaskStatus(task.id, 'queued', { pauseReason: undefined });
+  const runner = new BackgroundTaskRunner(task.id, handleChat, makeBroadcastForTask(task.id), telegramChannel);
+  runner.start().catch((err: any) => console.error(`[ErrorResponse] Task ${task.id} resume error:`, err.message));
+
+  res.json({ success: true, resumed: true, action });
 });
 
 // Inject a user message into the task's session — lets the web UI chat directly with the task agent.
@@ -6784,17 +7601,240 @@ app.post('/api/agents/:id/spawn', async (req, res) => {
   res.json({ success: result.success, result, historyEntry });
 });
 
+// ─── Scheduler API ────────────────────────────────────────────────────────────────
+
+app.get('/api/schedules', (_req, res) => {
+  const jobs = cronScheduler.getJobs();
+  res.json({
+    success: true,
+    schedules: jobs.map((job: any) => ({
+      id: job.id,
+      name: job.name,
+      prompt: job.prompt,
+      cron: job.cron,
+      run_at: job.run_at,
+      timezone: job.timezone,
+      status: job.status || 'active',
+      next_run: job.nextRun,
+      last_run: job.lastRun,
+      delivery_channel: job.deliveryChannel || 'web',
+    })),
+  });
+});
+
+app.post('/api/schedules', (req: any, res: any) => {
+  const { name, pattern, prompt, timezone, delivery_channel, confirm } = req.body;
+  
+  // Require confirmation for create
+  if (confirm !== true) {
+    return res.json({
+      success: false,
+      needs_confirmation: true,
+      error: 'This action requires explicit confirmation. Set confirm: true to proceed.',
+    });
+  }
+  
+  if (!name || !pattern || !prompt) {
+    return res.json({ success: false, error: 'name, pattern, and prompt are required' });
+  }
+  
+  try {
+    const job = cronScheduler.createJob({
+      name: String(name).slice(0, 100),
+      prompt: String(prompt).slice(0, 2000),
+      schedule: /^\d/.test(pattern) ? pattern : null,  // If starts with number, assume cron
+      runAt: !/^\d/.test(pattern) ? pattern : null,  // NL pattern
+      tz: timezone || 'UTC',
+      delivery: 'web',  // Only web supported for now
+    });
+    
+    res.json({
+      success: true,
+      job: {
+        id: job.id,
+        name: job.name,
+        status: 'active',
+        next_run: job.nextRun,
+      },
+    });
+  } catch (err: any) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.put('/api/schedules/:id', (req: any, res: any) => {
+  const { name, pattern, prompt, timezone, delivery_channel, confirm } = req.body;
+  
+  if (confirm !== true) {
+    return res.json({
+      success: false,
+      needs_confirmation: true,
+      error: 'This action requires explicit confirmation. Set confirm: true to proceed.',
+    });
+  }
+  
+  try {
+    const job = cronScheduler.updateJob(req.params.id, {
+      name: name ? String(name).slice(0, 100) : undefined,
+      prompt: prompt ? String(prompt).slice(0, 2000) : undefined,
+      schedule: pattern && /^\d/.test(pattern) ? pattern : undefined,
+      runAt: pattern && !/^\d/.test(pattern) ? pattern : undefined,
+      tz: timezone || undefined,
+    });
+    
+    res.json({ success: true, job });
+  } catch (err: any) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/schedules/:id', (req: any, res: any) => {
+  const { confirm } = req.body;
+  
+  if (confirm !== true) {
+    return res.json({
+      success: false,
+      needs_confirmation: true,
+      error: 'This action requires explicit confirmation. Set confirm: true to proceed.',
+    });
+  }
+  
+  try {
+    cronScheduler.deleteJob(req.params.id);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.patch('/api/schedules/:id', (req: any, res: any) => {
+  const { status } = req.body;
+  
+  try {
+    const job = cronScheduler.updateJob(req.params.id, { status });
+    res.json({ success: true, job });
+  } catch (err: any) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/schedules/:id/run', (req: any, res: any) => {
+  try {
+    cronScheduler.runJobNow(req.params.id);
+    res.json({ success: true, message: 'Schedule triggered' });
+  } catch (err: any) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/schedules/parse', (req: any, res: any) => {
+  const { text, timezone } = req.body;
+  
+  if (!text) {
+    return res.json({ success: false, error: 'text is required' });
+  }
+  
+  try {
+    let cron = '';
+    let preview = '';
+    const t = text.toLowerCase().trim();
+    
+    // Helper: extract time from text and handle AM/PM
+    function extractTime(text: string): { hour: number; minute: number } | null {
+      // Match: "3:13pm", "15:13", "3:13", "11am", etc.
+      const timeMatch = text.match(/(\d{1,2}):?(\d{2})?\s*(am|pm)?/i);
+      if (!timeMatch) return null;
+      
+      let hour = parseInt(timeMatch[1], 10);
+      const minute = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
+      const period = timeMatch[3]?.toLowerCase();
+      
+      // Convert 12-hour to 24-hour format if AM/PM specified
+      if (period === 'pm' && hour !== 12) {
+        hour += 12;
+      } else if (period === 'am' && hour === 12) {
+        hour = 0;
+      }
+      
+      // Validate ranges
+      if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+      
+      return { hour, minute };
+    }
+    
+    if (t.includes('daily') || t.includes('every day')) {
+      const timeInfo = extractTime(t);
+      if (timeInfo) {
+        const hourStr = String(timeInfo.hour).padStart(2, '0');
+        const minStr = String(timeInfo.minute).padStart(2, '0');
+        cron = `${timeInfo.minute} ${timeInfo.hour} * * *`;
+        preview = `Daily at ${hourStr}:${minStr}`;
+      } else {
+        cron = '0 9 * * *';
+        preview = 'Daily at 09:00';
+      }
+    } else if (t.includes('weekly')) {
+      const timeInfo = extractTime(t);
+      if (timeInfo) {
+        cron = `${timeInfo.minute} ${timeInfo.hour} * * 1`;
+        preview = `Weekly on Monday at ${String(timeInfo.hour).padStart(2, '0')}:${String(timeInfo.minute).padStart(2, '0')}`;
+      } else {
+        cron = '0 9 * * 1';
+        preview = 'Weekly on Monday at 09:00';
+      }
+    } else if (t.includes('monday') || t.includes('tuesday') || t.includes('wednesday') || t.includes('thursday') || t.includes('friday')) {
+      const timeInfo = extractTime(t);
+      if (timeInfo) {
+        cron = `${timeInfo.minute} ${timeInfo.hour} * * 1-5`;
+        preview = `Weekdays at ${String(timeInfo.hour).padStart(2, '0')}:${String(timeInfo.minute).padStart(2, '0')}`;
+      } else {
+        cron = '0 9 * * 1-5';
+        preview = 'Weekdays at 09:00';
+      }
+    } else if (/^\d{1,2} \d{1,2} \d|\d \d \*/.test(t)) {
+      cron = t;
+      preview = 'Custom cron pattern';
+    } else {
+      return res.json({
+        success: false,
+        error: 'Could not parse pattern. Try: "daily at 3:13pm", "daily at 15:13", "weekly", or cron like "0 9 * * *"',
+        confidence: 0,
+      });
+    }
+    
+    res.json({
+      success: true,
+      kind: 'cron',
+      cron,
+      human_text: preview,
+      preview,
+      timezone: timezone || 'UTC',
+      confidence: 0.8,
+    });
+  } catch (err: any) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
 // ─── Settings API ────────────────────────────────────────────────────────────────
 
 app.get('/api/settings/search', (_req, res) => {
-  const cfg = (getConfig().getConfig() as any).search || {};
+  const cm = getConfig();
+  const cfg = (cm.getConfig() as any).search || {};
+  // Resolve then mask — never send actual key values to the browser.
+  // Returns '••••••••' if a key is present (vault or plaintext), '' if not set.
+  const maskIfSet = (val: string | undefined): string => {
+    if (!val) return '';
+    const resolved = cm.resolveSecret(val);
+    return resolved ? '••••••••' : '';
+  };
   res.json({
     preferred_provider: cfg.preferred_provider || 'tavily',
     search_rigor: cfg.search_rigor || 'verified',
-    tavily_api_key: cfg.tavily_api_key || '',
-    google_api_key: cfg.google_api_key || '',
-    google_cx: cfg.google_cx || '',
-    brave_api_key: cfg.brave_api_key || '',
+    tavily_api_key: maskIfSet(cfg.tavily_api_key),
+    google_api_key: maskIfSet(cfg.google_api_key),
+    google_cx: cfg.google_cx || '',   // CSE ID is not a secret
+    brave_api_key: maskIfSet(cfg.brave_api_key),
   });
 });
 
@@ -6802,17 +7842,48 @@ app.post('/api/settings/search', (req, res) => {
   const { preferred_provider, search_rigor, tavily_api_key, google_api_key, google_cx, brave_api_key } = req.body;
   const cm = getConfig();
   const current = cm.getConfig() as any;
+  // Only write a key field if the user actually entered a new value.
+  // '••••••••' means "leave existing vault entry alone".
+  const isNew = (v: any) => v !== undefined && v !== '' && v !== '••••••••';
   const newSearch = {
     ...((current.search || {})),
     ...(preferred_provider !== undefined && { preferred_provider }),
     ...(search_rigor !== undefined && { search_rigor }),
-    ...(tavily_api_key !== undefined && { tavily_api_key }),
-    ...(google_api_key !== undefined && { google_api_key }),
+    ...(isNew(tavily_api_key) && { tavily_api_key }),
+    ...(isNew(google_api_key) && { google_api_key }),
     ...(google_cx !== undefined && { google_cx }),
-    ...(brave_api_key !== undefined && { brave_api_key }),
+    ...(isNew(brave_api_key) && { brave_api_key }),
   };
   cm.updateConfig({ search: newSearch } as any);
+  // migrateSecretsToVault() runs inside updateConfig → saveConfig, so any
+  // plaintext key just entered is automatically encrypted and replaced with
+  // a "vault:<key>" reference before hitting disk.
   res.json({ success: true });
+});
+
+// GET /api/credentials/status — list which vault keys are currently stored (names only, no values)
+app.get('/api/credentials/status', (_req, res) => {
+  try {
+    const vault = getVault();
+    res.json({ success: true, keys: vault.keys() });
+  } catch (err: any) {
+    res.json({ success: false, keys: [], error: err.message });
+  }
+});
+
+// GET /api/credentials/audit — return last N lines of vault-audit.log (scrubbed)
+app.get('/api/credentials/audit', (_req, res) => {
+  const fs = require('fs');
+  const path = require('path');
+  try {
+    const auditPath = path.join(process.cwd(), '.smallclaw', 'vault', 'vault-audit.log');
+    if (!fs.existsSync(auditPath)) { res.json({ success: true, lines: [] }); return; }
+    const raw = fs.readFileSync(auditPath, 'utf-8');
+    const lines = raw.split('\n').filter((l: string) => l.trim());
+    res.json({ success: true, lines: lines.slice(-40) });
+  } catch (err: any) {
+    res.json({ success: false, lines: [], error: err.message });
+  }
 });
 
 app.get('/api/settings/paths', (_req, res) => {
@@ -7447,6 +8518,11 @@ app.get('/api/mcp/tools', (_req, res) => {
   console.log(`[Webhooks] Listening at ${hookCfg.path} (wake, agent, status)`);
 })();
 
+// ─── Internal Agent Task endpoint (called by Agent Builder for AI-authoring nodes)
+// Localhost-only unless SMALLCLAW_INTERNAL_TOKEN is set.
+app.use('/internal/agent-task', internalAgentTaskRouter);
+console.log('[InternalAgentTask] Endpoint mounted at POST /internal/agent-task');
+
 app.get('*', (_req, res) => { res.sendFile(path.join(webUiPath, 'index.html')); });
 
 // ─── Server ────────────────────────────────────────────────────────────────────
@@ -7481,6 +8557,30 @@ server.on('error', (err: any) => {
   console.error('[Gateway] HTTP server error:', err?.message || err);
   process.exit(1);
 });
+
+// Setup error response endpoint
+setupErrorResponseEndpoint(app);
+
+// ─── Initialize Advanced Error Response Systems ────────────────────────────────
+const encryptionKey = process.env.CREDENTIAL_ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
+const credentialHandler = initCredentialHandler(encryptionKey);
+const verificationFlowManager = getVerificationFlowManager();
+const errorAnalyzer = getErrorAnalyzer();
+const errorHistory = getErrorHistory();
+const retryStrategy = getRetryStrategy();
+const visualErrorDetector = getVisualErrorDetector();
+const errorAudit = getErrorAudit(process.env.ERROR_AUDIT_LOG_PATH || path.join(CONFIG_DIR_PATH, 'logs', 'audit.log'));
+const contextInjectionManager = getContextInjectionManager();
+
+console.log('[Server] ✅ Advanced error response systems initialized');
+console.log(`[Server] - Credential Handler: ${encryptionKey.substring(0, 8)}...`);
+console.log('[Server] - Verification Flow Manager: Ready');
+console.log('[Server] - Error Analyzer: Ready');
+console.log('[Server] - Error History: Ready');
+console.log('[Server] - Retry Strategy: Ready');
+console.log('[Server] - Visual Error Detector: Ready');
+console.log('[Server] - Error Audit: Ready');
+console.log('[Server] - Context Injection Manager: Ready');
 
 server.listen(PORT, HOST, () => {
   // Detect GPU hardware once — logs a single clean line, caches result for
@@ -7558,6 +8658,9 @@ let shuttingDown = false;
 function gracefulShutdown(signal: 'SIGINT' | 'SIGTERM'): void {
   if (shuttingDown) return;
   shuttingDown = true;
+  console.log('[Gateway] Shutting down error response systems...');
+  try { credentialHandler.stop(); console.log('[Gateway] ✅ Credential handler stopped'); } catch (e) { console.error('[Gateway] Error:', e); }
+  try { verificationFlowManager.stop(); console.log('[Gateway] ✅ Verification flow stopped'); } catch (e) { console.error('[Gateway] Error:', e); }
   console.log(`[Gateway] Received ${signal}; shutting down...`);
   try { skillsManager.persistState(); } catch {}
   try { telegramChannel.stop(); } catch {}

@@ -78,9 +78,11 @@ RUN mkdir -p /data/workspace /data/logs /root/.localclaw
 # These are overridden by docker-compose.yml / -e flags.
 # Provider: ollama | lm_studio | llama_cpp | openai | openai_codex
 ENV NODE_ENV=production \
+    DOCKER_CONTAINER=true \
     SMALLCLAW_DATA_DIR=/data \
     SMALLCLAW_WORKSPACE_DIR=/data/workspace \
-    GATEWAY_PORT=3333 \
+    GATEWAY_PORT=18789 \
+    GATEWAY_HOST=0.0.0.0 \
     PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright \
     \
     # Active provider
@@ -105,9 +107,9 @@ ENV NODE_ENV=production \
     # OpenAI Codex OAuth (tokens live in mounted ~/.localclaw volume)
     CODEX_MODEL=gpt-5.3-codex
 
-EXPOSE 3333
+EXPOSE 18789
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:3333/health || exit 1
+    CMD curl -f http://localhost:18789/health || exit 1
 
 CMD ["node", "dist/cli/index.js", "gateway"]

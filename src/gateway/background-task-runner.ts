@@ -18,6 +18,15 @@ import {
 } from './task-store';
 import { clearHistory, addMessage, getHistory, flushSession } from './session';
 import { callSecondaryTaskStepAuditor } from '../orchestration/multi-agent';
+import { errorCategorizer } from './error-categorizer';
+import { getRetryStrategy } from './retry-strategy';
+import { getErrorAnalyzer } from './error-analyzer';
+import { getErrorHistory } from './error-history';
+import {
+  callErrorHealer,
+  callCompletionVerifier,
+  MAX_HEAL_ATTEMPTS,
+} from './task-self-healer';
 
 // Pause registry (global singleton map).
 // Server-v2 calls BackgroundTaskRunner.requestPause(id) to signal a running
@@ -31,7 +40,7 @@ const BACKGROUND_SESSION_MAX_MESSAGES = 40;
 const DEFAULT_ROUND_TIMEOUT_MS = 120_000;
 const MAX_STEP_VERIFICATION_RETRIES = 2;
 
-function resolveRoundTimeoutMs(): number {
+function resolveRoundTimeoutMs(isResearchTask?: boolean): number {
   const candidates = [
     process.env.LOCALCLAW_BG_ROUND_TIMEOUT_MS,
     process.env.LOCALCLAW_TASK_ROUND_TIMEOUT_MS,
@@ -40,7 +49,12 @@ function resolveRoundTimeoutMs(): number {
     const n = Number(raw);
     if (Number.isFinite(n) && n >= 10_000) return Math.floor(n);
   }
-  return DEFAULT_ROUND_TIMEOUT_MS;
+  // Research tasks (web search, browser automation, news aggregation) need longer timeout
+  // to account for API calls, page loading, and content synthesis (5 min)
+  if (isResearchTask) {
+    return 300_000; // 5 minutes for research tasks
+  }
+  return DEFAULT_ROUND_TIMEOUT_MS; // 2 minutes for regular tasks
 }
 
 export class BackgroundTaskRunner {
@@ -87,6 +101,83 @@ export class BackgroundTaskRunner {
     return activeRunners.has(taskId);
   }
 
+  /**
+   * Force-release a task from activeRunners.
+   * Only use when a runner is confirmed dead (e.g. stale 'running' status with no live runner).
+   */
+  static forceRelease(taskId: string): void {
+    if (activeRunners.has(taskId)) {
+      console.warn(`[BackgroundTaskRunner] Force-releasing stale activeRunners entry for task ${taskId}`);
+      activeRunners.delete(taskId);
+      pauseRequests.delete(taskId);
+    }
+  }
+
+  /**
+   * Get list of all currently running task IDs
+   */
+  static getRunningTasks(): string[] {
+    return Array.from(activeRunners);
+  }
+
+  /**
+   * Interrupt a task for schedule execution
+   * Marks the task with schedule context so heartbeat can resume it later
+   */
+  static interruptTaskForSchedule(taskId: string, scheduleId: string): boolean {
+    if (!activeRunners.has(taskId)) {
+      return false; // Task not running
+    }
+    const task = loadTask(taskId);
+    if (!task) return false;
+    
+    // Mark task with schedule interruption context
+    updateTaskStatus(taskId, 'paused', {
+      pauseReason: 'interrupted_by_schedule',
+      pausedByScheduleId: scheduleId,
+      pausedAt: Date.now(),
+      pausedAtStepIndex: task.currentStepIndex,
+      shouldResumeAfterSchedule: true,
+    });
+    
+    // Request pause at next round boundary
+    pauseRequests.add(taskId);
+    
+    console.log(`[BackgroundTaskRunner] Task ${taskId} interrupted by schedule ${scheduleId}`);
+    return true;
+  }
+
+  /**
+   * Resume a task that was paused by a schedule
+   */
+  static resumeTaskAfterSchedule(taskId: string, scheduleId: string): boolean {
+    const task = loadTask(taskId);
+    if (!task) return false;
+    
+    // Only resume if it was paused by this specific schedule
+    if (task.pausedByScheduleId !== scheduleId) {
+      console.warn(`[BackgroundTaskRunner] Task ${taskId} not paused by schedule ${scheduleId}`);
+      return false;
+    }
+    
+    // Clear pause context and mark for resumption
+    updateTaskStatus(taskId, 'running', {
+      pauseReason: undefined,
+      pausedByScheduleId: undefined,
+      pausedAt: undefined,
+      pausedAtStepIndex: undefined,
+      shouldResumeAfterSchedule: false,
+    });
+    
+    // Start a new runner if not already active
+    if (!activeRunners.has(taskId)) {
+      console.log(`[BackgroundTaskRunner] Resuming task ${taskId} after schedule ${scheduleId} completed`);
+      // Note: caller should invoke new BackgroundTaskRunner(taskId, ...).start()
+    }
+    
+    return true;
+  }
+
   async start(): Promise<void> {
     const { taskId } = this;
 
@@ -124,6 +215,61 @@ export class BackgroundTaskRunner {
     const resumeNote = task.resumeContext?.onResumeInstruction
       ? `\n${task.resumeContext.onResumeInstruction}`
       : '';
+    
+    // Add specific guidance for research/news tasks
+    const isResearchTask = /\b(research|search|news|articles?|web.*search|browser|gather|collect|summari)\b/i.test(
+      task.prompt + ' ' + task.title
+    );
+    // Detect X.com / Twitter tasks and inject login state guidance
+    const isXTask = /\b(x\.com|twitter|tweet|retweet|post.*tweet|reply.*tweet)\b/i.test(
+      task.prompt + ' ' + task.title
+    );
+    const xLoginGuidance = isXTask
+      ? `\nX.COM LOGIN NOTE: If the browser page title shows "(N) Home / X", "Home / X", or any title ending in "/ X", ` +
+        `the user IS already logged in to X — do NOT ask to confirm login or suggest they log in. ` +
+        `Proceed directly with the task action (compose tweet, click reply, etc.).` +
+        `\nX.COM POSTING FLOW: When posting a tweet, follow EXACTLY these steps and NO others:\n` +
+        `  1. browser_open("https://x.com") — the snapshot shows the composer at the top.\n` +
+        `  2. Find the textbox with name "Post text" or "What's happening" in the snapshot — browser_fill it.\n` +
+        `  3. The fill result shows "⚠️ COMPOSER SUBMIT BUTTON: @N" — browser_click(@N) immediately.\n` +
+        `  4. If browser_fill auto-posted (result says "Tweet has been posted successfully"), you are DONE. Stop immediately.\n` +
+        `  5. Only call browser_snapshot ONCE to verify if auto-post did NOT happen. Then STOP.\n` +
+        `Do NOT scroll, press PageDown, or take additional snapshots after confirming the tweet posted. ` +
+        `Do NOT call browser_snapshot before filling. ` +
+        `Do NOT call browser_snapshot after browser_open — it already returned a snapshot. ` +
+        `After the tweet is confirmed posted, your ONLY valid next action is writing your FINAL: summary. ` +
+        `There are ZERO valid reasons to scroll before filling the composer or after confirming the post.`
+      : '';
+    
+    const researchGuidance = isResearchTask ? [
+      ``,
+      `[RESEARCH TASK GUIDANCE - SNAPSHOT → FETCH → SYNTHESIZE FLOW]`,
+      `Your research follows a strict 3-phase flow. Execute each phase fully before moving to the next:`,
+      ``,
+      `PHASE 1: COLLECT SNAPSHOTS (identify article sources)`,
+      `  • browser_open() to news sites (Reuters, AP, BBC, CNN, etc)`,
+      `  • browser_snapshot() to see the page structure`,
+      `  • Look at the snapshot Elements list - find links/headlines (elements with @##)`,
+      `  • Do NOT stop at snapshot. Always proceed to Phase 2.`,
+      ``,
+      `PHASE 2: FETCH CONTENT (extract actual article text)`,
+      `  • From snapshot elements, identify article URLs in the link references`,
+      `  • Use web_fetch(url) on 4-6 different article URLs to get full text`,
+      `  • Store key facts/headlines from each article as you fetch`,
+      `  • After fetching articles, you have real data to work with`,
+      ``,
+      `PHASE 3: SYNTHESIZE (analyze and deliver final answer)`,
+      `  • Review all fetched content together - identify 3-5 most significant events`,
+      `  • Cross-reference facts (does story appear in multiple sources?)`,
+      `  • Create concise bullets with facts + source attribution`,
+      `  • Deliver final summary to user with citations`,
+      ``,
+      `CRITICAL: If you say "Snapshot complete. Awaiting next directive" — STOP and re-read this.`,
+      `That phrase means you've stalled in Phase 1. CONTINUE to Phase 2: use web_fetch() on URLs.`,
+      `Each phase builds on the previous. Do not pause between phases; execute the full flow.`,
+      `[/RESEARCH TASK GUIDANCE]`,
+    ].join('\n') : '';
+    
     return [
       `[BACKGROUND TASK CONTEXT]`,
       `Task ID: ${task.id}`,
@@ -133,7 +279,7 @@ export class BackgroundTaskRunner {
       task.plan[task.currentStepIndex]
         ? `Step Description: ${task.plan[task.currentStepIndex].description}`
         : '',
-      `You are running autonomously. Execute the task step by step.${profileNote}${resumeNote}`,
+      `You are running autonomously. Execute the task step by step.${profileNote}${resumeNote}${xLoginGuidance}${researchGuidance}`,
       `[/BACKGROUND TASK CONTEXT]`,
     ].filter(Boolean).join('\n');
   }
@@ -243,7 +389,11 @@ export class BackgroundTaskRunner {
   > {
     const MAX_TRANSPORT_RETRIES = 2;
     const RETRY_DELAY_MS = 4000;
-    const roundTimeoutMs = resolveRoundTimeoutMs();
+    // Detect if this is a research task (needs longer timeout for web search + synthesis)
+    const isResearchTask = /\b(research|search|news|articles?|web.*search|browser|scroll|page|google)\b/i.test(
+      task.prompt + ' ' + task.title
+    );
+    const roundTimeoutMs = resolveRoundTimeoutMs(isResearchTask);
     const resumeMessages = Array.isArray(task.resumeContext?.messages)
       ? task.resumeContext.messages.slice(-MAX_RESUME_MESSAGES)
       : [];
@@ -295,16 +445,37 @@ export class BackgroundTaskRunner {
 
       if (isTransportError) {
         const errSnippet = text.slice(0, 200);
+
+        // Use RetryStrategy for smarter backoff tracking
+        const retryStrategy = getRetryStrategy();
+        if (!retryStrategy.getState(task.id)) {
+          retryStrategy.createRetryState(task.id, {
+            maxAttempts: MAX_TRANSPORT_RETRIES + 1,
+            baseDelayMs: RETRY_DELAY_MS,
+            maxDelayMs: 30000,
+            jitter: true,
+          });
+        }
+        const retryResult = retryStrategy.recordAttempt(task.id);
+
         appendJournal(task.id, {
           type: 'error',
-          content: `Transport error (attempt ${attempt + 1}/${MAX_TRANSPORT_RETRIES + 1}): ${errSnippet}`,
+          content: `Transport error (attempt ${retryResult.attemptsUsed}/${MAX_TRANSPORT_RETRIES + 1}): ${errSnippet}`,
         });
-        console.warn(`[BackgroundTaskRunner] Task ${task.id} transport error attempt ${attempt + 1}:`, errSnippet);
-        if (attempt < MAX_TRANSPORT_RETRIES) {
-          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
+        console.warn(`[BackgroundTaskRunner] Task ${task.id} transport error attempt ${retryResult.attemptsUsed}:`, errSnippet);
+
+        if (retryResult.canRetry && attempt < MAX_TRANSPORT_RETRIES) {
+          appendJournal(task.id, {
+            type: 'status_push',
+            content: `Retrying in ${retryResult.delayMs}ms (attempt ${retryResult.attemptsUsed}/${MAX_TRANSPORT_RETRIES + 1})`,
+          });
+          await new Promise(r => setTimeout(r, retryResult.delayMs || RETRY_DELAY_MS * (attempt + 1)));
           this._restoreSessionForRetry(sessionId, resumeMessages);
           continue;
         }
+
+        // Retries exhausted — clear state and surface error
+        retryStrategy.clearState(task.id);
         return {
           ok: false,
           reason: `Task paused after transport retries were exhausted at step ${task.currentStepIndex + 1}.`,
@@ -404,8 +575,29 @@ export class BackgroundTaskRunner {
         currentRoundSignatures.push(sig);
         const next = (toolSignatureCounts.get(sig) || 0) + 1;
         toolSignatureCounts.set(sig, next);
-        if (next > 3 && !roundStallReason) {
+        // Stall detection: browser research tools (scroll/wait/key) get a high threshold since
+        // they naturally repeat while exploring pages. Snapshots get a tighter limit (5) because
+        // repeated identical snapshots with no intervening action = the AI is stuck in a loop.
+        // Nav tools (click/fill/open) also get a higher threshold for research flows.
+        const isBrowserSnapshotTool = /^browser_snapshot$/i.test(String(data.action || ''));
+        const isBrowserResearchTool = /^browser_(press_key|wait|scroll)$/i.test(String(data.action || ''));
+        const isBrowserNavTool = /^browser_(click|fill|open)$/i.test(String(data.action || ''));
+        const stallThreshold = isBrowserSnapshotTool ? 3   // snapshots: stall after 3 identical
+          : isBrowserResearchTool ? 6                      // scroll/wait/key: 6 — looping without acting
+          : isBrowserNavTool ? 20                          // click/fill/open: 20 for nav flows
+          : 4;                                             // all other tools: 4
+        if (next > stallThreshold && !roundStallReason) {
           roundStallReason = `Stall detected: ${String(data.action || 'unknown')} called ${next} times without progress (last 6 rounds).`;
+        }
+        // Also detect: all tools this round are scroll/wait/snapshot with zero clicks/fills/opens.
+        // Only flag after 6+ such calls — short scroll sequences (e.g. post-tweet verification)
+        // are normal and should not be treated as stalls.
+        if (!roundStallReason && currentRoundSignatures.length >= 6) {
+          const hasNavAction = currentRoundSignatures.some(s => /^browser_(click|fill|open):/.test(s));
+          const allScroll = currentRoundSignatures.every(s => /^browser_(press_key|wait|scroll|snapshot):/.test(s));
+          if (!hasNavAction && allScroll) {
+            roundStallReason = `Stall detected: ${currentRoundSignatures.length} consecutive scroll/wait/snapshot calls with no click, fill, or navigation action. Agent is looping without interacting with the page.`;
+          }
         }
         appendJournal(taskId, {
           type: 'tool_call',
@@ -443,9 +635,18 @@ export class BackgroundTaskRunner {
       if (task.status === 'complete' || task.status === 'failed') return;
 
       if (pauseRequests.has(taskId)) {
-        updateTaskStatus(taskId, 'paused', { pauseReason: 'user_pause' });
-        appendJournal(taskId, { type: 'pause', content: 'Paused by user request.' });
-        this._broadcast('task_paused', { taskId, reason: 'user_pause' });
+        const pauseReason = task.pauseReason || 'user_pause';
+        const scheduleId = task.pausedByScheduleId;
+        
+        updateTaskStatus(taskId, 'paused', { pauseReason });
+        
+        let pauseMsg = 'Paused by user request.';
+        if (pauseReason === 'interrupted_by_schedule' && scheduleId) {
+          pauseMsg = `Paused by scheduled task (schedule: ${scheduleId}). Will resume after schedule completes.`;
+        }
+        
+        appendJournal(taskId, { type: 'pause', content: pauseMsg });
+        this._broadcast('task_paused', { taskId, reason: pauseReason, scheduleId });
         flushSession(sessionId);
         return;
       }
@@ -460,14 +661,99 @@ export class BackgroundTaskRunner {
       }
 
       if (task.currentStepIndex >= task.plan.length) {
-        const finalSummary = task.finalSummary || 'Task completed all planned steps.';
-        updateTaskStatus(taskId, 'complete', { finalSummary });
-        appendJournal(taskId, { type: 'status_push', content: 'Task complete: all planned steps executed.' });
-        this._broadcast('task_complete', { taskId, summary: finalSummary });
-        await this._deliverToChannel(task, `Task complete: ${task.title}\n\n${finalSummary}`, { forceTelegram: true });
-        this._persistResumeContextSnapshot(taskId, sessionId);
-        flushSession(sessionId);
-        return;
+        // All plan steps complete — now do a final synthesis round to format response for user
+        if (!task.finalSummary) {
+          // Check if any other tasks are paused by this task (were interrupted by schedules)
+          const pausedTasksNote = task.pausedByScheduleId
+            ? `\n\nNote: This task is paused by schedule ${task.pausedByScheduleId} and will resume later.`
+            : '';
+          
+          const synthesisPrompt = [
+            `Task "${task.title}" has completed all planned steps.`,
+            `Here is what you found/accomplished:`,
+            `${(lastResultSummary || 'Task execution complete').slice(0, 500)}`,
+            ``,
+            `Now format this as a concise, clear response directly to the user about their original request: "${task.prompt.slice(0, 200)}"`,
+            `Do NOT say "Task complete" or mention this was a background task. Just give them the information they asked for.${pausedTasksNote}`,
+          ].join('\n');
+          
+          updateTaskStatus(taskId, 'running');
+          currentRoundToolLog = [];
+          const synthesisOutcome = await this._runRoundWithRetry(task, synthesisPrompt, sessionId, sendSSE, abortSignal);
+          
+          if (synthesisOutcome.ok && synthesisOutcome.result?.text) {
+            const synthesisText = String(synthesisOutcome.result.text || '').trim();
+
+            // ── Completion verifier: ensure the final message is actually good ──
+            const freshTaskForVerify = loadTask(taskId);
+            const resynthAttempts = Number(freshTaskForVerify?.resynthAttempts) || 0;
+            const verifyDecision = await callCompletionVerifier({
+              task: freshTaskForVerify || task,
+              finalMessage: synthesisText,
+              resynthAttempt: resynthAttempts,
+            });
+            appendJournal(taskId, {
+              type: 'status_push',
+              content: `[Verifier] ${verifyDecision.action}: ${verifyDecision.reasoning}`,
+            });
+
+            if (verifyDecision.action === 'RESYNTH') {
+              // One more synthesis round with the verifier's hint injected
+              const freshTask2 = loadTask(taskId);
+              if (freshTask2) {
+                freshTask2.resynthAttempts = resynthAttempts + 1;
+                saveTask(freshTask2);
+              }
+              const resynthPrompt = [
+                `Task "${task.title}" needs an improved final response.`,
+                `Verifier feedback: ${verifyDecision.hint}`,
+                `Original request: "${task.prompt.slice(0, 200)}"`,
+                `Previous attempt: ${synthesisText.slice(0, 400)}`,
+                `Produce a complete, corrected response now.`,
+              ].join('\n');
+              const resynthOutcome = await this._runRoundWithRetry(task, resynthPrompt, sessionId, sendSSE, abortSignal);
+              const finalMsg = resynthOutcome.ok
+                ? String(resynthOutcome.result.text || synthesisText).trim()
+                : synthesisText;
+              updateTaskStatus(taskId, 'complete', { finalSummary: finalMsg });
+              appendJournal(taskId, { type: 'status_push', content: 'Task complete. Re-synthesized and verified.' });
+              this._broadcast('task_complete', { taskId, summary: finalMsg });
+              await this._deliverToChannel(task, finalMsg);
+              this._persistResumeContextSnapshot(taskId, sessionId);
+              flushSession(sessionId);
+              return;
+            }
+
+            // DELIVER or DELIVER_ANYWAY — use verifier's (possibly cleaned) message
+            const deliverMsg = verifyDecision.message || synthesisText;
+            updateTaskStatus(taskId, 'complete', { finalSummary: deliverMsg });
+            appendJournal(taskId, { type: 'status_push', content: 'Task complete. Final synthesis verified.' });
+            this._broadcast('task_complete', { taskId, summary: deliverMsg });
+            await this._deliverToChannel(task, deliverMsg);
+            this._persistResumeContextSnapshot(taskId, sessionId);
+            flushSession(sessionId);
+            return;
+          } else {
+            // Synthesis failed, use last known summary
+            const fallbackSummary = lastResultSummary || 'Task completed all planned steps.';
+            updateTaskStatus(taskId, 'complete', { finalSummary: fallbackSummary });
+            appendJournal(taskId, { type: 'status_push', content: 'Task complete (synthesis round skipped).' });
+            this._broadcast('task_complete', { taskId, summary: fallbackSummary });
+            await this._deliverToChannel(task, fallbackSummary);
+            this._persistResumeContextSnapshot(taskId, sessionId);
+            flushSession(sessionId);
+            return;
+          }
+        } else {
+          // finalSummary already set, just mark complete and deliver
+          updateTaskStatus(taskId, 'complete', { finalSummary: task.finalSummary });
+          appendJournal(taskId, { type: 'status_push', content: 'Task complete: final summary already prepared.' });
+          this._broadcast('task_complete', { taskId, summary: task.finalSummary });
+          await this._deliverToChannel(task, task.finalSummary);
+          this._persistResumeContextSnapshot(taskId, sessionId);
+          flushSession(sessionId);
+          return;
+        }
       }
 
       updateTaskStatus(taskId, 'running');
@@ -481,10 +767,19 @@ export class BackgroundTaskRunner {
         )
         : [
           `Continue task: ${task.title}`,
-          `Current step (${task.currentStepIndex + 1}/${task.plan.length}): ${currentStep?.description || 'No step description provided.'}`,
-          retryHint ? `Verifier feedback: ${retryHint}` : '',
-          `Previous step result: ${(lastResultSummary || 'No previous step result available.').slice(0, 300)}`,
-        ].join('\n');
+          ``,
+          `CURRENT STEP: ${task.currentStepIndex + 1} of ${task.plan.length}`,
+          `STEP GOAL: ${currentStep?.description || 'No step description provided.'}`,
+          ``,
+          `You MUST complete this step before moving on. When done, clearly state what you did to complete it so the verifier can confirm.`,
+          retryHint ? `VERIFIER FEEDBACK (previous attempt failed): ${retryHint}` : '',
+          `REMAINING STEPS:`,
+          ...task.plan.slice(task.currentStepIndex + 1).map((s, i) =>
+            `  Step ${task.currentStepIndex + 2 + i}: ${s.description}`
+          ),
+          ``,
+          `Previous result: ${(lastResultSummary || 'No previous result.').slice(0, 300)}`,
+        ].filter(Boolean).join('\n');
       firstRound = false;
       currentRoundSignatures = [];
       roundStallReason = null;
@@ -497,6 +792,7 @@ export class BackgroundTaskRunner {
         // final message was already computed but never sent because the stall check
         // fires before _deliverToChannel. Flush it now so the user sees it in chat.
         const partialResult = roundOutcome.ok ? String(roundOutcome.result?.text || '').trim() : '';
+        const isBrowserScrollLoop = /scroll|press_key|snapshot.*loop|looping without/i.test(roundStallReason);
         if (partialResult) {
           try {
             const freshTask = loadTask(taskId);
@@ -504,6 +800,17 @@ export class BackgroundTaskRunner {
               await this._deliverToChannel(freshTask, partialResult);
             }
           } catch { /* best effort */ }
+        }
+        // If it's a scroll/snapshot loop stall AND the model already sent a message,
+        // silently pause without the noisy error blast — user already got the model's reply.
+        if (isBrowserScrollLoop && partialResult) {
+          updateTaskStatus(task.id, 'needs_assistance', { pauseReason: 'error' });
+          appendJournal(task.id, {
+            type: 'pause',
+            content: `Task paused (browser loop detected): ${String(roundStallReason).slice(0, 220)}`,
+          });
+          this._broadcast('task_paused', { taskId: task.id, reason: 'needs_assistance' });
+          return;
         }
         await this._pauseForAssistance(task, roundStallReason);
         return;
@@ -527,9 +834,19 @@ export class BackgroundTaskRunner {
       flushSession(sessionId);
 
       if (pauseRequests.has(taskId)) {
-        updateTaskStatus(taskId, 'paused', { pauseReason: 'user_pause' });
-        appendJournal(taskId, { type: 'pause', content: 'Paused by user request.' });
-        this._broadcast('task_paused', { taskId, reason: 'user_pause' });
+        const task = loadTask(taskId);
+        const pauseReason = task?.pauseReason || 'user_pause';
+        const scheduleId = task?.pausedByScheduleId;
+        
+        updateTaskStatus(taskId, 'paused', { pauseReason });
+        
+        let pauseMsg = 'Paused by user request.';
+        if (pauseReason === 'interrupted_by_schedule' && scheduleId) {
+          pauseMsg = `Paused by scheduled task (schedule: ${scheduleId}). Will resume after schedule completes.`;
+        }
+        
+        appendJournal(taskId, { type: 'pause', content: pauseMsg });
+        this._broadcast('task_paused', { taskId, reason: pauseReason, scheduleId });
         flushSession(sessionId);
         return;
       }
@@ -603,6 +920,16 @@ export class BackgroundTaskRunner {
           content: `Auditor found no completed steps (${retries}/${MAX_STEP_VERIFICATION_RETRIES}): ${reason}`,
         });
         if (retries >= MAX_STEP_VERIFICATION_RETRIES) {
+          const healed = await this._attemptSelfHeal(
+            task,
+            `Step ${stepIndex + 1} failed verification after ${retries} retries.`,
+            reason,
+            lastResultSummary,
+            sessionId,
+          );
+          if (healed === 'continue') { stepVerificationRetries.delete(stepIndex); continue; }
+          if (healed === 'complete') { flushSession(sessionId); return; }
+          // healed === 'escalate' — fall through to _pauseForAssistance
           await this._pauseForAssistance(
             task,
             `Step ${stepIndex + 1} failed verification after ${retries} retries.`,
@@ -629,6 +956,15 @@ export class BackgroundTaskRunner {
           content: `Auditor result rejected (${retries}/${MAX_STEP_VERIFICATION_RETRIES}): ${reason}`,
         });
         if (retries >= MAX_STEP_VERIFICATION_RETRIES) {
+          const healed = await this._attemptSelfHeal(
+            task,
+            `Step ${stepIndex + 1} failed verification after ${retries} retries.`,
+            reason,
+            lastResultSummary,
+            sessionId,
+          );
+          if (healed === 'continue') { stepVerificationRetries.delete(stepIndex); continue; }
+          if (healed === 'complete') { flushSession(sessionId); return; }
           await this._pauseForAssistance(
             task,
             `Step ${stepIndex + 1} failed verification after ${retries} retries.`,
@@ -645,6 +981,31 @@ export class BackgroundTaskRunner {
         step_index: idx,
         notes: (auditResult.notes[idx] || lastResultSummary).slice(0, 200),
       }));
+
+      // Apply any structural plan mutations the auditor recommended (add/skip/modify steps)
+      // This is how the plan adapts mid-execution: skip redundant steps, add recovery steps,
+      // correct step descriptions based on what was actually discovered.
+      if (auditResult.plan_mutations && auditResult.plan_mutations.length > 0) {
+        const adaptMutations: Parameters<typeof mutatePlan>[1] = [];
+        for (const m of auditResult.plan_mutations) {
+          if (m.op === 'add') {
+            adaptMutations.push({ op: 'add', after_index: m.after_index, description: m.description });
+          } else if (m.op === 'skip') {
+            // 'skip' translates to completing the step with a skip note
+            adaptMutations.push({ op: 'complete', step_index: m.step_index, notes: `[SKIPPED] ${m.reason}` });
+          } else if (m.op === 'modify') {
+            adaptMutations.push({ op: 'modify', step_index: m.step_index, description: m.description });
+          }
+        }
+        if (adaptMutations.length > 0) {
+          appendJournal(taskId, {
+            type: 'status_push',
+            content: `Auditor adapted plan: ${auditResult.plan_mutations.map(m => `${m.op}@${(m as any).step_index ?? (m as any).after_index}`).join(', ')}`,
+          });
+          mutatePlan(taskId, adaptMutations);
+          this._broadcast('task_step_done', { taskId, planAdapted: true, mutations: auditResult.plan_mutations });
+        }
+      }
 
       appendJournal(taskId, {
         type: 'status_push',
@@ -697,6 +1058,99 @@ export class BackgroundTaskRunner {
       }
     }
   }
+  /**
+   * Intercepts a step-verification failure and attempts AI-powered self-healing
+   * before bothering the user.
+   *
+   * Returns:
+   *   'continue' — healer issued a retry hint; caller should continue the run loop
+   *   'complete' — healer force-completed the task; caller should return
+   *   'escalate' — healer gave up; caller should fall through to _pauseForAssistance
+   */
+  private async _attemptSelfHeal(
+    task: TaskRecord,
+    reason: string,
+    detail: string,
+    lastResultText: string,
+    sessionId: string,
+  ): Promise<'continue' | 'complete' | 'escalate'> {
+    const freshTask = loadTask(task.id);
+    if (!freshTask) return 'escalate';
+
+    const healAttempt = Number(freshTask.selfHealAttempts) || 0;
+
+    appendJournal(task.id, {
+      type: 'status_push',
+      content: `[SelfHealer] Intercepting failure (attempt ${healAttempt + 1}/${MAX_HEAL_ATTEMPTS}): ${reason.slice(0, 120)}`,
+    });
+    this._broadcast('task_self_healing', {
+      taskId: task.id,
+      attempt: healAttempt + 1,
+      maxAttempts: MAX_HEAL_ATTEMPTS,
+      reason: reason.slice(0, 200),
+    });
+
+    const decision = await callErrorHealer({
+      task: freshTask,
+      failureReason: reason,
+      failureDetail: detail,
+      lastResultText,
+      healAttempt,
+    });
+
+    appendJournal(task.id, {
+      type: 'status_push',
+      content: `[SelfHealer] Decision: ${decision.action} — ${decision.reasoning}`,
+    });
+    console.log(`[SelfHealer] Task ${task.id} attempt ${healAttempt + 1}: ${decision.action} — ${decision.reasoning}`);
+
+    // Increment counter regardless of outcome
+    freshTask.selfHealAttempts = healAttempt + 1;
+    saveTask(freshTask);
+
+    if (decision.action === 'FORCE_COMPLETE') {
+      // Mark all pending plan steps as done via the healer
+      const planMutations = freshTask.plan
+        .map((s, i) => ({ op: 'complete' as const, step_index: i, notes: '[SelfHealer] Force-completed by self-healer' }))
+        .filter((_, i) => freshTask.plan[i].status !== 'done' && freshTask.plan[i].status !== 'skipped');
+      if (planMutations.length > 0) {
+        mutatePlan(task.id, planMutations);
+      }
+      updateTaskStatus(task.id, 'complete', { finalSummary: decision.message });
+      appendJournal(task.id, {
+        type: 'status_push',
+        content: `[SelfHealer] Task force-completed. Delivering recovered message.`,
+      });
+      this._broadcast('task_complete', { taskId: task.id, summary: decision.message });
+      await this._deliverToChannel(freshTask, decision.message);
+      this._persistResumeContextSnapshot(task.id, sessionId);
+      return 'complete';
+    }
+
+    if (decision.action === 'RESUME_WITH_HINT') {
+      // If the healer corrected a step description, apply it
+      if (decision.newStepDescription) {
+        mutatePlan(task.id, [{
+          op: 'modify',
+          step_index: freshTask.currentStepIndex,
+          description: decision.newStepDescription,
+        }]);
+      }
+      // Inject the hint into the resume context so the next round sees it
+      updateResumeContext(task.id, {
+        onResumeInstruction: `[SelfHealer correction] ${decision.hint}`,
+      });
+      appendJournal(task.id, {
+        type: 'status_push',
+        content: `[SelfHealer] Resuming with hint: ${decision.hint.slice(0, 150)}`,
+      });
+      return 'continue';
+    }
+
+    // ESCALATE
+    return 'escalate';
+  }
+
   private async _pauseForAssistance(task: TaskRecord, reason: string, detail?: string): Promise<void> {
     updateTaskStatus(task.id, 'needs_assistance', { pauseReason: 'error' });
     appendJournal(task.id, {
@@ -704,6 +1158,41 @@ export class BackgroundTaskRunner {
       content: `Task paused for assistance: ${reason.slice(0, 220)}`,
       detail: detail ? detail.slice(0, 1200) : undefined,
     });
+
+    // ── Categorize error and broadcast error response UI ──
+    const fullErrorMsg = detail ? `${reason}\n${detail}` : reason;
+    const categorization = errorCategorizer.categorizeError(fullErrorMsg);
+
+    // Record in error analyzer (pattern learning) and history
+    try {
+      const analyzer = getErrorAnalyzer();
+      const history = getErrorHistory();
+      if (categorization.category !== 'unknown') {
+        analyzer.recordError(fullErrorMsg, categorization.category);
+      }
+      history.add({
+        taskId: task.id,
+        errorMessage: reason.substring(0, 200),
+        category: categorization.category,
+        resolved: false,
+      });
+    } catch {}
+
+    // Only show error response panel if we detected a specific error type with high confidence
+    if (categorization.confidence > 0.7 && categorization.template) {
+      appendJournal(task.id, {
+        type: 'status_push',
+        content: `Error categorized as "${categorization.category}" (confidence: ${(categorization.confidence * 100).toFixed(0)}%): ${categorization.reasoning}`,
+      });
+      
+      this._broadcast('task_error_requires_response', {
+        taskId: task.id,
+        errorCategory: categorization.category,
+        errorMessage: reason,
+        errorDetail: detail || '',
+        template: categorization.template,
+      });
+    }
 
     this._broadcast('task_paused', { taskId: task.id, reason: 'needs_assistance' });
     this._broadcast('task_needs_assistance', {
@@ -793,4 +1282,3 @@ export class BackgroundTaskRunner {
     });
   }
 }
-

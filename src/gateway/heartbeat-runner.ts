@@ -7,6 +7,8 @@
 
 import fs from 'fs';
 import path from 'path';
+import { loadTask, listTasks } from './task-store';
+import { BackgroundTaskRunner } from './background-task-runner';
 
 export interface HeartbeatRunnerConfig {
   enabled: boolean;
@@ -150,6 +152,35 @@ export class HeartbeatRunner {
     return true;
   }
 
+  /**
+   * Detect and resume any background tasks that were paused by schedules
+   */
+  private resumePausedTasks(): void {
+    const allTasks = listTasks();
+    const toBePausedBySchedule = allTasks.filter(
+      t => t.status === 'paused' && t.pausedByScheduleId && t.shouldResumeAfterSchedule
+    );
+
+    if (toBePausedBySchedule.length === 0) {
+      return; // No tasks to resume
+    }
+
+    console.log(`[HeartbeatRunner] Checking ${toBePausedBySchedule.length} tasks paused by schedules for resumption...`);
+
+    for (const task of toBePausedBySchedule) {
+      if (!task.pausedByScheduleId) continue;
+
+      // Try to resume the task after its schedule completed
+      // The resumption will be deferred to next heartbeat if schedule still running
+      const resumed = BackgroundTaskRunner.resumeTaskAfterSchedule(task.id, task.pausedByScheduleId);
+      if (resumed) {
+        console.log(`[HeartbeatRunner] Resumed task ${task.id} (was paused by schedule ${task.pausedByScheduleId})`);
+        // Note: The caller (server-v2) should have a listener for task resumption
+        // and will invoke new BackgroundTaskRunner(task.id, ...).start()
+      }
+    }
+  }
+
   async tick(mainSessionId?: string): Promise<void> {
     if (this.running) {
       this.schedule();
@@ -160,6 +191,9 @@ export class HeartbeatRunner {
       this.schedule();
       return;
     }
+
+    // Before running the heartbeat check, detect and resume any paused tasks
+    this.resumePausedTasks();
 
     this.running = true;
     const sessionId = mainSessionId || this.deps.getMainSessionId() || 'default';

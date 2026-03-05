@@ -14,6 +14,7 @@ import fs from 'fs';
 import { getConfig } from '../config/config';
 import type { LLMProvider } from '../providers/LLMProvider';
 import { contentToString } from '../providers/content-utils';
+import { loadTokens } from '../auth/openai-oauth';
 
 export type PreflightMode = 'off' | 'complex_only' | 'always';
 
@@ -191,8 +192,8 @@ export async function checkOrchestrationEligibility(): Promise<EligibilityResult
   }
 
   if (secondary.provider === 'openai_codex') {
-    const tokenPath = path.join(getConfigDir(), 'credentials', 'oauth-openai.json');
-    if (!fs.existsSync(tokenPath)) {
+    const tokens = loadTokens(getConfigDir());
+    if (!tokens) {
       return { eligible: false, reason: 'Secondary is ChatGPT but no OAuth token found - connect your account first.' };
     }
   }
@@ -488,7 +489,7 @@ Return ONLY a JSON object - no markdown, no explanation:
 
 Rules:
 - Keep it concise and executable for a small model
-- task_plan max 6 items
+- task_plan: use AS MANY STEPS AS THE TASK GENUINELY NEEDS — 1 for trivial single-tool tasks, up to 12 for complex multi-phase work. Do NOT pad with unnecessary steps, and do NOT compress complex work into too few. Simple task = 1-2 steps. Research = 3-4. Complex multi-system work = 5-10+.
 - checkpoints max 6 items
 - exact_files max 8 items
 - success_criteria max 6 items
@@ -560,7 +561,44 @@ Rules:
 - Keep answer <= 450 chars.
 - primary_hint <= 600 chars.
 - evidence_focus max 6 items.
-- Return JSON only.`;
+- Return JSON only.
+
+ANTI-LOOP RULE: If the snapshot hash is unchanged (you receive the same snapshot twice in a row)
+or if the last 2+ actions were browser_snapshot with no click/fill in between, you MUST return
+continue_browser with a concrete next_tool that is NOT browser_snapshot. Pick the most relevant
+@ref from the snapshot and click or fill it. If no ref is actionable, return handoff_primary with
+a primary_hint explaining why you’re stuck. NEVER return continue_browser with next_tool=browser_snapshot
+unless explicitly told to stabilize — returning another snapshot when the last action was already
+a snapshot is a loop bug.
+
+SNAPSHOT REQUEST GATE: The primary model MUST NOT call browser_snapshot when it already has a
+fresh snapshot in context. If the last RECENT ACTIONS entry is browser_open, browser_fill,
+browser_wait, or browser_snapshot, a valid snapshot already exists — return continue_browser or
+handoff_primary with a concrete @ref-based action instead. NEVER approve another snapshot call
+when the previous tool already returned one. If you receive a snapshot request and the last
+action was already a snapshot or page-load tool, set next_tool to browser_click or browser_fill
+using a @ref from the current snapshot, and set primary_hint to “You already have a snapshot —
+do NOT call browser_snapshot again. Act immediately: [specific action].”
+
+INTERACTIVE PAGE ACTION REQUIREMENT: For non-feed pages (generic, article, chat_interface),
+your response MUST include a specific @ref number from the snapshot in next_tool params.
+Do NOT return browser_snapshot as next_tool on interactive pages. If you see a compose button,
+post button, text input, or any actionable element, click or fill it using its @ref number.
+For X.com home page: the compose area is visible at the top with a “What’s happening?”
+textbox — find it in the snapshot and fill it directly. Do NOT scroll first.
+
+PAGE TITLE LOGIN INFERENCE: If the page title contains "(N) Home / X" or "Home / X" or ends with
+"/ X" on x.com, the user IS logged in — do NOT ask to confirm login or suggest logging in.
+Proceed directly with the task. Similarly, if on x.com/settings or x.com/notifications without
+being redirected to a login page, treat the user as logged in.
+
+POST/TWEET WORKFLOW: When the goal is to post or tweet:
+1. Find the compose textarea (@ref with role textbox and name "Post text" or similar) — browser_fill it.
+2. The fill result will include "⚠️ COMPOSER SUBMIT BUTTON: @N" — immediately click that exact @N as your very next action. Do NOT click anything else, do NOT snapshot first.
+3. If no COMPOSER SUBMIT BUTTON annotation appears, look for a button named exactly "Post" or "Tweet" inside the composer area and click it.
+4. After clicking Post, use browser_snapshot to verify the composer closed and the post was published.
+5. NEVER declare the task complete without having explicitly clicked Post AND verified. Filling the textarea alone is NOT completion.
+6. NEVER click buttons like "Everyone can reply", audience selectors, or media buttons — those are composer settings, not the submit.`;
 
 const DESKTOP_ADVISOR_SYSTEM = `You are a desktop automation advisor for a local executor AI.
 
@@ -844,11 +882,15 @@ Authorization context:
 - Do NOT classify normal local browser automation requests as disallowed remote control.
 
 Routing policy — choose the FIRST that matches:
+- BLOCKED TASK RESUME: If the prompt contains a "BLOCKED TASK FOR THIS SESSION" block AND the user message is a short affirmation ("proceed", "go ahead", "ok", "continue", "I logged in", "fixed it", "try again", "yes", "done", "sure") → ALWAYS primary_direct with executor_objective: "Use task_control(action='resume', task_id='<ID from blocked task>') to resume the blocked task." NEVER create a new background_task in this case.
+- schedule_job: Requests to create, update, pause, resume, delete, or list schedules MUST be primary_direct. These are quick tool calls that need instant confirmation, never background tasks.
 - primary_direct: task management operations (delete/cancel/pause/resume/list tasks, check task status). These MUST NEVER be background_task — they are quick inline tool calls.
 - background_task: USE THIS for ANY request that requires tools, browser automation, file operations, code editing, running commands, or interacting with any external app or website. Also use for research, "look into", "find out", "while I'm away", "in the background", "go ahead and" requests. If in doubt and tools would be needed — background_task.
 - primary_direct: simple conversational message, no tools, no execution — pure text response only
 
 Critical rules:
+- BLOCKED TASK RULE: When a BLOCKED TASK FOR THIS SESSION is shown in the prompt, a short user affirmation MUST route as primary_direct to resume that task — never spawn a new background_task.
+- SCHEDULE OPERATIONS: "daily at", "weekly on", "schedule", "reminder", "set timer" → ALWAYS primary_direct. Users expect instant confirmation of schedule creation.
 - NEVER create a background_task just to manage other tasks. delete/cancel/pause/resume/list → primary_direct ALWAYS.
 - ANY research, browsing, or multi-step work → ALWAYS background_task, even if the message is short.
 - If the task touches a file, a browser, a terminal, a desktop app, or another AI → ALWAYS background_task, no exceptions.
@@ -859,7 +901,20 @@ Critical rules:
 - For route=primary_direct, executor_objective is REQUIRED.
 - executor_objective must preserve exact user literals (message text, URLs, names, numbers).
 - Never use placeholders like "the requested message" when the literal value is known.
-- For route=background_task: set task_title (max 12 words), task_plan (3-6 steps), friendly_queued_message.
+- For route=background_task: set task_title (max 12 words), task_plan (right-sized steps), friendly_queued_message.
+- task_plan: CRITICAL RULES:
+  * Use AS MANY STEPS AS THE TASK GENUINELY NEEDS. 1-2 for simple lookups. 3-5 for research. 6-10+ for complex multi-system work. Never pad. Never compress.
+  * Each step MUST be a concrete action that uses a tool or produces visible output
+  * Do NOT include meta-steps like "Determine the current date", "Get the time", "Prepare", "Set up"
+  * The runner already knows the system time and has time_now tool — don't waste a step
+  * Do NOT end with internal steps like "Verify findings", "Save results", or "Generate summary"
+  * FINAL step MUST directly address the user: "Deliver answer with X to user" or "Post summary in chat"
+  * For research/news: CRITICAL - Include BOTH of these as separate steps:
+    - Step 1: "Open news sites and take snapshots to identify article headlines/URLs"
+    - Step 2: "Fetch full article content from URLs using web_fetch"
+    - Step 3: "Synthesize key facts from articles and deliver summary with citations"
+  * For file work: Start with action (read/create/edit), not planning; end with showing results
+  * The runner can ADD steps mid-task if it discovers more work is needed — so keep the initial plan honest, not defensive
 
 Output constraints:
 - quick_plan max 5 items
@@ -867,7 +922,7 @@ Output constraints:
 - likely_files max 6
 - tool_hints max 6
 - executor_objective max 900 chars
-- task_plan max 6 items
+- task_plan: 1 to 12 items depending on complexity (final step MUST be delivery/response to user; exclude meta-steps)
 - Keep entries short and concrete
 - Return JSON only`;
   }
@@ -896,12 +951,16 @@ Authorization context:
 - Do NOT classify normal local browser automation requests as disallowed remote control.
 
 Routing policy — choose the FIRST that matches:
+- BLOCKED TASK RESUME: If the prompt contains a "BLOCKED TASK FOR THIS SESSION" block AND the user message is a short affirmation ("proceed", "go ahead", "ok", "continue", "I logged in", "fixed it", "try again", "yes", "done", "sure") → ALWAYS primary_direct with executor_objective: "Use task_control(action='resume', task_id='<ID from blocked task>') to resume the blocked task." NEVER create a new background_task in this case.
+- schedule_job: Requests to create, update, pause, resume, delete, or list schedules MUST be primary_direct. These are quick tool calls that need instant confirmation, never background tasks.
 - primary_direct: task management operations (delete/cancel/pause/resume/list tasks, check task status, "any tasks paused?", "what tasks are running?"). These MUST NEVER be background_task or secondary_chat — they require task_control tool calls that only the primary executor can make.
 - secondary_chat: greetings, small talk, simple factual questions, anything you can answer directly in 1-2 sentences with NO tools. Use this aggressively — it is the fastest route.
 - background_task: USE THIS for ANY request that requires tools, browser automation, file operations, code editing, running commands, or interacting with any external app or website. Also use for research, "look into", "find out", "while I'm away", "in the background", "go ahead and" requests. If in doubt and tools would be needed — background_task.
 - primary_direct: fallback for conversational messages that need primary model reasoning but NO tools
 
 Critical rules:
+- BLOCKED TASK RULE: When a BLOCKED TASK FOR THIS SESSION is shown in the prompt, a short user affirmation MUST route as primary_direct to resume that task — never spawn a new background_task.
+- SCHEDULE OPERATIONS: "daily at", "weekly on", "schedule", "reminder", "set timer" → ALWAYS primary_direct. Users expect instant confirmation of schedule creation.
 - NEVER create a background_task just to manage other tasks. delete/cancel/pause/resume/list/check tasks → primary_direct ALWAYS. secondary_chat cannot call tools.
 - ANY research, browsing, or multi-step work → ALWAYS background_task, even if the message is short.
 - If the task touches a file, a browser, a terminal, a desktop app, or another AI → ALWAYS background_task, no exceptions.
@@ -910,7 +969,20 @@ Critical rules:
 - For route=primary_direct, executor_objective is REQUIRED.
 - executor_objective must preserve exact user literals (message text, URLs, names, numbers).
 - Never use placeholders like "the requested message" when the literal value is known.
-- For route=background_task: set task_title (max 12 words), task_plan (3-6 steps), friendly_queued_message.
+- For route=background_task: set task_title (max 12 words), task_plan (right-sized steps), friendly_queued_message.
+- task_plan: CRITICAL RULES:
+  * Use AS MANY STEPS AS THE TASK GENUINELY NEEDS — 1-2 for simple lookups, 3-5 for research, 6-10+ for complex multi-system work. Never pad. Never compress.
+  * Each step MUST be a concrete action that uses a tool or produces visible output
+  * Do NOT include meta-steps like "Determine the current date", "Get the time", "Prepare", "Set up"
+  * The runner already knows the system time and has time_now tool — don't waste a step
+  * Do NOT end with internal steps like "Verify findings", "Save results", or "Generate summary"
+  * FINAL step MUST directly address the user: "Deliver answer with X to user" or "Post summary in chat"
+  * For research/news: CRITICAL - Include BOTH of these as separate steps:
+    - Step 1: "Open news sites and take snapshots to identify article headlines/URLs"
+    - Step 2: "Fetch full article content from URLs using web_fetch"
+    - Step 3: "Synthesize key facts from articles and deliver summary with citations"
+  * For file work: Start with action (read/create/edit), not planning; end with showing results
+  * The runner can ADD steps mid-task if it discovers more work needed — keep initial plan honest, not defensive
 - For route=secondary_chat: fill secondary_response with the complete answer.
 
 Output constraints:
@@ -919,7 +991,7 @@ Output constraints:
 - likely_files max 6
 - tool_hints max 6
 - executor_objective max 900 chars
-- task_plan max 6 items
+- task_plan: 1 to 12 items depending on complexity (final step MUST be delivery/response to user)
 - Keep entries short and concrete
 - Return JSON only`;
 }
@@ -1069,6 +1141,14 @@ function secondarySupportsVision(config: OrchestrationConfig): boolean {
 export async function callSecondaryPreflight(input: {
   userMessage: string;
   recentHistory?: Array<{ role: string; content: string }>;
+  blockedTask?: {
+    id: string;
+    title: string;
+    status: string;
+    currentStepIndex: number;
+    planLength: number;
+    pauseReason?: string;
+  } | null;
 }): Promise<PreflightResult | null> {
   const built = await buildSecondaryProvider();
   if (!built) return null;
@@ -1080,11 +1160,27 @@ export async function callSecondaryPreflight(input: {
     .map((m, i) => `${i + 1}. ${m.role}: ${String(m.content || '').slice(0, 220)}`)
     .join('\n');
 
+  // Build blocked-task context block if one exists for this session
+  const blockedTaskBlock = input.blockedTask
+    ? `\n\nBLOCKED TASK FOR THIS SESSION (needs_assistance / paused / escalated):
+- Task ID: ${input.blockedTask.id}
+- Title: "${input.blockedTask.title}"
+- Status: ${input.blockedTask.status}
+- Progress: step ${input.blockedTask.currentStepIndex + 1} of ${input.blockedTask.planLength}
+- Last issue: ${input.blockedTask.pauseReason || 'unknown'}
+
+If the user's message is a short affirmation or follow-up to this blocked task
+(e.g. "proceed", "go ahead", "ok", "I logged in", "fixed it", "continue", "try again"),
+you MUST route this as primary_direct with executor_objective:
+  "Use task_control(action='resume', task_id='${input.blockedTask.id}') to resume the blocked task."
+Do NOT create a new background_task — that would duplicate existing work.`
+    : '';
+
   const prompt = `USER MESSAGE:
 ${String(input.userMessage || '').slice(0, 1800)}
 
 RECENT CONTEXT:
-${historyText || '(none)'}
+${historyText || '(none)'}${blockedTaskBlock}
 
 Return routing JSON now.`;
 
@@ -1157,7 +1253,7 @@ Return routing JSON now.`;
 
     // Extract background task fields when route is background_task
     const taskTitle = route === 'background_task' ? String(parsed.task_title || '').slice(0, 120) : undefined;
-    const taskPlan = route === 'background_task' ? compactList(parsed.task_plan, 6, 200) : undefined;
+    const taskPlan = route === 'background_task' ? compactList(parsed.task_plan, 12, 200) : undefined;
     const friendlyQueuedMessage = route === 'background_task' ? String(parsed.friendly_queued_message || '').slice(0, 600) : undefined;
 
     return {
@@ -1328,7 +1424,7 @@ Return guidance JSON now.`;
       hints: compactList(parsed.hints, 6, 160),
       risk_note: String(parsed.risk_note || '').slice(0, 220),
       raw_response: rawResponse.slice(0, 6000),
-      task_plan: compactList(parsed.task_plan, 6, 140),
+      task_plan: compactList(parsed.task_plan, 12, 140),
       checkpoints: compactList(parsed.checkpoints, 6, 140),
       exact_files: compactList(parsed.exact_files, 8, 220),
       success_criteria: compactList(parsed.success_criteria, 6, 160),
@@ -2225,33 +2321,66 @@ export interface TaskStepAuditResult {
   completed_steps: number[];
   /** Per-step rationale keyed by step index. */
   notes: Record<number, string>;
+  /** Optional plan adaptations the auditor recommends based on what it observed. */
+  plan_mutations?: Array<
+    | { op: 'add'; after_index: number; description: string }
+    | { op: 'skip'; step_index: number; reason: string }
+    | { op: 'modify'; step_index: number; description: string }
+  >;
   raw_response?: string;
 }
 
-const TASK_STEP_AUDITOR_SYSTEM = `You are a task step completion auditor.
+const TASK_STEP_AUDITOR_SYSTEM = `You are a task step completion auditor with plan adaptation authority.
 
 An autonomous agent just finished a round of work. You receive:
-- The full task plan (numbered steps)
+- The full task plan (numbered steps with their current status)
 - Every tool call the agent made this round, and the data each tool returned
 - The agent's final summary text
 
-Your job: decide which plan steps are NOW COMPLETE based solely on what the tool calls actually DID and RETURNED.
+Your job has TWO parts:
+
+PART 1 — COMPLETION AUDIT:
+Decide which plan steps are NOW COMPLETE based solely on what the tool calls actually DID and RETURNED.
 Do NOT mark a step complete just because the agent mentioned it in text — only mark it complete if the tool call evidence directly proves it.
+
+SPECIAL: write_note() calls count as evidence for cognitive steps (filtering, assessing, deciding, reasoning).
+If the step says "filter entries" and there is a write_note with "step": "filter", that counts as evidence.
+If the step says "assess quality" and there is a write_note with "step": "assess", that counts as evidence.
+
+PART 2 — PLAN ADAPTATION:
+After auditing completions, look for cases where the plan needs adjustment:
+- SKIP ahead: If evidence shows the agent already accomplished steps 4-6 while working on step 3, mark ALL those steps complete.
+- ADD steps: If the agent encountered a blocker, error, or discovered unexpected complexity that the current plan doesn't account for, add a recovery/adaptation step AFTER the current step.
+- MODIFY steps: If a step's description is now clearly wrong given what was discovered, update it.
+
+ADD a step when: auth failed and needs retry, data was empty/wrong and needs a different source, a sub-task returned an error and needs handling, or an unexpected prerequisite was discovered.
+Do NOT add steps just to pad the plan.
 
 Return ONLY JSON:
 {
   "completed_steps": [0, 2],
   "notes": {
     "0": "browser_open returned page title 'X / Twitter' confirming browser opened",
-    "2": "browser_snapshot showed login wall — step asks to check login state, confirmed not logged in"
-  }
+    "2": "write_note(step='filter') provided evidence that filtering was performed"
+  },
+  "plan_mutations": [
+    { "op": "add", "after_index": 2, "description": "Retry fetch from alternate source — first source returned 403" },
+    { "op": "skip", "step_index": 4, "reason": "Evidence shows agent already completed this while doing step 3" }
+  ]
 }
 
 Rules:
-- completed_steps: array of 0-based step indices that are proven complete
+- completed_steps: array of 0-based step indices that are proven complete by tool evidence
 - notes: one short sentence per completed step explaining which tool call/result proved it
-- Be conservative — if there is any doubt, do NOT include the step
-- An empty completed_steps array is a valid and sometimes correct answer
+- plan_mutations: array of plan changes — omit or leave empty if no changes needed
+  * op "add": insert a new step AFTER after_index with the given description
+  * op "skip": mark a future step as skippable because evidence already covers it (include step_index and reason)
+  * op "modify": update a pending step's description if it needs correction (include step_index and description)
+- For cognitive steps, write_note calls PLUS subsequent output together constitute evidence
+- Be PRACTICAL on completions — if the tool call evidence clearly matches what the step description asks for, mark it done. Do not require perfection. Example: step says "open X website" and browser_open returned page titled "Home / X" — that step is done.
+- Be proactive on plan_mutations — if the situation clearly warrants an adaptation, do it
+- NEVER return an empty completed_steps array when there are tool calls that clearly satisfy one or more steps
+- An empty completed_steps array is valid and sometimes correct
 - Return JSON only`;
 
 /**
@@ -2284,15 +2413,22 @@ export async function callSecondaryTaskStepAuditor(input: {
       try { argsText = JSON.stringify(t.args ?? {}).slice(0, 300); } catch { argsText = '{}'; }
       const resultText = String(t.result || '').replace(/\r/g, '').trim().slice(0, 800);
       const status = t.error ? 'FAIL' : 'OK';
-      return `${i + 1}. [${status}] ${String(t.tool || 'unknown')}(${argsText})\nResult: ${resultText || '(empty)'}`;
+      const toolMark = t.tool === 'write_note' ? '📝 ' : '';
+      return `${i + 1}. [${status}] ${toolMark}${String(t.tool || 'unknown')}(${argsText})\nResult: ${resultText || '(empty)'}`;
     })
     .join('\n\n');
+
+  // Highlight write_note calls if any
+  const writeNotes = input.toolCallLog.filter(t => t.tool === 'write_note');
+  const writeNoteHint = writeNotes.length > 0
+    ? `\n[HINT: Agent called write_note ${writeNotes.length}x to record reasoning. These are marked with 📝.]`
+    : '';
 
   const prompt = `PENDING PLAN STEPS (0-based indices):
 ${stepsText}
 
 TOOL CALLS MADE THIS ROUND:
-${toolCallText || '(none)'}
+${toolCallText || '(none)'}${writeNoteHint}
 
 AGENT FINAL SUMMARY:
 ${String(input.resultText || '').slice(0, 800)}
@@ -2336,7 +2472,23 @@ Return step audit JSON now.`;
       }
     }
 
-    return { completed_steps, notes, raw_response: rawResponse.slice(0, 3000) };
+    // Parse plan_mutations — auditor can add/skip/modify steps based on evidence
+    const parsedMutations: TaskStepAuditResult['plan_mutations'] = [];
+    if (Array.isArray(parsed.plan_mutations)) {
+      for (const m of parsed.plan_mutations.slice(0, 8)) {
+        if (!m || typeof m !== 'object') continue;
+        const op = String(m.op || '').trim();
+        if (op === 'add' && typeof m.after_index === 'number' && m.description) {
+          parsedMutations.push({ op: 'add', after_index: Math.floor(m.after_index), description: String(m.description).slice(0, 200) });
+        } else if (op === 'skip' && typeof m.step_index === 'number') {
+          parsedMutations.push({ op: 'skip', step_index: Math.floor(m.step_index), reason: String(m.reason || 'Evidence already covers this step').slice(0, 200) });
+        } else if (op === 'modify' && typeof m.step_index === 'number' && m.description) {
+          parsedMutations.push({ op: 'modify', step_index: Math.floor(m.step_index), description: String(m.description).slice(0, 200) });
+        }
+      }
+    }
+
+    return { completed_steps, notes, plan_mutations: parsedMutations, raw_response: rawResponse.slice(0, 3000) };
   } catch (err: any) {
     console.error('[Orchestrator] Task step auditor failed:', err.message);
     return null;
